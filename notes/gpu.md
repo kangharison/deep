@@ -133,6 +133,44 @@ GPU-Storage I/O 관련 논문을 6개 분류로 체계적으로 정리.
 
 ---
 
+## GPU-NVMe 최적화의 역사: GDS/GPU-Initiated I/O 이전의 노력들
+
+> 상세 문서: [gpu-nvme-optimization-history.md](gpu-nvme-optimization-history.md)
+
+### 원래의 문제
+
+전통적 데이터 경로: `NVMe → 커널 버퍼 → User 버퍼 → cudaMemcpy → GPU`
+- 데이터가 CPU 메모리를 2번 거침 (바운스 버퍼)
+- CPU 코어 절반 이상이 I/O 처리에 소모 [C2]
+- GPU 커널이 데이터 대기 중 멈춰야 함
+
+### 5가지 접근법과 한계
+
+| # | 접근법 | 대표 논문 | 해결한 것 | 남은 한계 |
+|---|--------|----------|----------|----------|
+| ① | CPU I/O 스택 최적화 | SPDK [P7], io_uring [C1], io_passthru [C3], 120M IOPS [C4] | CPU 측 SW 오버헤드 제거 (코어당 100x IOPS↑) | GPU는 여전히 CPU에 요청하고 대기 |
+| ② | GPU 파일 API / 직접 접근 | GPUfs [P1], EMOGI [P4] | GPU 프로그래밍 편의, 호스트 메모리 zero-copy | CPU 병목 (GPUfs), SSD 접근 불가 (EMOGI) |
+| ③ | HW 아키텍처 제안 | NVMMU [P2], FlashGPU [P3] | 이상적 GPU-SSD 직접 경로 제시 | 시뮬레이션만, GPU 칩 수정 필요 |
+| ④ | 메모리 계층 오프로드 | FlashNeuron [P5], ZeRO-Infinity [P6], G10 [O6], HetCache [O7] | GPU 메모리 용량 확장, 대규모 모델 학습 | CPU 오케스트레이션, 불규칙 접근에 취약 |
+| ⑤ | P2P DMA (GDS) | GDS [G1], SPIN [G2] | 바운스 버퍼 제거, throughput 2~6x↑ | CPU가 I/O 발행, fine-grained random 부적합 |
+
+**공통 한계: "CPU가 중간에 끼어있다"** → BaM [I1]이 GPU-Initiated I/O로 돌파
+
+### 발전 흐름 요약
+
+```
+GPUfs(2014) → NVMMU(2015) → SPDK(2017) → FlashGPU(2019)
+    → EMOGI/FlashNeuron/ZeRO-Infinity(2021)
+    → GDS(2022) → io_passthru/SPIN/SPDK 120M(2023)
+    → ★ BaM(2023): GPU가 NVMe SQ에 직접 커맨드 발행 (모든 한계 돌파)
+```
+
+BaM이 가능했던 이유 = 선행 연구 통찰의 조합:
+- GPUfs → GPU 스토리지 접근 개념 / EMOGI → massive parallelism으로 대역폭 활용
+- SPDK → 유저스페이스 NVMe 큐 직접 조작 / GDS → P2P DMA 인프라
+
+---
+
 ## 핵심 기술 계보
 
 ```
