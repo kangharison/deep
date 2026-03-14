@@ -522,7 +522,7 @@ Phase 5: 시스템 & 응용 (1주)
 ├── #94-96 DGX 시스템 토폴로지
 ├── #101-105 DPU, DPDK, GPU 패킷 처리
 ├── #111-115 Magnum IO 통합 프레임워크
-└── papers/README.md 논문 읽기 순서와 병행
+└── papers/gpu-ssd/README.md 논문 읽기 순서와 병행
 ```
 
 ---

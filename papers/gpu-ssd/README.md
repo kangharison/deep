@@ -135,7 +135,7 @@ GPU-Storage I/O 관련 논문을 6개 분류로 체계적으로 정리.
 
 ## GPU-NVMe 최적화의 역사: GDS/GPU-Initiated I/O 이전의 노력들
 
-> 상세 문서: [optimization-history.md](../notes/gpu-storage/optimization-history.md)
+> 상세 문서: [optimization-history.md](../../notes/gpu-storage/optimization-history.md)
 
 ### 원래의 문제
 

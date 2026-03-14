@@ -49,15 +49,16 @@ deep/
 │       ├── optimization-history.md        ← GPU-NVMe 최적화 역사
 │       ├── experiment-design.md           ← 실험 설계
 │       └── ppt-outline.md                 ← 발표 자료 구조
-├── papers/                      ← 논문 리딩 노트 (41편)
-│   ├── README.md                ← 논문 인덱스 & 읽기 순서
-│   ├── experiment-metrics.md    ← 논문별 실험 메트릭 정리
-│   ├── P-prereq/                ← 선행 연구 (7편)
-│   ├── C-cpu-io/                ← CPU Initiated I/O (4편)
-│   ├── G-gds/                   ← GPUDirect Storage (8편)
-│   ├── I-gpu-initiated/         ← GPU Initiated I/O (9편, 핵심)
-│   ├── O-offload/               ← GPU-NVMe 오프로드 (8편)
-│   └── N-industry/              ← 산업 동향 (5편)
+├── papers/                      ← 논문 리딩 노트
+│   └── gpu-ssd/                 ← GPU-Storage I/O (41편)
+│       ├── README.md            ← 논문 인덱스 & 읽기 순서
+│       ├── experiment-metrics.md← 논문별 실험 메트릭 정리
+│       ├── P-prereq/            ← 선행 연구 (7편)
+│       ├── C-cpu-io/            ← CPU Initiated I/O (4편)
+│       ├── G-gds/               ← GPUDirect Storage (8편)
+│       ├── I-gpu-initiated/     ← GPU Initiated I/O (9편, 핵심)
+│       ├── O-offload/           ← GPU-NVMe 오프로드 (8편)
+│       └── N-industry/          ← 산업 동향 (5편)
 ├── analysis/                    ← 코드 분석 상세
 │   ├── bam/                     ← BaM 코드 분석 (README + 8개 상세)
 │   ├── gpgpu-sim/               ← GPGPU-Sim 시뮬레이터 분석 (9개)
