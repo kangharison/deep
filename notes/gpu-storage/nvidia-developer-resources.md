@@ -522,7 +522,7 @@ Phase 5: 시스템 & 응용 (1주)
 ├── #94-96 DGX 시스템 토폴로지
 ├── #101-105 DPU, DPDK, GPU 패킷 처리
 ├── #111-115 Magnum IO 통합 프레임워크
-└── notes/gpu.md 논문 읽기 순서와 병행
+└── papers/README.md 논문 읽기 순서와 병행
 ```
 
 ---
@@ -531,8 +531,8 @@ Phase 5: 시스템 & 응용 (1주)
 
 | 기존 노트 | GPU 리소스와의 연결 |
 |-----------|---------------------|
-| `notes/nvme_driver.md` | NVMe 드라이버가 PCIe BAR를 통해 SQ/CQ에 접근하는 방식 → GPU도 PCIe BAR로 자신의 메모리를 노출 (#88, #89) |
-| `notes/spdk.md` | SPDK가 kernel bypass하는 것처럼 → GPUDirect Storage도 CPU bounce buffer를 bypass (#70-77) |
-| `notes/bam.md` | BaM은 GPU가 직접 NVMe SQ/CQ를 제어 → CUDA Programming Guide의 메모리 모델 이해 필요 (#1, #46) |
-| `notes/gpu-pcie-nvme-experiments.md` | PCIe 토폴로지 실험 → GDS Configuration Guide의 토폴로지 요구사항과 직결 (#73-75) |
-| `notes/gpu.md` 논문 | P2P DMA 관련 논문들 → Linux P2PDMA 문서 (#78), ssd-gpu-dma (#B6), SPIN (#B9) |
+| `notes/kernel/nvme-driver.md` | NVMe 드라이버가 PCIe BAR를 통해 SQ/CQ에 접근하는 방식 → GPU도 PCIe BAR로 자신의 메모리를 노출 (#88, #89) |
+| `notes/kernel/spdk.md` | SPDK가 kernel bypass하는 것처럼 → GPUDirect Storage도 CPU bounce buffer를 bypass (#70-77) |
+| `analysis/bam/` | BaM은 GPU가 직접 NVMe SQ/CQ를 제어 → CUDA Programming Guide의 메모리 모델 이해 필요 (#1, #46) |
+| `notes/gpu-storage/experiment-design.md` | PCIe 토폴로지 실험 → GDS Configuration Guide의 토폴로지 요구사항과 직결 (#73-75) |
+| `papers/` 논문 | P2P DMA 관련 논문들 → Linux P2PDMA 문서 (#78), ssd-gpu-dma (#B6), SPIN (#B9) |
