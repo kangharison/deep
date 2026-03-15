@@ -1,5 +1,8 @@
 # 18. CPU MMU Page Fault Tracing (mmiotrace) vs IOMMU Page Fault Tracing: 대칭 구조 분석
 
+> **대상 아키텍처**: x86_64 (Intel VT-d IOMMU 기준)
+> **용어 주의**: 이 문서에서 "ARM/DISARM"은 ARM 아키텍처가 아니라 "무장/해제(트랩 설치/해제)"를 의미한다. 커널 함수명 `arm_kmmio_fault_page()` / `disarm_kmmio_fault_page()`에서 유래한 용어이다.
+
 ## 1. 대칭 구조: 같은 패턴의 두 가지 적용
 
 CPU MMU 기반 MMIO tracing과 IOMMU 기반 DMA tracing은 놀랍도록 동일한 설계 패턴을 사용한다.
