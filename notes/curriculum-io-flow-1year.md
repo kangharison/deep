@@ -18,10 +18,13 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  APPLICATION (fio, custom app)                                      │
-│  write(fd, buf, len)  /  io_submit()  /  io_uring_enter()           │
+│  FIO / APPLICATION                                                   │
+│  fio: ioengine 선택 (sync/libaio/io_uring/pvsync2)                  │
+│  engines/sync.c → write()                                           │
+│  engines/libaio.c → io_submit()                                     │
+│  engines/io_uring.c → io_uring_enter()                              │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │ syscall (SWI/SYSCALL instruction)
+                               │ syscall (SYSCALL instruction)
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  SYSCALL ENTRY  (arch/x86/entry/entry_64.S → do_syscall_64)        │
@@ -63,7 +66,24 @@
 │  nvme_queue_rq() → nvme_setup_cmd() → nvme_map_data()              │
 │  → nvme_submit_cmd() → writel(sq->tail, q->q_db)  ← doorbell       │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │ PCIe MMIO Write (doorbell)
+                               │ writel() = MMIO store
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PCIe LAYER  (CPU ↔ Device 물리 전송)                               │
+│  CPU store → write combining buffer → Root Complex                  │
+│  → PCIe TLP (Memory Write, 3DW/4DW header + 4B payload)            │
+│  → Switch/Bridge → Endpoint (NVMe Controller)                       │
+│  DMA: TLP Memory Read/Write (PRP 기반 데이터 전송)                   │
+│  MSI-X: TLP Memory Write to LAPIC address                           │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ QEMU: memory_region MMIO trap
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  QEMU PCIe EMULATION  (hw/pci/, hw/pci-host/)                      │
+│  MMIO dispatch: flatview → MemoryRegion → nvme_mmio_ops            │
+│  DMA dispatch: pci_dma_read/write → address_space_rw               │
+│  MSI-X: msix_notify() → MSI address/data → LAPIC                   │
+└──────────────────────────────┬──────────────────────────────────────┘
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  QEMU NVMe DEVICE  (hw/nvme/ctrl.c)                                │
@@ -74,10 +94,11 @@
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  COMPLETION PATH (역방향)                                            │
-│  QEMU: nvme_enqueue_req_completion() → msix_notify()                │
+│  QEMU: nvme_enqueue_req_completion() → nvme_post_cqes()             │
+│        → msix_notify() → PCIe TLP(MSI-X) → LAPIC → CPU interrupt   │
 │  KERNEL: nvme_irq() → nvme_process_cq() → nvme_pci_complete_rq()   │
 │  → blk_mq_end_request() → bio_endio() → dio_complete()             │
-│  → complete()/wakeup → userspace return                             │
+│  → complete()/wakeup → fio td->io_u_completed++                    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
