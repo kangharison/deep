@@ -2,38 +2,47 @@
 
 NVMe PCIe-Level Bidirectional Command Tracer for Linux.
 
-NVMe 디바이스와 호스트 간의 모든 통신을 **PCIe 레벨**에서 탐지하고 기록한다. 핵심 목표는 디바이스가 호스트 메모리에 실제로 접근하는 시점을 Page Fault / 메모리 폴링 메커니즘으로 직접 잡는 것이다.
+NVMe 디바이스와 호스트 간의 모든 통신을 **PCIe 레벨**에서 탐지하고 기록한다. 핵심 목표는 디바이스가 호스트 메모리에 DMA 접근하는 순간을 **IOMMU page fault**로 직접 잡는 것이다.
 
-## 핵심 아이디어: kprobe(간접) vs Page Fault(직접)
+## 핵심 아이디어: IOMMU Page Fault로 PCIe DMA 접근 탐지
 
 ```
-기존 방식 (kprobe):
-  NVMe SSD --DMA Write--> CQ 메모리 --MSI-X IRQ--> nvme_irq() ← kprobe가 여기를 잡음
-  문제: 실제 DMA Write 시점과 kprobe 시점 사이에 수 μs 갭
+CQ 폴링 (간접):
+  NVMe SSD --DMA Write--> CQ 메모리 변화 ← 호스트 CPU가 "값이 바뀌었네?" → 결과를 보는 것
 
-새로운 방식 (Page Fault / 메모리 폴링):
-  NVMe SSD --DMA Write--> CQ 메모리의 Phase bit 변화 ← CQ 폴링이 여기를 잡음
-  NVMe SSD --DMA 시도---> IOMMU PTE 권한 없음 → Fault ← IOMMU fault가 여기를 잡음
+IOMMU Page Fault (직접):
+  NVMe SSD --DMA Write 시도--> IOMMU PTE에 Write 권한 없음
+                                    |
+                                    v
+                              IOMMU Fault! ← PCIe TLP 자체를 IOMMU가 차단
+                                    |
+                                    v
+                              dmar_fault() IRQ → Fault Record에서 정보 추출
+                              - Fault Address: CQ의 IOVA
+                              - Source ID: NVMe 디바이스 BDF
+                              - Reason 0x05: "PTE Write access is not set"
+                              - Type: DMA Write
 ```
 
 ## 탐지 방식 비교
 
-| 방식 | 모듈 | 탐지 수준 | 투명성 | 하드웨어 요구 | 상태 |
-|------|------|-----------|--------|---------------|------|
-| **CQ 메모리 폴링** | `nvme_cq_poll_tracer.c` | PCIe DMA Write 직접 탐지 | 투명 (비파괴) | 없음 | Phase 1 구현 |
-| **IOMMU Fault** | `nvme_iommu_fault_tracer.c` | PCIe TLP 직접 탐지 | 파괴적 (교육용) | Intel VT-d | Phase 2 구현 |
-| IOMMU Access/Dirty Bit | (미구현) | PCIe DMA 페이지 추적 | 투명 | VT-d Scalable Mode | Phase 3 계획 |
-| IOMMU PRI | (미구현) | PCIe TLP + 자동 재시도 | 투명 | VT-d + ATS/PRI | Phase 4 계획 |
-| kprobe (보조) | `nvme_sq_monitor.c` 등 | 커널 함수 호출 시점 | 투명 | 없음 | Host→Device 보조용 |
+| 방식 | 모듈 | 탐지 수준 | 특성 | 하드웨어 요구 | 상태 |
+|------|------|-----------|------|---------------|------|
+| **★ IOMMU Fault** | `nvme_iommu_fault_tracer.c` | **PCIe TLP 직접 차단** | DMA abort (파괴적) | Intel VT-d | **핵심 구현** |
+| CQ 메모리 폴링 | `nvme_cq_poll_tracer.c` | 메모리 값 변화 관찰 | 비파괴, 간접적 | 없음 | 보조 |
+| IOMMU Access/Dirty Bit | (미구현) | IOMMU PTE A/D 비트 | 비파괴, 투명 | VT-d Scalable Mode | 계획 |
+| IOMMU PRI | (미구현) | PCIe TLP + 자동 재시도 | 비파괴, 투명 | VT-d + ATS/PRI | 계획 |
+| kprobe (보조) | `nvme_sq_monitor.c` 등 | 커널 함수 호출 시점 | 비파괴, 간접적 | 없음 | Host→Device 보조 |
 
 ```
-탐지 시점 비교 (타임라인):
+탐지 수준 비교:
 
-  t0: 디바이스가 CQE를 DMA Write    ← CQ 폴링은 여기를 잡음 (가장 빠름)
-  t1: IOMMU가 접근을 감지            ← IOMMU Fault는 여기를 잡음
-  t2: 디바이스가 MSI-X 인터럽트 발생
-  t3: CPU가 인터럽트 수신
-  t4: nvme_irq() 진입               ← kprobe는 여기를 잡음 (가장 늦음)
+  kprobe:       "nvme_irq()가 호출되었다" → 커널 함수 시점 (간접)
+  CQ 폴링:      "CQ 메모리 값이 바뀌었다" → 결과 관찰 (간접)
+  IOMMU Fault:  "디바이스가 IOVA에 DMA Write를 시도했다" → PCIe TLP 자체 (직접!)
+
+  IOMMU Fault만이 진짜 PCIe 레벨 탐지이다.
+  대가: 해당 DMA는 abort되고 NVMe 컨트롤러가 에러 상태에 빠진다.
 ```
 
 ## 아키텍처
@@ -130,49 +139,68 @@ nvme-pcie-tracer/
 - `bpftrace` (BPF 스크립트, optional)
 - `python3` with `matplotlib` (시각화, optional)
 
-## Quick Start
-
-### Phase 1: CQ 메모리 폴링 (권장, 안전)
+## Quick Start: IOMMU Fault로 CQ DMA Write 탐지
 
 ```bash
-# 1. 환경 설정
-sudo scripts/setup.sh
+# 0. 전제 조건
+#    - Intel VT-d IOMMU 활성화: 부트 파라미터에 intel_iommu=on iommu.passthrough=0
+#    - 실험용 NVMe (fault 시 컨트롤러 에러 발생, 데이터 손실 가능)
+dmesg | grep -i "IOMMU\|DMAR"       # IOMMU 활성 확인
+lspci -d ::0108                       # NVMe BDF 확인
 
-# 2. nvme_queue 구조체 오프셋 확인 (커널 버전마다 다름)
+# 1. nvme_queue 구조체 오프셋 확인
 pahole -C nvme_queue /sys/kernel/btf/vmlinux
+# → cq_dma_addr, q_depth, qid 오프셋 메모
 
-# 3. 커널 모듈 빌드
+# 2. 커널 모듈 빌드
 cd kernel && make
 
-# 4. CQ 폴링 모듈 로드 (오프셋 값은 pahole 결과로 대체)
+# 3. 모듈 로드 (오프셋은 pahole 결과로 대체)
+sudo insmod nvme_iommu_fault_tracer.ko \
+  target_pci='0000:03:00.0' \
+  target_qid=1 \
+  off_cq_dma_addr=XX off_q_depth=XX off_qid=XX
+
+# 4. 상태 확인
+cat /sys/kernel/debug/nvme-iommu-fault/status
+
+# 5. I/O 발생 → CQ IOVA 자동 캡처
+dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1
+
+# 6. CQ IOVA 캡처 확인
+cat /sys/kernel/debug/nvme-iommu-fault/status
+# → "CQ Captured: YES, CQ IOVA: 0x..."
+
+# 7. ★ IOMMU Fault 유발 (CQ Write 권한 제거) ★
+echo arm > /sys/kernel/debug/nvme-iommu-fault/control
+# → CQ IOVA가 Read-Only로 변경됨
+# → 다음 디바이스 DMA Write → IOMMU fault!
+
+# 8. I/O 발생 → 디바이스가 CQ에 DMA Write 시도 → IOMMU FAULT!
+dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1
+# → 이 I/O는 실패함 (DMA abort)
+
+# 9. Fault 로그 확인
+cat /sys/kernel/debug/nvme-iommu-fault/log
+# → IOVA=0x..., Source=03:00.0, Type=Write, Reason=0x05
+#    "PTE Write access is not set" → CQ DMA Write가 잡혔다!
+
+# 10. 복원
+echo disarm > /sys/kernel/debug/nvme-iommu-fault/control
+echo 1 > /sys/class/nvme/nvme0/reset_controller
+```
+
+### 보조: CQ 메모리 폴링 (비파괴, 간접 관찰)
+
+```bash
+# CQ 폴링은 "메모리 값 변화를 CPU가 읽어서 확인"하는 것이지
+# 디바이스의 DMA 접근을 직접 잡는 것이 아니다.
+# IOMMU fault와 비교/보조 용도로 사용.
+
 sudo insmod nvme_cq_poll_tracer.ko \
   target_qid=1 \
   off_cqes=XX off_q_depth=XX off_cq_head=XX \
   off_qid=XX off_cq_phase=XX
-
-# 5. I/O 발생시켜 nvme_queue 정보 캡처
-dd if=/dev/nvme0n1 of=/dev/null bs=4k count=1
-
-# 6. 캡처 확인 및 폴링 시작
-cat /sys/kernel/debug/nvme-cq-poll/info_captured
-cat /sys/kernel/debug/nvme-cq-poll/total_detected
-```
-
-### Phase 2: IOMMU Fault 탐지 (실험/교육용)
-
-```bash
-# 1. IOMMU 활성화 확인
-dmesg | grep -i "IOMMU\|DMAR"
-
-# 2. NVMe 디바이스 BDF 확인
-lspci -d ::0108
-
-# 3. IOMMU Fault 모듈 로드 (관찰 모드)
-sudo insmod nvme_iommu_fault_tracer.ko target_pci='0000:03:00.0'
-
-# 4. Fault 로그 확인
-cat /sys/kernel/debug/nvme-iommu-fault/fault_log
-cat /sys/kernel/debug/nvme-iommu-fault/iommu_info
 ```
 
 ### BPF 스크립트 (커널 모듈 불필요)
@@ -225,10 +253,14 @@ Host → Device (0x01xx) - kprobe 보조
 
 ## 구현 로드맵
 
-- [x] Phase 1: CQ 메모리 폴링 (`nvme_cq_poll_tracer.c`)
-- [x] Phase 2: IOMMU Fault Handler (`nvme_iommu_fault_tracer.c`)
-- [ ] Phase 3: IOMMU Access/Dirty Bit 추적 (VT-d Scalable Mode)
-- [ ] Phase 4: IOMMU PRI (Page Request Interface, ATS/PRI 필요)
+- [x] **Phase 1: IOMMU Fault** (`nvme_iommu_fault_tracer.c`) — 핵심
+  - dmar_fault_do_one() kprobe로 모든 IOMMU fault 캡처
+  - CQ IOVA의 IOMMU Write 권한 제거로 DMA Write fault 유발
+  - Fault Record에서 IOVA, BDF, Reason, Read/Write 추출
+  - debugfs arm/disarm 인터페이스
+- [x] 보조: CQ 메모리 폴링 (`nvme_cq_poll_tracer.c`) — 비파괴 간접 관찰
+- [ ] Phase 2: IOMMU Access/Dirty Bit 추적 (VT-d Scalable Mode) — 비파괴 직접 탐지
+- [ ] Phase 3: IOMMU PRI (Page Request Interface) — 비파괴 + 자동 재시도
 - [x] 보조: Host→Device kprobe 모듈들 (SQ, Doorbell, MMIO, DMA, IRQ)
 
 자세한 설계: [`docs/01_pcie_fault_based_detection.md`](docs/01_pcie_fault_based_detection.md)

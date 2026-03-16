@@ -1,342 +1,716 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * nvme_iommu_fault_tracer.c - IOMMU Fault 기반 PCIe DMA 접근 탐지
+ * nvme_iommu_fault_tracer.c - IOMMU Page Fault로 PCIe DMA 접근 직접 탐지
  *
  * ============================================================================
  * 목적
  * ============================================================================
  *
- * NVMe 디바이스의 DMA 접근을 IOMMU page fault 메커니즘으로 탐지한다.
- * kprobe가 커널 함수 호출을 잡는 "간접적" 방법이라면,
- * IOMMU fault는 실제 PCIe TLP(Transaction Layer Packet)가
- * IOMMU를 통과하는 시점을 잡는 "직접적" 방법이다.
+ * NVMe 디바이스가 호스트 메모리(SQ, CQ, Data)에 DMA 접근하는 순간을
+ * IOMMU page fault로 직접 탐지한다.
+ *
+ * CQ 폴링은 "호스트가 메모리를 읽어서 값이 바뀌었는지 확인"하는 것이고,
+ * IOMMU fault는 "디바이스가 PCIe TLP를 보내는 순간 IOMMU가 차단"하는 것이다.
+ * 후자만이 진짜 PCIe 레벨 탐지이다.
  *
  * ============================================================================
- * 동작 원리
+ * 동작 흐름
  * ============================================================================
  *
- * 1. NVMe 디바이스의 IOMMU 도메인을 획득한다.
- * 2. iommu_set_fault_handler()로 커스텀 fault handler를 등록한다.
- * 3. 정상 동작 중 IOMMU fault는 발생하지 않는다.
- * 4. 의도적으로 IOMMU 매핑을 조작하면 fault를 유발할 수 있다.
+ *   ┌─────────────────────────────────────────────────────────────────┐
+ *   │ 1. 모듈 로드                                                   │
+ *   │    → dmar_fault()에 kprobe 등록 (fault 감지 준비)             │
+ *   │    → nvme_irq()에 kprobe 등록 (CQ IOVA 추출용)               │
+ *   │                                                                 │
+ *   │ 2. I/O 발생 → nvme_irq() kprobe가 CQ IOVA/크기 추출         │
+ *   │                                                                 │
+ *   │ 3. debugfs에서 "arm" 명령                                     │
+ *   │    → CQ IOVA의 IOMMU 매핑에서 Write 권한 제거                │
+ *   │    → IOTLB flush                                               │
+ *   │                                                                 │
+ *   │ 4. NVMe 디바이스가 CQ에 DMA Write 시도                       │
+ *   │    → IOMMU가 "PTE Write access is not set" fault 발생        │
+ *   │    → PCIe Completion에 UR 반환 → DMA 실패                    │
+ *   │                                                                 │
+ *   │ 5. dmar_fault() IRQ handler 호출                              │
+ *   │    → 우리의 kprobe가 fault 정보 캡처:                        │
+ *   │      - Fault Address (IOVA) ← CQ의 DMA 주소                  │
+ *   │      - Source ID (BDF)      ← NVMe 디바이스의 BDF             │
+ *   │      - Fault Reason 0x05    ← "PTE Write access is not set"  │
+ *   │      - Type = Write         ← DMA Write (CQ 기록)            │
+ *   │                                                                 │
+ *   │ 6. 즉시 IOMMU 매핑 복원 (Write 권한 재설정)                  │
+ *   │                                                                 │
+ *   │ ★ 결과: "디바이스가 CQ IOVA에 DMA Write를 시도했다"를        │
+ *   │   PCIe 레벨에서 확인! 하지만 해당 DMA는 실패함.              │
+ *   │   NVMe 컨트롤러 리셋이 필요할 수 있음.                       │
+ *   └─────────────────────────────────────────────────────────────────┘
  *
  * ============================================================================
- * IOMMU Fault 경로 (Intel VT-d)
+ * Fault 탐지 방법: dmar_fault() kprobe
  * ============================================================================
  *
- * 디바이스가 DMA 접근 시도
- *   → PCIe TLP (Memory Read/Write)
- *     → IOMMU가 IOVA → HPA 변환 시도
- *       → IOMMU PTE에 접근 권한 없음 (R=0 또는 W=0)
- *         → IOMMU Fault Record 생성
- *           → IOMMU MSI 인터럽트 → CPU
- *             → dmar_fault() IRQ handler    [drivers/iommu/intel/dmar.c]
- *               → dmar_fault_do_one()
+ * iommu_set_fault_handler()는 DMA 도메인(cookie_type=DMA_IOVA)에서
+ * 동작하지 않는다. Intel VT-d의 dmar_fault() IRQ handler를 직접
+ * kprobe로 후킹하면 어떤 도메인에서든 fault를 잡을 수 있다.
  *
- * dmar_fault_do_one()은 기본적으로 dmesg에 경고만 출력한다:
- *   "DMAR: DRHD: handling fault status reg 2"
- *   "DMAR: [DMA Read/Write] Request device [03:00.0] ..."
+ * dmar_fault() 내부에서 Fault Record를 읽는 위치:
  *
- * report_iommu_fault()가 호출되면 우리의 handler가 실행된다.
+ *   Fault Record Base = iommu->reg + cap_fault_reg_offset(iommu->cap)
+ *   각 record는 16바이트:
+ *     +0  [63:12] Fault Address (IOVA)
+ *     +8  [15:0]  Source ID (BDF)
+ *     +12 [7:0]   Fault Reason
+ *     +12 [30]    Type (0=Write, 1=Read)
+ *     +12 [31]    Valid bit
  *
- * ============================================================================
- * Intel VT-d Fault Record 구조
- * ============================================================================
- *
- * Fault Recording Register (16 bytes per record):
- *
- *   +0 [63:12] Fault Address (IOVA, 4KB 정렬)
- *   +0 [11:0]  Reserved
- *   +8 [31]    Fault (F) - valid bit
- *   +8 [30]    Type (T) - 0=DMA Write fault, 1=DMA Read fault
- *   +8 [29]    PASID Present (PP)
- *   +8 [27:20] Fault Reason
- *   +8 [19:8]  Source ID [bus:dev.func]
- *   +8 [7:0]   PASID value (lower bits)
- *
- * Fault Reason 코드:
- *   0x01: "Present bit in root entry is clear"
- *   0x02: "Present bit in context entry is clear"
- *   0x05: "PTE Write access is not set"    ← CQ Write, Data DMA Write
- *   0x06: "PTE Read access is not set"     ← SQ Fetch (DMA Read)
- *   0x07: "Next page table ptr is invalid"
+ *   Fault Reason:
+ *     0x05 = "PTE Write access is not set"  ← CQ Write 차단
+ *     0x06 = "PTE Read access is not set"   ← SQ Fetch 차단
+ *     0x01 = "Present bit in root entry is clear"
+ *     0x02 = "Present bit in context entry is clear"
  *
  * ============================================================================
- * 주의사항
+ * Fault 유발 방법: IOMMU PTE 권한 조작
  * ============================================================================
  *
- * ★ IOMMU fault는 DMA를 abort시킨다! ★
+ * Intel VT-d 2nd-Level PTE:
+ *   bit 0: Read permission   (DMA_PTE_READ)
+ *   bit 1: Write permission  (DMA_PTE_WRITE)
  *
- * CPU의 kmmio(PTE fault)는 Single-Step으로 접근을 허용한 후 다시 차단하지만,
- * IOMMU fault는 해당 DMA 트랜잭션을 중단(abort)시킨다.
- * PCIe Completion에 UR(Unsupported Request)가 반환되어
- * NVMe 컨트롤러가 에러 상태(CSTS.CFS=1)에 빠질 수 있다.
+ * CQ 영역의 Write 권한만 제거하면:
+ *   → 디바이스의 DMA Read(있다면)는 통과
+ *   → 디바이스의 DMA Write(CQ 기록)는 fault
+ *   → Fault Reason = 0x05 "PTE Write access is not set"
  *
- * 따라서 이 모듈은:
- *   - 교육/실험 목적으로 IOMMU fault 메커니즘을 이해하는 용도
- *   - 의도적 fault 유발은 별도 디바이스(사용하지 않는 NVMe)에서만
- *   - 정상 운영 중에는 fault handler 등록만 하고 관찰만 한다
+ * API:
+ *   iommu_unmap(domain, cq_iova, cq_size)    → 매핑 완전 제거
+ *   iommu_map(domain, cq_iova, cq_phys, cq_size, IOMMU_READ, GFP_KERNEL)
+ *     → Read-Only로 재매핑 (Write만 차단)
+ *   또는 완전 unmap 후 fault 확인 후 remap
+ *
+ * ============================================================================
+ * ★ 경고: 이 모듈은 NVMe 디바이스를 죽입니다 ★
+ * ============================================================================
+ *
+ * IOMMU fault = DMA abort = PCIe UR Completion
+ * → NVMe 컨트롤러 CSTS.CFS=1 (Controller Fatal Status)
+ * → nvme_reset_work() → 컨트롤러 리셋 필요
+ *
+ * 사용 대상:
+ *   - 실험용 NVMe (데이터 손실 가능)
+ *   - 또는 nvme_core.multipath=N 상태에서 여분의 NVMe
+ *
+ * 복구:
+ *   echo 1 > /sys/class/nvme/nvmeX/reset_controller
+ *   또는 rmmod nvme && modprobe nvme
  */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/iommu.h>
-#include <linux/dma-mapping.h>
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
 #include <linux/timekeeping.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/delay.h>
 
 #include "nvme_trace_event.h"
 #include "trace_buffer.h"
 
-/* 모듈 파라미터 */
+/*
+ * ============================================================================
+ * 모듈 파라미터
+ * ============================================================================
+ */
+
 static char *target_pci = "";
 module_param(target_pci, charp, 0444);
 MODULE_PARM_DESC(target_pci,
-	"Target NVMe PCI device BDF (e.g., '0000:03:00.0')");
+	"Target NVMe PCI BDF (e.g., '0000:03:00.0')");
 
-/*
- * 의도적 fault 유발 모드
- * 0: 관찰만 (안전)
- * 1: 지정된 IOVA 영역의 매핑을 해제하여 fault 유발 (위험!)
- */
-static int provoke_fault;
-module_param(provoke_fault, int, 0644);
-MODULE_PARM_DESC(provoke_fault,
-	"0=observe only (safe), 1=provoke IOMMU fault (DANGEROUS!)");
+static int target_qid = 1;
+module_param(target_qid, int, 0444);
+MODULE_PARM_DESC(target_qid,
+	"Target NVMe queue ID for CQ fault (default=1)");
+
+/* nvme_queue 오프셋 (CQ IOVA 추출용) */
+static int off_cq_dma_addr = -1;
+static int off_q_depth = -1;
+static int off_qid = -1;
+module_param(off_cq_dma_addr, int, 0444);
+module_param(off_q_depth, int, 0444);
+module_param(off_qid, int, 0444);
+MODULE_PARM_DESC(off_cq_dma_addr,
+	"Offset of cq_dma_addr in nvme_queue (pahole로 확인)");
 
 /*
  * ============================================================================
- * IOMMU Fault 컨텍스트
+ * Fault 로그
  * ============================================================================
  */
 
 #define MAX_FAULT_LOG 256
 
-struct iommu_fault_entry {
-	u64 timestamp_ns;
-	unsigned long iova;       /* Fault 주소 */
-	int flags;                /* IOMMU_FAULT_READ/WRITE */
-	char dev_name[32];        /* 디바이스 이름 */
-	char classification[32];  /* SQ_FETCH / CQ_WRITE / DATA_DMA / UNKNOWN */
+struct dmar_fault_record {
+	u64  timestamp_ns;
+	u64  fault_addr;       /* IOVA (4KB 정렬) */
+	u16  source_id;        /* BDF: bus[15:8] devfn[7:0] */
+	u8   fault_reason;     /* 0x05=Write denied, 0x06=Read denied 등 */
+	u8   fault_type;       /* 0=DMA Write, 1=DMA Read */
+	u32  pasid;
+	bool pasid_present;
+	char classification[16]; /* CQ_WRITE / SQ_FETCH / DATA / UNKNOWN */
 };
 
-struct iommu_fault_ctx {
+struct fault_ctx {
 	struct pci_dev *pdev;
 	struct iommu_domain *domain;
+	u16 target_bdf;         /* 타겟 NVMe의 BDF (Source ID 필터링용) */
 
-	/* Fault 로그 (ring buffer) */
-	struct iommu_fault_entry log[MAX_FAULT_LOG];
+	/* CQ 정보 (kprobe로 추출) */
+	dma_addr_t cq_iova;     /* CQ DMA 주소 */
+	phys_addr_t cq_phys;    /* CQ 물리 주소 (remap용) */
+	size_t cq_size;          /* CQ 크기 (바이트) */
+	u32 cq_q_depth;
+	bool cq_info_captured;
+
+	/* Fault 상태 */
+	bool armed;              /* IOMMU PTE 조작 중 */
+
+	/* Fault 로그 */
+	struct dmar_fault_record log[MAX_FAULT_LOG];
 	unsigned int log_head;
 	unsigned int log_count;
 	spinlock_t log_lock;
 
-	/* NVMe DMA 주소 범위 (분류용, kprobe로 추출) */
-	struct {
-		dma_addr_t sq_iova;
-		size_t sq_size;
-		dma_addr_t cq_iova;
-		size_t cq_size;
-	} nvme_ranges;
-	bool ranges_known;
-
 	/* 통계 */
 	atomic64_t total_faults;
-	atomic64_t read_faults;   /* DMA Read fault (SQ Fetch 등) */
-	atomic64_t write_faults;  /* DMA Write fault (CQ Write 등) */
+	atomic64_t target_faults; /* 타겟 NVMe에서 온 fault만 */
 
 	/* debugfs */
 	struct dentry *debugfs_dir;
 };
 
-static struct iommu_fault_ctx fault_ctx;
+static struct fault_ctx fctx;
 
 /*
  * ============================================================================
- * IOMMU Fault Handler
+ * Part 1: dmar_fault() kprobe - IOMMU Fault Record 직접 읽기
  * ============================================================================
  *
- * iommu_set_fault_handler()로 등록하는 콜백이다.
+ * dmar_fault()는 IOMMU MSI IRQ handler이다.
+ * 시그니처: irqreturn_t dmar_fault(int irq, void *dev_id)
+ *   x86_64: RDI=irq, RSI=dev_id(struct intel_iommu *)
  *
- * 이 핸들러가 호출되는 경로 (Intel VT-d):
+ * struct intel_iommu의 첫 번째 필드가 reg(void __iomem *)이다.
+ * iommu->reg + DMAR_FSTS_REG(0x34)에서 Fault Status를 읽고,
+ * Fault Record에서 IOVA, Source ID, Reason을 추출한다.
  *
- *   dmar_fault() [drivers/iommu/intel/dmar.c:1899]
- *     IOMMU MSI IRQ handler. Fault Status Register(DMAR_FSTS_REG)를 읽고
- *     Fault Record에서 정보를 추출한다.
+ * dmar_fault()에 kprobe를 걸면:
+ *   - 어떤 도메인이든 상관없이 모든 IOMMU fault를 잡음
+ *   - Fault Record의 원시 정보에 접근 가능
+ *   - DMA 도메인에서도 동작 (iommu_set_fault_handler() 제약 없음)
  *
- *   → dmar_fault_do_one() [dmar.c:1806]
- *       pr_err("DMAR: [DMA %s] ... fault addr %llx [fault reason %s] ...")
- *       Fault 정보를 dmesg에 출력한다.
+ * 그러나 dmar_fault() 진입 시점에는 아직 fault record를 처리하기 전이므로,
+ * kretprobe를 사용하여 dmar_fault() 실행 후에 로그를 확인하거나,
+ * dmar_fault_do_one()을 직접 후킹하는 것이 더 정확하다.
  *
- *   현재 커널(6.x)에서는 Intel VT-d의 non-recoverable fault에 대해
- *   report_iommu_fault()가 호출되지 않는 경우가 있다.
- *   이 경우 dmesg의 DMAR 에러 메시지를 파싱해야 한다.
+ * dmar_fault_do_one() 시그니처:
+ *   static int dmar_fault_do_one(struct intel_iommu *iommu, int type,
+ *       u8 fault_reason, u32 pasid, u16 source_id, unsigned long long addr)
+ *   x86_64: RDI=iommu, RSI=type, RDX=fault_reason,
+ *           RCX=pasid, R8=source_id, R9=addr
  *
- *   확실한 호출을 위해서는 커널 패치가 필요할 수 있다:
- *   dmar_fault_do_one()에서 report_iommu_fault() 호출 추가.
- *
- * 시그니처:
- *   int handler(struct iommu_domain *domain, struct device *dev,
- *               unsigned long iova, int flags, void *token)
- *
- * flags:
- *   IOMMU_FAULT_READ  (1): DMA Read fault
- *   IOMMU_FAULT_WRITE (2): DMA Write fault
- *
- * 반환값:
- *   -ENOSYS: 핸들러가 처리하지 않음
- *   0: 처리 완료
+ * → dmar_fault_do_one()을 후킹하면 파싱된 정보를 바로 얻는다!
  */
-static int nvme_iommu_fault_handler(struct iommu_domain *domain,
-				    struct device *dev,
-				    unsigned long iova,
-				    int flags, void *token)
+
+static struct kprobe fault_kprobe;
+static bool fault_kprobe_registered;
+
+/*
+ * dmar_fault_do_one_handler - IOMMU fault 정보 캡처
+ *
+ * dmar_fault_do_one()이 호출될 때 이미 fault record가 파싱되어
+ * 함수 인자로 전달된다. 우리는 이 인자를 읽기만 하면 된다.
+ *
+ * 인자 (x86_64 calling convention):
+ *   RDI: struct intel_iommu *iommu  (사용하지 않음)
+ *   RSI: int type                   0=Write fault, 1=Read fault
+ *   RDX: u8 fault_reason            0x05=Write denied, 0x06=Read denied
+ *   RCX: u32 pasid
+ *   R8:  u16 source_id              BDF (bus:dev.func)
+ *   R9:  unsigned long long addr    Fault IOVA
+ */
+static int dmar_fault_do_one_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct iommu_fault_ctx *ctx = token;
-	struct iommu_fault_entry *entry;
 	u64 ts = ktime_get_ns();
+	int type = (int)regs->si;               /* 0=Write, 1=Read */
+	u8 fault_reason = (u8)regs->dx;
+	u32 pasid = (u32)regs->cx;
+	u16 source_id = (u16)regs->r8;
+	u64 fault_addr = (u64)regs->r9;
+
+	struct dmar_fault_record *rec;
 	unsigned long irq_flags;
 	const char *classification = "UNKNOWN";
+	bool is_target;
 
-	atomic64_inc(&ctx->total_faults);
+	atomic64_inc(&fctx.total_faults);
 
-	if (flags & IOMMU_FAULT_READ)
-		atomic64_inc(&ctx->read_faults);
-	if (flags & IOMMU_FAULT_WRITE)
-		atomic64_inc(&ctx->write_faults);
+	/* 타겟 NVMe 디바이스의 BDF와 비교 */
+	is_target = (source_id == fctx.target_bdf);
+	if (is_target)
+		atomic64_inc(&fctx.target_faults);
 
-	/*
-	 * IOVA 범위로 접근 유형 분류
-	 *
-	 * NVMe DMA 매핑:
-	 *   SQ: dma_alloc_coherent() → sq_dma_addr
-	 *        디바이스가 DMA Read로 커맨드를 가져감 (SQ Fetch)
-	 *   CQ: dma_alloc_coherent() → cq_dma_addr
-	 *        디바이스가 DMA Write로 완료 엔트리를 기록함 (CQ Write)
-	 *   Data: dma_map_sg() → scatter-gather IOVA
-	 *        데이터 읽기/쓰기 DMA
-	 */
-	if (ctx->ranges_known) {
-		if (iova >= ctx->nvme_ranges.sq_iova &&
-		    iova < ctx->nvme_ranges.sq_iova +
-			    ctx->nvme_ranges.sq_size) {
-			classification = "SQ_FETCH";
-		} else if (iova >= ctx->nvme_ranges.cq_iova &&
-			   iova < ctx->nvme_ranges.cq_iova +
-				   ctx->nvme_ranges.cq_size) {
-			classification = "CQ_WRITE";
+	/* IOVA 범위로 접근 유형 분류 */
+	if (is_target && fctx.cq_info_captured) {
+		if (fault_addr >= fctx.cq_iova &&
+		    fault_addr < fctx.cq_iova + fctx.cq_size) {
+			if (type == 0)
+				classification = "CQ_WRITE";
+			else
+				classification = "CQ_READ";
 		} else {
 			classification = "DATA_DMA";
 		}
 	}
 
-	/* Fault 로그에 기록 */
-	spin_lock_irqsave(&ctx->log_lock, irq_flags);
+	/* 로그 기록 */
+	spin_lock_irqsave(&fctx.log_lock, irq_flags);
 
-	entry = &ctx->log[ctx->log_head % MAX_FAULT_LOG];
-	entry->timestamp_ns = ts;
-	entry->iova = iova;
-	entry->flags = flags;
-	strscpy(entry->dev_name, dev_name(dev), sizeof(entry->dev_name));
-	strscpy(entry->classification, classification,
-		sizeof(entry->classification));
-	ctx->log_head++;
-	if (ctx->log_count < MAX_FAULT_LOG)
-		ctx->log_count++;
+	rec = &fctx.log[fctx.log_head % MAX_FAULT_LOG];
+	rec->timestamp_ns = ts;
+	rec->fault_addr = fault_addr;
+	rec->source_id = source_id;
+	rec->fault_reason = fault_reason;
+	rec->fault_type = (u8)type;
+	rec->pasid = pasid;
+	rec->pasid_present = (pasid != 0);
+	strscpy(rec->classification, classification,
+		sizeof(rec->classification));
+	fctx.log_head++;
+	if (fctx.log_count < MAX_FAULT_LOG)
+		fctx.log_count++;
 
-	spin_unlock_irqrestore(&ctx->log_lock, irq_flags);
+	spin_unlock_irqrestore(&fctx.log_lock, irq_flags);
 
-	/* trace_buffer에도 기록 */
+	/* trace_buffer에 기록 */
 	{
 		struct nvme_trace_event evt;
 
 		memset(&evt, 0, sizeof(evt));
 		evt.timestamp_ns = ts;
 		evt.cpu = smp_processor_id();
-
-		if (flags & IOMMU_FAULT_READ) {
-			evt.event_type = EVT_DMA_MAP; /* SQ Fetch 등 */
-		} else {
-			evt.event_type = EVT_DMA_UNMAP; /* CQ Write 등 */
-		}
-
+		evt.event_type = (type == 0) ? EVT_DMA_MAP : EVT_DMA_UNMAP;
 		evt.direction = DIR_DEVICE_TO_HOST;
-		evt.address = iova;
+		evt.address = fault_addr;
 		evt.flags = 0x10; /* DETECTED_BY_IOMMU_FAULT */
-		evt.dma.iova = iova;
-		evt.dma.dma_direction = (flags & IOMMU_FAULT_WRITE) ? 1 : 0;
+		evt.dma.iova = fault_addr;
+		evt.dma.dma_direction = type; /* 0=Write, 1=Read */
 
 		trace_buffer_write(&evt);
 	}
 
-	pr_info("nvme-iommu-fault: [%llu] FAULT! "
-		"iova=0x%lx dev=%s %s → %s\n",
-		ts, iova, dev_name(dev),
-		(flags & IOMMU_FAULT_READ) ? "DMA_READ" :
-		(flags & IOMMU_FAULT_WRITE) ? "DMA_WRITE" : "??",
+	/*
+	 * Fault 로그 출력
+	 *
+	 * 형식: dmar_fault_do_one()과 동일한 정보지만
+	 * 우리의 분류(CQ_WRITE 등)가 추가됨
+	 */
+	pr_info("nvme-iommu-fault: [%llu] ★ IOMMU FAULT ★\n"
+		"  Source: %04x:%02x:%02x.%x %s\n"
+		"  IOVA:   0x%016llx\n"
+		"  Type:   DMA %s\n"
+		"  Reason: 0x%02x (%s)\n"
+		"  Class:  %s\n",
+		ts,
+		0, source_id >> 8,
+		PCI_SLOT(source_id & 0xFF),
+		PCI_FUNC(source_id & 0xFF),
+		is_target ? "[TARGET]" : "",
+		fault_addr,
+		type == 0 ? "Write" : "Read",
+		fault_reason,
+		fault_reason == 0x05 ? "PTE Write access not set" :
+		fault_reason == 0x06 ? "PTE Read access not set" :
+		fault_reason == 0x01 ? "Root entry not present" :
+		fault_reason == 0x02 ? "Context entry not present" :
+		"other",
 		classification);
 
-	return -ENOSYS; /* 기본 fault 처리로 넘김 */
+	return 0;
 }
 
 /*
  * ============================================================================
- * debugfs: Fault 로그 조회
+ * Part 2: CQ IOVA 추출 (nvme_irq kprobe)
+ * ============================================================================
+ *
+ * CQ의 DMA 주소(IOVA)를 알아야 IOMMU 매핑을 조작할 수 있다.
+ * nvme_irq()의 두 번째 인자(nvme_queue *)에서 cq_dma_addr를 읽는다.
+ */
+
+static struct kprobe info_kprobe;
+static bool info_kprobe_registered;
+
+static int nvme_info_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	void *nvmeq = (void *)regs->si;
+	u16 qid;
+	dma_addr_t cq_dma;
+	u32 q_depth;
+
+	if (fctx.cq_info_captured || !nvmeq)
+		return 0;
+
+	if (off_qid < 0 || off_cq_dma_addr < 0 || off_q_depth < 0)
+		return 0;
+
+	if (copy_from_kernel_nofault(&qid, nvmeq + off_qid, sizeof(qid)))
+		return 0;
+
+	if (qid != target_qid)
+		return 0;
+
+	if (copy_from_kernel_nofault(&cq_dma, nvmeq + off_cq_dma_addr,
+				     sizeof(cq_dma)))
+		return 0;
+	if (copy_from_kernel_nofault(&q_depth, nvmeq + off_q_depth,
+				     sizeof(q_depth)))
+		return 0;
+
+	if (cq_dma == 0 || q_depth == 0 || q_depth > 65536)
+		return 0;
+
+	fctx.cq_iova = cq_dma;
+	fctx.cq_q_depth = q_depth;
+	fctx.cq_size = q_depth * 16; /* CQE = 16 bytes */
+
+	/*
+	 * CQ의 물리 주소를 IOMMU 변환으로 추정
+	 * dma_alloc_coherent()는 1:1 매핑이 아닐 수 있으므로
+	 * iommu_iova_to_phys()로 변환한다.
+	 */
+	if (fctx.domain) {
+		fctx.cq_phys = iommu_iova_to_phys(fctx.domain, cq_dma);
+	}
+
+	smp_wmb();
+	fctx.cq_info_captured = true;
+
+	pr_info("nvme-iommu-fault: CQ info captured for qid=%u\n"
+		"  cq_iova=0x%llx cq_phys=0x%llx\n"
+		"  q_depth=%u cq_size=%zu\n"
+		"  → echo arm > /sys/kernel/debug/nvme-iommu-fault/control\n",
+		qid, (u64)cq_dma, (u64)fctx.cq_phys,
+		q_depth, fctx.cq_size);
+
+	return 0;
+}
+
+/*
+ * ============================================================================
+ * Part 3: IOMMU PTE 조작 (arm/disarm)
+ * ============================================================================
+ *
+ * arm:   CQ IOVA의 Write 권한 제거 → 디바이스 DMA Write 시 fault
+ * disarm: CQ IOVA의 매핑 복원 → 정상 DMA 가능
+ *
+ * 방법:
+ *   1. iommu_unmap(domain, cq_iova, cq_size) → 매핑 완전 제거
+ *   2. iommu_map(domain, cq_iova, cq_phys, cq_size,
+ *                IOMMU_READ, GFP_KERNEL)
+ *      → Read-Only로 재매핑
+ *      → 디바이스의 DMA Write → "PTE Write access is not set" (0x05)
+ *      → 디바이스의 DMA Read는 통과
+ *
+ *   또는 완전히 unmap하면:
+ *      → "Present bit in context entry is clear" (0x02) 또는
+ *        "PTE Read/Write access is not set"
+ *
+ * IOTLB Flush:
+ *   iommu_unmap()과 iommu_map() 내부에서 자동으로 IOTLB flush가
+ *   수행되므로, 별도 flush는 불필요하다.
+ */
+
+static int arm_cq_fault(void)
+{
+	size_t unmapped;
+	int ret;
+
+	if (!fctx.cq_info_captured) {
+		pr_err("nvme-iommu-fault: CQ info not captured yet. "
+		       "Generate I/O first:\n"
+		       "  dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n");
+		return -EAGAIN;
+	}
+
+	if (fctx.armed) {
+		pr_warn("nvme-iommu-fault: already armed\n");
+		return -EBUSY;
+	}
+
+	if (!fctx.domain) {
+		pr_err("nvme-iommu-fault: no IOMMU domain\n");
+		return -ENODEV;
+	}
+
+	pr_warn("nvme-iommu-fault: ★ ARMING ★\n"
+		"  Removing Write permission for CQ IOVA 0x%llx (size=%zu)\n"
+		"  Next device DMA Write to CQ will trigger IOMMU fault!\n"
+		"  NVMe controller WILL enter fatal error state!\n",
+		(u64)fctx.cq_iova, fctx.cq_size);
+
+	/*
+	 * Step 1: 기존 매핑 제거
+	 */
+	unmapped = iommu_unmap(fctx.domain, fctx.cq_iova, fctx.cq_size);
+	if (unmapped != fctx.cq_size) {
+		pr_err("nvme-iommu-fault: iommu_unmap partial: %zu/%zu\n"
+		       "  IOMMU가 이 도메인을 관리하지 않거나\n"
+		       "  identity mapping(passthrough)일 수 있음\n",
+		       unmapped, fctx.cq_size);
+		/*
+		 * identity mapping인 경우 iommu_unmap()이 0을 반환한다.
+		 * 이 경우 IOMMU가 DMA 주소를 직접 통과시키므로
+		 * fault를 유발할 수 없다.
+		 *
+		 * 해결: intel_iommu=on,strict 부트 파라미터로
+		 * 강제 IOMMU translation 모드를 사용해야 한다.
+		 */
+		if (unmapped == 0) {
+			pr_err("nvme-iommu-fault: IOMMU passthrough mode!\n"
+			       "  Boot with: intel_iommu=on iommu.passthrough=0\n");
+			return -ENOTSUP;
+		}
+	}
+
+	/*
+	 * Step 2: Read-Only로 재매핑
+	 *
+	 * IOMMU_READ만 설정하면:
+	 *   VT-d PTE: bit0(R)=1, bit1(W)=0
+	 *   → DMA Read는 통과, DMA Write는 fault
+	 *   → Fault Reason = 0x05 "PTE Write access is not set"
+	 *
+	 * 이렇게 하면 SQ Fetch(DMA Read)는 계속 동작하지만
+	 * CQ Write(DMA Write)만 fault가 발생한다.
+	 */
+	ret = iommu_map(fctx.domain, fctx.cq_iova, fctx.cq_phys,
+			fctx.cq_size, IOMMU_READ, GFP_KERNEL);
+	if (ret) {
+		pr_err("nvme-iommu-fault: iommu_map(READ-ONLY) failed: %d\n"
+		       "  Attempting full remap to recover...\n", ret);
+		/* 복구 시도 */
+		iommu_map(fctx.domain, fctx.cq_iova, fctx.cq_phys,
+			  fctx.cq_size, IOMMU_READ | IOMMU_WRITE,
+			  GFP_KERNEL);
+		return ret;
+	}
+
+	fctx.armed = true;
+
+	pr_warn("nvme-iommu-fault: ★ ARMED ★\n"
+		"  CQ IOVA 0x%llx is now READ-ONLY in IOMMU\n"
+		"  Waiting for device DMA Write fault...\n"
+		"  Generate I/O: dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n"
+		"  Then check: cat /sys/kernel/debug/nvme-iommu-fault/log\n");
+
+	return 0;
+}
+
+static int disarm_cq_fault(void)
+{
+	size_t unmapped;
+	int ret;
+
+	if (!fctx.armed) {
+		pr_info("nvme-iommu-fault: not armed\n");
+		return 0;
+	}
+
+	if (!fctx.domain)
+		return -ENODEV;
+
+	pr_info("nvme-iommu-fault: disarming - restoring Write permission\n");
+
+	/* Read-Only 매핑 제거 */
+	unmapped = iommu_unmap(fctx.domain, fctx.cq_iova, fctx.cq_size);
+
+	/* Read+Write로 재매핑 */
+	ret = iommu_map(fctx.domain, fctx.cq_iova, fctx.cq_phys,
+			fctx.cq_size, IOMMU_READ | IOMMU_WRITE,
+			GFP_KERNEL);
+	if (ret) {
+		pr_err("nvme-iommu-fault: ★ CRITICAL ★ "
+		       "Failed to restore IOMMU mapping! ret=%d\n"
+		       "  NVMe device may be permanently broken!\n"
+		       "  Try: echo 1 > /sys/class/nvme/nvmeX/"
+		       "reset_controller\n", ret);
+		return ret;
+	}
+
+	fctx.armed = false;
+
+	pr_info("nvme-iommu-fault: disarmed - CQ IOVA 0x%llx restored (R+W)\n"
+		"  NVMe controller may need reset:\n"
+		"    echo 1 > /sys/class/nvme/nvmeX/reset_controller\n",
+		(u64)fctx.cq_iova);
+
+	return 0;
+}
+
+/*
+ * ============================================================================
+ * Part 4: debugfs 인터페이스
  * ============================================================================
  */
 
-static int fault_log_show(struct seq_file *m, void *v)
+/* control: arm / disarm / info */
+static ssize_t control_write(struct file *file, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	char cmd[16];
+	size_t len = min(count, sizeof(cmd) - 1);
+
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	/* 개행 제거 */
+	if (len > 0 && cmd[len - 1] == '\n')
+		cmd[len - 1] = '\0';
+
+	if (strcmp(cmd, "arm") == 0)
+		arm_cq_fault();
+	else if (strcmp(cmd, "disarm") == 0)
+		disarm_cq_fault();
+	else
+		pr_err("nvme-iommu-fault: unknown command '%s' "
+		       "(use: arm, disarm)\n", cmd);
+
+	return count;
+}
+
+static const struct file_operations control_fops = {
+	.owner = THIS_MODULE,
+	.write = control_write,
+};
+
+/* log: Fault Record 이력 */
+static int log_show(struct seq_file *m, void *v)
 {
 	unsigned long flags;
 	unsigned int i, start, count;
 
-	seq_printf(m, "IOMMU Fault Log (target=%s)\n", target_pci);
-	seq_printf(m, "Total faults: %lld (read=%lld, write=%lld)\n\n",
-		   atomic64_read(&fault_ctx.total_faults),
-		   atomic64_read(&fault_ctx.read_faults),
-		   atomic64_read(&fault_ctx.write_faults));
+	seq_printf(m, "IOMMU Fault Log (target=%s BDF=0x%04x)\n",
+		   target_pci, fctx.target_bdf);
+	seq_printf(m, "Total: %lld  Target: %lld  Armed: %s\n\n",
+		   atomic64_read(&fctx.total_faults),
+		   atomic64_read(&fctx.target_faults),
+		   fctx.armed ? "YES" : "no");
 
-	seq_printf(m, "%-20s %-18s %-12s %-16s %s\n",
-		   "Timestamp(ns)", "IOVA", "Type", "Classification",
-		   "Device");
-	seq_puts(m, "------------------------------------------------------"
-		 "-----------------------------------\n");
+	seq_printf(m, "%-18s %-18s %-12s %-6s %-8s %s\n",
+		   "Timestamp(ns)", "IOVA", "Source(BDF)", "R/W",
+		   "Reason", "Class");
+	seq_puts(m, "-----------------------------------------------"
+		 "-----------------------------------------------\n");
 
-	spin_lock_irqsave(&fault_ctx.log_lock, flags);
+	spin_lock_irqsave(&fctx.log_lock, flags);
 
-	count = fault_ctx.log_count;
-	if (count > MAX_FAULT_LOG)
-		count = MAX_FAULT_LOG;
-
-	start = (fault_ctx.log_head >= count) ?
-		(fault_ctx.log_head - count) : 0;
+	count = min(fctx.log_count, (unsigned int)MAX_FAULT_LOG);
+	start = (fctx.log_head >= count) ? (fctx.log_head - count) : 0;
 
 	for (i = 0; i < count; i++) {
-		struct iommu_fault_entry *e;
+		struct dmar_fault_record *r;
 
-		e = &fault_ctx.log[(start + i) % MAX_FAULT_LOG];
-		seq_printf(m, "%-20llu 0x%016lx %-12s %-16s %s\n",
-			   e->timestamp_ns, e->iova,
-			   (e->flags & IOMMU_FAULT_READ) ? "DMA_READ" :
-			   (e->flags & IOMMU_FAULT_WRITE) ? "DMA_WRITE" :
-			   "UNKNOWN",
-			   e->classification, e->dev_name);
+		r = &fctx.log[(start + i) % MAX_FAULT_LOG];
+		seq_printf(m, "%-18llu 0x%016llx %02x:%02x.%x      %-6s 0x%02x     %s\n",
+			   r->timestamp_ns, r->fault_addr,
+			   r->source_id >> 8,
+			   PCI_SLOT(r->source_id & 0xFF),
+			   PCI_FUNC(r->source_id & 0xFF),
+			   r->fault_type == 0 ? "Write" : "Read",
+			   r->fault_reason,
+			   r->classification);
 	}
 
-	spin_unlock_irqrestore(&fault_ctx.log_lock, flags);
+	spin_unlock_irqrestore(&fctx.log_lock, flags);
+	return 0;
+}
+
+static int log_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, log_show, NULL);
+}
+
+static const struct file_operations log_fops = {
+	.owner = THIS_MODULE,
+	.open = log_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/* status: 현재 상태 요약 */
+static int status_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "Target PCI:     %s\n", target_pci);
+	seq_printf(m, "Target BDF:     0x%04x (%02x:%02x.%x)\n",
+		   fctx.target_bdf,
+		   fctx.target_bdf >> 8,
+		   PCI_SLOT(fctx.target_bdf & 0xFF),
+		   PCI_FUNC(fctx.target_bdf & 0xFF));
+	seq_printf(m, "Target QID:     %d\n", target_qid);
+	seq_printf(m, "IOMMU Domain:   %s (type=%u)\n",
+		   fctx.domain ? "found" : "NONE",
+		   fctx.domain ? fctx.domain->type : 0);
+	seq_printf(m, "CQ Captured:    %s\n",
+		   fctx.cq_info_captured ? "YES" : "no");
+
+	if (fctx.cq_info_captured) {
+		seq_printf(m, "  CQ IOVA:      0x%llx\n",
+			   (u64)fctx.cq_iova);
+		seq_printf(m, "  CQ Phys:      0x%llx\n",
+			   (u64)fctx.cq_phys);
+		seq_printf(m, "  CQ Size:      %zu (%u entries x 16B)\n",
+			   fctx.cq_size, fctx.cq_q_depth);
+	}
+
+	seq_printf(m, "Armed:          %s\n",
+		   fctx.armed ? "★ YES - CQ Write will fault! ★" : "no");
+	seq_printf(m, "Total Faults:   %lld\n",
+		   atomic64_read(&fctx.total_faults));
+	seq_printf(m, "Target Faults:  %lld\n",
+		   atomic64_read(&fctx.target_faults));
+
+	if (!fctx.cq_info_captured)
+		seq_puts(m, "\nNext: Generate I/O to capture CQ info:\n"
+			 "  dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n");
+	else if (!fctx.armed)
+		seq_puts(m, "\nNext: Arm the fault:\n"
+			 "  echo arm > /sys/kernel/debug/"
+			 "nvme-iommu-fault/control\n");
+	else
+		seq_puts(m, "\nNext: Generate I/O to trigger fault:\n"
+			 "  dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n"
+			 "Then: cat /sys/kernel/debug/"
+			 "nvme-iommu-fault/log\n");
 
 	return 0;
 }
 
-static int fault_log_open(struct inode *inode, struct file *file)
+static int status_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, fault_log_show, NULL);
+	return single_open(file, status_show, NULL);
 }
 
-static const struct file_operations fault_log_fops = {
+static const struct file_operations status_fops = {
 	.owner = THIS_MODULE,
-	.open = fault_log_open,
+	.open = status_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = single_release,
@@ -344,60 +718,7 @@ static const struct file_operations fault_log_fops = {
 
 /*
  * ============================================================================
- * debugfs: IOMMU 정보 조회
- * ============================================================================
- */
-
-static int iommu_info_show(struct seq_file *m, void *v)
-{
-	struct iommu_domain *domain = fault_ctx.domain;
-
-	seq_printf(m, "Target PCI Device: %s\n", target_pci);
-	seq_printf(m, "Device: %s\n",
-		   fault_ctx.pdev ? pci_name(fault_ctx.pdev) : "none");
-
-	if (domain) {
-		seq_printf(m, "IOMMU Domain Type: %u\n", domain->type);
-		seq_printf(m, "Page Size Bitmap: 0x%lx\n",
-			   domain->pgsize_bitmap);
-		seq_printf(m, "Geometry:\n");
-		seq_printf(m, "  Aperture Start: 0x%llx\n",
-			   domain->geometry.aperture_start);
-		seq_printf(m, "  Aperture End:   0x%llx\n",
-			   domain->geometry.aperture_end);
-	} else {
-		seq_puts(m, "IOMMU Domain: not found\n");
-	}
-
-	if (fault_ctx.ranges_known) {
-		seq_printf(m, "\nNVMe DMA Ranges:\n");
-		seq_printf(m, "  SQ IOVA: 0x%llx (size=%zu)\n",
-			   (u64)fault_ctx.nvme_ranges.sq_iova,
-			   fault_ctx.nvme_ranges.sq_size);
-		seq_printf(m, "  CQ IOVA: 0x%llx (size=%zu)\n",
-			   (u64)fault_ctx.nvme_ranges.cq_iova,
-			   fault_ctx.nvme_ranges.cq_size);
-	}
-
-	return 0;
-}
-
-static int iommu_info_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, iommu_info_show, NULL);
-}
-
-static const struct file_operations iommu_info_fops = {
-	.owner = THIS_MODULE,
-	.open = iommu_info_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-/*
- * ============================================================================
- * 초기화 / 해제
+ * Part 5: 초기화 / 해제
  * ============================================================================
  */
 
@@ -405,14 +726,28 @@ int nvme_iommu_fault_tracer_init(void)
 {
 	struct pci_dev *pdev;
 	struct iommu_domain *domain;
+	int ret;
 
-	memset(&fault_ctx, 0, sizeof(fault_ctx));
-	spin_lock_init(&fault_ctx.log_lock);
+	memset(&fctx, 0, sizeof(fctx));
+	spin_lock_init(&fctx.log_lock);
 
+	/* 파라미터 검증 */
 	if (!target_pci || !target_pci[0]) {
-		pr_err("nvme-iommu-fault: target_pci not specified!\n"
-		       "  Usage: insmod ... target_pci='0000:03:00.0'\n"
-		       "  Find NVMe: lspci -d ::0108\n");
+		pr_err("nvme-iommu-fault: target_pci required!\n"
+		       "  Usage: insmod nvme_iommu_fault_tracer.ko \\\n"
+		       "    target_pci='0000:03:00.0' \\\n"
+		       "    off_cq_dma_addr=XX off_q_depth=XX off_qid=XX\n"
+		       "  Find NVMe: lspci -d ::0108\n"
+		       "  Find offsets: pahole -C nvme_queue "
+		       "/sys/kernel/btf/vmlinux\n");
+		return -EINVAL;
+	}
+
+	if (off_cq_dma_addr < 0 || off_q_depth < 0 || off_qid < 0) {
+		pr_err("nvme-iommu-fault: nvme_queue offsets required!\n"
+		       "  off_cq_dma_addr, off_q_depth, off_qid\n"
+		       "  Use: pahole -C nvme_queue "
+		       "/sys/kernel/btf/vmlinux\n");
 		return -EINVAL;
 	}
 
@@ -420,150 +755,139 @@ int nvme_iommu_fault_tracer_init(void)
 	 * Step 1: PCI 디바이스 찾기
 	 */
 	pdev = pci_get_domain_bus_and_slot(
-		0, /* domain */
-		simple_strtoul(target_pci + 5, NULL, 16), /* bus */
+		0,
+		simple_strtoul(target_pci + 5, NULL, 16),
 		PCI_DEVFN(
-			simple_strtoul(target_pci + 8, NULL, 16), /* dev */
-			simple_strtoul(target_pci + 11, NULL, 16) /* func */
+			simple_strtoul(target_pci + 8, NULL, 16),
+			simple_strtoul(target_pci + 11, NULL, 16)
 		)
 	);
-
 	if (!pdev) {
 		pr_err("nvme-iommu-fault: PCI device %s not found\n",
 		       target_pci);
 		return -ENODEV;
 	}
+	fctx.pdev = pdev;
+	fctx.target_bdf = (pdev->bus->number << 8) | pdev->devfn;
 
-	fault_ctx.pdev = pdev;
-	pr_info("nvme-iommu-fault: found PCI device %s [%04x:%04x]\n",
-		pci_name(pdev), pdev->vendor, pdev->device);
+	pr_info("nvme-iommu-fault: target %s [%04x:%04x] BDF=0x%04x\n",
+		pci_name(pdev), pdev->vendor, pdev->device,
+		fctx.target_bdf);
 
 	/*
 	 * Step 2: IOMMU 도메인 획득
-	 *
-	 * iommu_get_domain_for_dev() (drivers/iommu/iommu.c):
-	 *   dev->iommu_group->domain을 반환한다.
-	 *   IOMMU가 비활성화되어 있으면 NULL을 반환한다.
-	 *
-	 * IOMMU가 필요한 이유:
-	 *   커널 부트 파라미터에 intel_iommu=on이 있어야 한다.
-	 *   (또는 DMAR ACPI 테이블이 있고 커널이 자동 활성화)
 	 */
 	domain = iommu_get_domain_for_dev(&pdev->dev);
 	if (!domain) {
 		pr_err("nvme-iommu-fault: no IOMMU domain for %s\n"
-		       "  Is IOMMU enabled? Check:\n"
-		       "    dmesg | grep -i iommu\n"
-		       "    cat /proc/cmdline | grep intel_iommu\n"
-		       "  Enable: add 'intel_iommu=on' to kernel cmdline\n",
+		       "  Boot with: intel_iommu=on iommu.passthrough=0\n",
 		       pci_name(pdev));
 		pci_dev_put(pdev);
 		return -ENODEV;
 	}
+	fctx.domain = domain;
 
-	fault_ctx.domain = domain;
 	pr_info("nvme-iommu-fault: IOMMU domain found (type=%u)\n",
 		domain->type);
 
 	/*
-	 * Step 3: Fault Handler 등록
+	 * Step 3: dmar_fault_do_one()에 kprobe 등록
 	 *
-	 * iommu_set_fault_handler() (drivers/iommu/iommu.c):
-	 *   domain->handler = handler
-	 *   domain->handler_token = token
-	 *
-	 * 제약사항:
-	 *   - domain->cookie_type이 IOMMU_COOKIE_NONE이어야 등록 가능
-	 *   - DMA-IOMMU가 관리하는 도메인에서는 cookie_type이
-	 *     IOMMU_COOKIE_DMA_IOVA이므로 등록이 실패할 수 있다!
-	 *   - 이 경우 커널 패치가 필요하거나 다른 방법을 사용해야 한다
-	 *
-	 * 대안:
-	 *   1. VFIO passthrough 도메인 사용 (cookie_type=NONE)
-	 *   2. dmar_fault() 자체를 kprobe로 후킹
-	 *   3. dmesg의 DMAR 에러 메시지를 파싱
+	 * 이것이 핵심: 모든 IOMMU fault를 잡는다.
+	 * DMA 도메인이든 VFIO 도메인이든 상관없이 동작한다.
 	 */
-	iommu_set_fault_handler(domain, nvme_iommu_fault_handler,
-				&fault_ctx);
-	pr_info("nvme-iommu-fault: fault handler registered\n");
+	memset(&fault_kprobe, 0, sizeof(fault_kprobe));
+	fault_kprobe.symbol_name = "dmar_fault_do_one";
+	fault_kprobe.pre_handler = dmar_fault_do_one_handler;
+
+	ret = register_kprobe(&fault_kprobe);
+	if (ret < 0) {
+		pr_err("nvme-iommu-fault: kprobe on dmar_fault_do_one "
+		       "failed (ret=%d)\n"
+		       "  Is Intel IOMMU enabled?\n"
+		       "  dmesg | grep -i DMAR\n", ret);
+		pci_dev_put(pdev);
+		return ret;
+	}
+	fault_kprobe_registered = true;
+
+	pr_info("nvme-iommu-fault: kprobe registered on "
+		"dmar_fault_do_one()\n");
 
 	/*
-	 * Step 4: debugfs 인터페이스 생성
+	 * Step 4: nvme_irq()에 kprobe 등록 (CQ IOVA 추출)
 	 */
-	fault_ctx.debugfs_dir = debugfs_create_dir("nvme-iommu-fault", NULL);
-	debugfs_create_file("fault_log", 0444, fault_ctx.debugfs_dir,
-			    NULL, &fault_log_fops);
-	debugfs_create_file("iommu_info", 0444, fault_ctx.debugfs_dir,
-			    NULL, &iommu_info_fops);
+	memset(&info_kprobe, 0, sizeof(info_kprobe));
+	info_kprobe.symbol_name = "nvme_irq";
+	info_kprobe.pre_handler = nvme_info_handler;
 
-	pr_info("nvme-iommu-fault: module loaded for %s\n"
-		"  debugfs: /sys/kernel/debug/nvme-iommu-fault/\n"
-		"  fault_log: cat /sys/kernel/debug/nvme-iommu-fault/"
-		"fault_log\n"
-		"  iommu_info: cat /sys/kernel/debug/nvme-iommu-fault/"
-		"iommu_info\n",
-		target_pci);
+	ret = register_kprobe(&info_kprobe);
+	if (ret < 0) {
+		pr_warn("nvme-iommu-fault: kprobe on nvme_irq failed "
+			"(ret=%d). CQ IOVA auto-detection unavailable.\n",
+			ret);
+		info_kprobe_registered = false;
+	} else {
+		info_kprobe_registered = true;
+		pr_info("nvme-iommu-fault: kprobe registered on nvme_irq "
+			"(CQ IOVA extraction)\n");
+	}
+
+	/*
+	 * Step 5: debugfs 생성
+	 */
+	fctx.debugfs_dir = debugfs_create_dir("nvme-iommu-fault", NULL);
+	debugfs_create_file("control", 0200, fctx.debugfs_dir,
+			    NULL, &control_fops);
+	debugfs_create_file("log", 0444, fctx.debugfs_dir,
+			    NULL, &log_fops);
+	debugfs_create_file("status", 0444, fctx.debugfs_dir,
+			    NULL, &status_fops);
+
+	pr_info("nvme-iommu-fault: ========================================\n"
+		"  Module loaded. Usage:\n"
+		"  1. cat /sys/kernel/debug/nvme-iommu-fault/status\n"
+		"  2. dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n"
+		"     (captures CQ IOVA)\n"
+		"  3. echo arm > /sys/kernel/debug/nvme-iommu-fault/control\n"
+		"     (removes CQ Write permission → arms fault)\n"
+		"  4. dd if=/dev/nvmeXnY of=/dev/null bs=4k count=1\n"
+		"     (triggers IOMMU fault on CQ DMA Write)\n"
+		"  5. cat /sys/kernel/debug/nvme-iommu-fault/log\n"
+		"     (shows captured fault: IOVA, BDF, reason)\n"
+		"  6. echo disarm > /sys/kernel/debug/nvme-iommu-fault/"
+		"control\n"
+		"  7. echo 1 > /sys/class/nvme/nvmeX/reset_controller\n"
+		"=========================================================\n");
 
 	return 0;
 }
 
 void nvme_iommu_fault_tracer_exit(void)
 {
-	/*
-	 * Fault handler 해제
-	 *
-	 * iommu_set_fault_handler()는 unregister API가 없다.
-	 * domain->handler를 NULL로 설정하는 것도 안전하지 않다
-	 * (경쟁 조건). 모듈 해제 전에 synchronize_rcu()로 대기한다.
-	 *
-	 * 실제로는 도메인이 살아있는 한 handler도 유효해야 하므로,
-	 * 모듈을 해제하기 전에 디바이스를 사용하지 않는 상태여야 한다.
-	 */
+	/* 먼저 disarm */
+	if (fctx.armed)
+		disarm_cq_fault();
 
-	debugfs_remove_recursive(fault_ctx.debugfs_dir);
+	/* kprobe 해제 */
+	if (fault_kprobe_registered) {
+		unregister_kprobe(&fault_kprobe);
+		fault_kprobe_registered = false;
+	}
 
-	if (fault_ctx.pdev)
-		pci_dev_put(fault_ctx.pdev);
+	if (info_kprobe_registered) {
+		unregister_kprobe(&info_kprobe);
+		info_kprobe_registered = false;
+	}
+
+	debugfs_remove_recursive(fctx.debugfs_dir);
+
+	if (fctx.pdev)
+		pci_dev_put(fctx.pdev);
 
 	synchronize_rcu();
 
-	pr_info("nvme-iommu-fault: unloaded. total_faults=%lld\n",
-		atomic64_read(&fault_ctx.total_faults));
+	pr_info("nvme-iommu-fault: unloaded. total=%lld target=%lld\n",
+		atomic64_read(&fctx.total_faults),
+		atomic64_read(&fctx.target_faults));
 }
-
-/*
- * ============================================================================
- * 대안: dmar_fault()를 kprobe로 직접 후킹
- * ============================================================================
- *
- * iommu_set_fault_handler()가 DMA 도메인에서 동작하지 않는 경우,
- * Intel VT-d의 dmar_fault() IRQ handler를 kprobe로 후킹하여
- * IOMMU fault 정보를 직접 읽을 수 있다.
- *
- * dmar_fault()는 IOMMU의 Fault Status/Record 레지스터를
- * 직접 읽으므로, 가장 원시적인 fault 정보에 접근할 수 있다.
- *
- * 구현 골격:
- *
- * static struct kretprobe dmar_fault_kretprobe;
- *
- * static int dmar_fault_entry(struct kretprobe_instance *ri,
- *                              struct pt_regs *regs)
- * {
- *     // RDI=irq, RSI=dev_id(struct intel_iommu *)
- *     struct intel_iommu *iommu = (void *)regs->si;
- *
- *     // IOMMU의 Fault Status Register 읽기
- *     // → 어떤 디바이스(BDF)가 어떤 주소(IOVA)에 접근 시도했는지 확인
- *     // → Source ID로 NVMe 디바이스인지 필터링
- *     // → Fault Address로 SQ/CQ/Data 분류
- *
- *     // 주의: intel_iommu 구조체도 내부 구조체이므로
- *     //       레지스터 오프셋을 알아야 한다.
- *     //       iommu->reg + DMAR_FSTS_REG(0x34)
- *     return 0;
- * }
- *
- * 이 방법은 iommu_set_fault_handler()보다 더 low-level이지만,
- * DMA 도메인에서도 동작한다.
- */
