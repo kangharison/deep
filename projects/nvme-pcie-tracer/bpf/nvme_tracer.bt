@@ -1,0 +1,180 @@
+#!/usr/bin/env bpftrace
+/*
+ * nvme_tracer.bt - NVMe PCIe-level bidirectional command tracer
+ *
+ * Traces NVMe I/O lifecycle: SQ submit, doorbell, CQ complete, IRQ
+ * using kernel tracepoints and kprobes.
+ *
+ * Requires: bpftrace >= 0.16, kernel with NVMe PCIe driver loaded
+ * Target:   CentOS/Rocky Linux 9 (kernel 5.14+)
+ *
+ * Usage:
+ *   sudo bpftrace nvme_tracer.bt
+ *   sudo bpftrace nvme_tracer.bt -e 'BEGIN { @target_qid = 1; }'
+ */
+
+BEGIN
+{
+	printf("nvme-pcie-tracer (bpftrace) starting...\n");
+	printf("%-18s %-4s %-5s %-6s %-10s %s\n",
+		"[Timestamp]", "CPU", "Dir", "Queue", "Event", "Details");
+	printf("------------------------------------------------------------------------------\n");
+}
+
+/*
+ * Trace NVMe I/O submission: nvme_queue_rq()
+ *
+ * nvme_queue_rq() is the blk-mq queue callback. At this point, the NVMe
+ * command structure has been built in the request's driver-specific data.
+ * We capture the command opcode, NSID, and for R/W commands, SLBA and NLB.
+ *
+ * Prototype: blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ *                                        const struct blk_mq_queue_data *bd)
+ *
+ * To get the nvme_command, we walk: hctx -> driver_data -> nvme_queue,
+ * and bd -> rq -> nvme_request (stored at end of struct request).
+ */
+tracepoint:nvme:nvme_sq
+{
+	$opcode = args->opcode;
+	$cid = args->command_id;
+	$nsid = args->nsid;
+	$qid = args->qid;
+
+	/* Store submit timestamp for latency calculation */
+	@submit_ts[$qid, $cid] = nsecs;
+	@submit_opcode[$qid, $cid] = $opcode;
+
+	printf("[%lu.%09lu] C%02d  H->D  SQ[%d]  SUBMIT    opcode=%d nsid=%u cid=%u",
+		nsecs / 1000000000, nsecs % 1000000000,
+		cpu, $qid, $opcode, $nsid, $cid);
+
+	/* Decode SLBA/NLB for Read(0x02) and Write(0x01) */
+	if ($opcode == 0x01 || $opcode == 0x02) {
+		printf(" slba=%llu nlb=%u",
+			args->cdw10 | ((uint64)args->cdw11 << 32),
+			(uint16)(args->cdw12 & 0xffff));
+	}
+
+	printf("\n");
+}
+
+/*
+ * Trace NVMe completion events
+ *
+ * The nvme:nvme_complete_rq tracepoint fires when a request completes.
+ * We extract status, command_id, and calculate submit-to-complete latency.
+ */
+tracepoint:nvme:nvme_complete_rq
+{
+	$qid = args->qid;
+	$cid = args->command_id;
+	$status = args->status;
+	$result = args->result;
+
+	printf("[%lu.%09lu] C%02d  D->H  CQ[%d]  COMPLETE  cid=%u status=0x%04x result=0x%lx",
+		nsecs / 1000000000, nsecs % 1000000000,
+		cpu, $qid, $cid, $status, $result);
+
+	/* Calculate latency if we have matching submit */
+	if (@submit_ts[$qid, $cid]) {
+		$latency_ns = nsecs - @submit_ts[$qid, $cid];
+		$latency_us = $latency_ns / 1000;
+		printf(" latency=%lu.%03luus",
+			$latency_us, ($latency_ns % 1000));
+
+		/* Per-queue latency histogram */
+		@lat_hist[$qid] = hist($latency_ns / 1000);
+
+		/* Per-opcode latency */
+		$op = @submit_opcode[$qid, $cid];
+		@lat_by_opcode[$op] = hist($latency_ns / 1000);
+
+		delete(@submit_ts[$qid, $cid]);
+		delete(@submit_opcode[$qid, $cid]);
+	}
+
+	printf("\n");
+}
+
+/*
+ * Trace NVMe IRQ handler
+ *
+ * kprobe on nvme_irq to capture interrupt events.
+ * Prototype: irqreturn_t nvme_irq(int irq, void *data)
+ */
+kprobe:nvme_irq
+{
+	$irq = arg0;
+	/* arg1 = struct nvme_queue *nvmeq */
+
+	printf("[%lu.%09lu] C%02d  D->H  IRQ    MSI-X     irq=%d\n",
+		nsecs / 1000000000, nsecs % 1000000000,
+		cpu, $irq);
+
+	@irq_count = count();
+}
+
+/*
+ * Trace NVMe IRQ return to see if it was handled
+ */
+kretprobe:nvme_irq
+{
+	@irq_handled[retval == 1 ? "HANDLED" : "NONE"] = count();
+}
+
+/*
+ * Trace DMA mapping for NVMe
+ *
+ * kprobe on dma_map_sg_attrs to capture DMA setup.
+ * We only log this if the caller appears to be from nvme.
+ * Prototype: int dma_map_sg_attrs(struct device *dev, struct scatterlist *sg,
+ *                                  int nents, enum dma_data_direction dir,
+ *                                  unsigned long attrs)
+ */
+kprobe:dma_map_sg_attrs
+{
+	$nents = arg2;
+	$dir = arg3;
+
+	/* Only trace if called from nvme context (check comm name) */
+	if (comm == "nvme" || comm == "kworker") {
+		$dir_str = $dir == 1 ? "TO_DEV" : ($dir == 2 ? "FROM_DEV" : "BIDIR");
+		printf("[%lu.%09lu] C%02d  H->D  DMA    MAP       nents=%d dir=%s\n",
+			nsecs / 1000000000, nsecs % 1000000000,
+			cpu, $nents, $dir_str);
+	}
+}
+
+/*
+ * Periodic statistics output
+ */
+interval:s:10
+{
+	printf("\n--- 10s Statistics ---\n");
+	printf("IRQ count: ");
+	print(@irq_count);
+	printf("IRQ results: ");
+	print(@irq_handled);
+	printf("\n");
+}
+
+END
+{
+	printf("\n=== Final Latency Histograms (microseconds) ===\n");
+
+	printf("\n--- Per-Queue Latency ---\n");
+	print(@lat_hist);
+
+	printf("\n--- Per-Opcode Latency ---\n");
+	printf("(0x00=Flush, 0x01=Write, 0x02=Read)\n");
+	print(@lat_by_opcode);
+
+	/* Cleanup maps */
+	clear(@submit_ts);
+	clear(@submit_opcode);
+	clear(@irq_count);
+	clear(@irq_handled);
+	clear(@lat_hist);
+	clear(@lat_by_opcode);
+}

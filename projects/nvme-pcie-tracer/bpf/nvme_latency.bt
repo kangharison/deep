@@ -1,0 +1,170 @@
+#!/usr/bin/env bpftrace
+/*
+ * nvme_latency.bt - NVMe per-queue and per-opcode latency analysis
+ *
+ * Focuses on measuring submit-to-complete latency for NVMe I/O operations.
+ * Prints histograms every 5 seconds and a final summary on exit.
+ *
+ * Requires: bpftrace >= 0.16, kernel with NVMe tracepoints
+ * Target:   CentOS/Rocky Linux 9 (kernel 5.14+)
+ *
+ * Usage:
+ *   sudo bpftrace nvme_latency.bt
+ */
+
+BEGIN
+{
+	printf("NVMe Latency Analyzer starting...\n");
+	printf("Printing histograms every 5 seconds. Ctrl+C to stop.\n\n");
+	@start_time = nsecs;
+}
+
+/*
+ * Record submission timestamp per (qid, cid) pair.
+ * Also track opcode for per-opcode histograms.
+ */
+tracepoint:nvme:nvme_sq
+{
+	$qid = args->qid;
+	$cid = args->command_id;
+	$opcode = args->opcode;
+
+	@ts[$qid, $cid] = nsecs;
+	@op[$qid, $cid] = $opcode;
+
+	/* Count submissions per queue */
+	@submit_count[$qid] = count();
+
+	/* Count submissions per opcode */
+	@op_submit_count[$opcode] = count();
+}
+
+/*
+ * On completion, calculate latency and populate histograms.
+ */
+tracepoint:nvme:nvme_complete_rq
+{
+	$qid = args->qid;
+	$cid = args->command_id;
+	$status = args->status;
+
+	if (@ts[$qid, $cid]) {
+		$lat_ns = nsecs - @ts[$qid, $cid];
+		$lat_us = $lat_ns / 1000;
+		$opcode = @op[$qid, $cid];
+
+		/* Per-queue latency histogram (microseconds) */
+		@q_lat[$qid] = hist($lat_us);
+
+		/* Per-opcode latency histogram (microseconds) */
+		@opcode_lat[$opcode] = hist($lat_us);
+
+		/* Overall latency histogram */
+		@all_lat = hist($lat_us);
+
+		/* Running statistics */
+		@q_avg[$qid] = avg($lat_us);
+		@q_min[$qid] = min($lat_us);
+		@q_max[$qid] = max($lat_us);
+		@q_count[$qid] = count();
+
+		@opcode_avg[$opcode] = avg($lat_us);
+		@opcode_count[$opcode] = count();
+
+		/* Track errors */
+		if ($status != 0) {
+			@errors[$qid, $status] = count();
+		}
+
+		delete(@ts[$qid, $cid]);
+		delete(@op[$qid, $cid]);
+	}
+}
+
+/*
+ * Print periodic histograms every 5 seconds.
+ */
+interval:s:5
+{
+	$elapsed = (nsecs - @start_time) / 1000000000;
+
+	printf("\n========================================\n");
+	printf("  NVMe Latency Report @ T+%lus\n", $elapsed);
+	printf("========================================\n");
+
+	printf("\n--- Overall Latency Distribution (us) ---\n");
+	print(@all_lat);
+
+	printf("\n--- Per-Queue Latency (us) ---\n");
+	print(@q_lat);
+
+	printf("\n--- Per-Queue Stats ---\n");
+	printf("%-6s %-10s %-10s %-10s %-10s\n",
+		"QID", "Count", "Avg(us)", "Min(us)", "Max(us)");
+	print(@q_count);
+	print(@q_avg);
+	print(@q_min);
+	print(@q_max);
+
+	printf("\n--- Per-Opcode Latency (us) ---\n");
+	printf("(0x00=Flush, 0x01=Write, 0x02=Read, 0x08=WriteZeroes, 0x09=DSM)\n");
+	print(@opcode_lat);
+
+	printf("\n--- Submission Counts ---\n");
+	printf("Per Queue: ");
+	print(@submit_count);
+	printf("Per Opcode: ");
+	print(@op_submit_count);
+
+	/* Clear interval histograms for next period */
+	clear(@all_lat);
+	clear(@q_lat);
+	clear(@opcode_lat);
+}
+
+END
+{
+	printf("\n============================================\n");
+	printf("  Final NVMe Latency Summary\n");
+	printf("============================================\n");
+
+	printf("\n--- Per-Queue Completion Count ---\n");
+	print(@q_count);
+
+	printf("\n--- Per-Queue Average Latency (us) ---\n");
+	print(@q_avg);
+
+	printf("\n--- Per-Queue Min Latency (us) ---\n");
+	print(@q_min);
+
+	printf("\n--- Per-Queue Max Latency (us) ---\n");
+	print(@q_max);
+
+	printf("\n--- Per-Opcode Completion Count ---\n");
+	print(@opcode_count);
+
+	printf("\n--- Per-Opcode Average Latency (us) ---\n");
+	print(@opcode_avg);
+
+	if (count(@errors) > 0) {
+		printf("\n--- Errors (qid, status) ---\n");
+		print(@errors);
+	}
+
+	/* Cleanup */
+	clear(@ts);
+	clear(@op);
+	clear(@submit_count);
+	clear(@op_submit_count);
+	clear(@q_lat);
+	clear(@opcode_lat);
+	clear(@all_lat);
+	clear(@q_avg);
+	clear(@q_min);
+	clear(@q_max);
+	clear(@q_count);
+	clear(@opcode_avg);
+	clear(@opcode_count);
+	clear(@errors);
+	clear(@start_time);
+}
