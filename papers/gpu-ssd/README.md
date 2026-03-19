@@ -1,6 +1,6 @@
-# GPU-Storage I/O 논문 리딩 리스트 (총 41편)
+# GPU-Storage I/O 논문 리딩 리스트 (총 59편)
 
-GPU-Storage I/O 관련 논문을 6개 분류로 체계적으로 정리.
+GPU-Storage I/O 관련 논문을 7개 분류로 체계적으로 정리.
 각 논문의 상세 노트는 하위 디렉토리에 개별 파일로 관리.
 
 ---
@@ -15,6 +15,7 @@ GPU-Storage I/O 관련 논문을 6개 분류로 체계적으로 정리.
 | I | `papers/I-gpu-initiated/` | 9편 | GPU Initiated I/O — 핵심 분류, BaM 계보 |
 | O | `papers/O-offload/` | 8편 | GPU-NVMe 오프로드 — AI 워크로드 I/O 패턴 |
 | N | `papers/N-industry/` | 5편 | 산업 동향 및 표준 |
+| W | [`papers/W-workload-char/`](../W-workload-char/README.md) | 18편 | AI/ML 워크로드 I/O 특성 분석 — 순수 측정/관찰 논문 |
 
 ---
 
