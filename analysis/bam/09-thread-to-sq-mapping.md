@@ -717,32 +717,102 @@ SM당 최대 상주 Warp:   ~64     (Blackwell 추정, Hopper 동일)
 단, 실제로 모든 warp가 동시에 I/O를 발행하지는 않음 (cache hit, 연산 중 등).
 실효 I/O warp는 cache miss 비율에 따라 전체의 ~10~30% 수준.
 
-### 9.4 Warp Scheduler 4개와 SQ 경합
+### 9.4 queue_counter는 SM별이 아니라 Controller 전역
 
-```
-SM #k 내부 (한 cycle):
+**중요:** `queue_counter`는 SM마다 있는 게 아니라 Controller 구조체 안에 **1개**만 존재한다.
 
-  Scheduler 0 ──→ Warp A ──→ sq_enqueue(QP[x])
-  Scheduler 1 ──→ Warp B ──→ sq_enqueue(QP[y])   ← 4개가 동시 발행 가능
-  Scheduler 2 ──→ Warp C ──→ sq_enqueue(QP[z])
-  Scheduler 3 ──→ Warp D ──→ sq_enqueue(QP[w])
-
-  queue_counter 라운드로빈으로 x≠y≠z≠w일 확률 높음
-  → n_qps ≥ 4이면 같은 SM의 동시 4 warp가 서로 다른 QP에 배정
-  → n_qps = 128이면 같은 QP에 동시 접근하는 warp가 사실상 없음
+```cpp
+// ctrl.h:63 — Controller 전체에서 1개
+simt::atomic<uint64_t, simt::thread_scope_device> queue_counter;
 ```
 
-### 9.5 권장 설정
+따라서 **모든 SM의 모든 warp가 같은 카운터를 공유**하고, 호출 순서(실행 타이밍)에 따라 큐가 결정된다. SM 단위로 큐가 고정 배정되는 것이 아니라, warp가 실행되는 순서대로 글로벌 라운드로빈으로 받아간다.
+
+```
+시간순으로 warp들이 fetch_add(1)을 호출:
+
+  Warp A (SM 3)   → counter=0  → 0 % 16 = QP[0]
+  Warp B (SM 100) → counter=1  → 1 % 16 = QP[1]
+  Warp C (SM 3)   → counter=2  → 2 % 16 = QP[2]   ← 같은 SM인데 다른 QP
+  Warp D (SM 50)  → counter=3  → 3 % 16 = QP[3]
+  ...
+  Warp Q (SM 3)   → counter=16 → 16 % 16 = QP[0]  ← 한 바퀴 돌아서 다시 QP[0]
+  Warp R (SM 77)  → counter=17 → 17 % 16 = QP[1]
+
+  → 같은 SM 안의 warp들도 서로 다른 QP를 받음
+  → 다른 SM의 warp와 같은 QP를 받을 수도 있음
+  → SM과 QP 사이에 고정된 바인딩 없음 — 완전 동적 배정
+```
+
+### 9.5 Warp Scheduler 4개 × 같은 cycle 동시 발행
+
+한 SM에 Warp Scheduler가 4개이므로, 같은 cycle에 4개 warp가 동시에 `fetch_add(1)`을 호출할 수 있다.
+
+```
+SM #k, 같은 cycle, counter가 현재 32일 때:
+
+  Scheduler 0 → Warp A → fetch_add(1) → counter=32 → 32%16 = QP[0]
+  Scheduler 1 → Warp B → fetch_add(1) → counter=33 → 33%16 = QP[1]
+  Scheduler 2 → Warp C → fetch_add(1) → counter=34 → 34%16 = QP[2]
+  Scheduler 3 → Warp D → fetch_add(1) → counter=35 → 35%16 = QP[3]
+
+  atomic이므로 32,33,34,35가 순서대로 할당 (순서는 HW 중재)
+  → 같은 SM의 동시 4개 warp가 연속 4개 QP에 자연스럽게 분산!
+  → n_qps ≥ 4이면 같은 SM에서 같은 cycle에 같은 QP로 가는 일 없음
+```
+
+### 9.6 n_qps=16 구체적 경합 분석
+
+SSD가 16개 큐만 지원하는 경우의 실제 경합 수준:
+
+```
+                   글로벌 queue_counter (1개)
+                              │
+                   fetch_add(1) % 16
+                              │
+    ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+    │QP0│QP1│QP2│QP3│QP4│QP5│QP6│QP7│QP8│QP9│10 │11 │12 │13 │14 │15 │
+    └─┬─┴─┬─┴─┬─┴─┬─┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
+      │   │   │   │
+      │   │   │   └── Warp(SM50), Warp(SM3), Warp(SM180), ...
+      │   │   └── Warp(SM3), Warp(SM99), ...
+      │   └── Warp(SM100), Warp(SM3), ...
+      └── Warp(SM3), Warp(SM77), Warp(SM150), ...
+
+    → 어떤 SM의 warp인지와 무관, 호출 순서대로 라운드로빈
+    → 같은 SM의 warp들이 같은 QP에 몰리지 않고 흩어짐
+```
+
+**I/O depth별 SQ slot 점유율 (cache miss ~20% 가정):**
+
+```
+실효 동시 I/O warp = 12,032 × 0.2 = ~2,406
+QP당 동시 I/O warp = 2,406 / 16 = ~150
+```
+
+| I/O depth | QP당 outstanding cmd | 1024 slot 점유율 | 상태 |
+|:---------:|:-------------------:|:----------------:|:----:|
+| 1 | ~150 | 14.6% | 여유 |
+| 2 | ~300 | 29.3% | 적당 |
+| 4 | ~600 | 58.6% | ticket 대기 발생 가능 |
+
+n_qps=16은 동작하지만, I/O depth 4에서는 slot 경합이 생길 수 있다.
+
+### 9.7 권장 설정
 
 ```
 환경:   Blackwell 188 SM + NVMe SSD 1개
 
-n_qps = 64~128 권장
-  → QP당 동시 I/O warp: ~1~3개 (cache miss 10~30% 가정)
-  → ticket 경합 최소화, doorbell 배칭 효과도 유지
-  → SSD 측 제한 확인 필요: nvme id-ctrl /dev/nvmeX → MQES, SQES, 최대 큐 수
+SSD가 지원하는 큐 수에 따라:
+  n_qps = 16   → I/O depth 1~2로 제한 (경합 관리)
+  n_qps = 64   → I/O depth 4까지 여유 (QP당 ~38 I/O warp)
+  n_qps = 128  → 최적 (QP당 ~19 I/O warp, 경합 거의 없음)
 
 queueDepth (SQ 크기) = 1024 권장
-  → QP당 ~94 warp × I/O depth 1~4 = ~94~376 outstanding cmd
-  → 1024 slot이면 충분한 여유 (slot 대기 없음)
+  → 대부분의 n_qps 설정에서 slot 부족 없음
+
+SSD 측 제한 확인:
+  nvme id-ctrl /dev/nvmeX | grep -E "sqes|mqes|nn"
+  → MQES: 큐당 최대 엔트리 수
+  → NSQA/NCQA: 지원하는 SQ/CQ 수
 ```
