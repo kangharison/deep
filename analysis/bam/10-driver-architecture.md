@@ -344,3 +344,108 @@ BaM 드라이버가 동작하려면:
 | `nvidia_p2p_free_page_table()` | 페이지 테이블 해제 (강제 회수) | map.c:323 |
 
 이 API들은 NVIDIA 드라이버(`nvidia.ko`)가 제공하며, `#include <nv-p2p.h>`로 사용한다. NVIDIA 드라이버가 GPU 메모리의 물리 페이지 정보를 외부(BaM 커널 모듈)에 노출하는 유일한 공식 인터페이스이다.
+
+## 10. .cu 파일에서의 호출 흐름: Host 코드 vs Device 코드
+
+`.cu` 파일 안에는 **host 코드(CPU)**와 **device 코드(GPU)**가 함께 존재한다. open/mmap/ioctl로 커널 모듈을 호출하는 것은 **host 코드**이며, GPU 커널은 이미 준비된 포인터를 직접 사용한다.
+
+### 10.1 .cu 파일 내부 구조
+
+```cuda
+// ============ HOST 코드 (CPU에서 실행) ============
+int main() {
+    // ① open → 커널 모듈의 file_operations에 도달
+    Controller ctrl("/dev/libnvm0", ns, gpu, qd, nq);
+    //  내부:
+    //    open("/dev/libnvm0")         → 커널 모듈 pci.c
+    //    mmap(fd, BAR0)               → 커널 모듈 mmap_registers()
+    //    ioctl(NVM_MAP_DEVICE_MEMORY) → 커널 모듈 map_ioctl()
+    //    cudaHostRegister(IoMemory)   → CUDA 런타임
+    //    Admin cmd (Create CQ/SQ)     → NVMe 컨트롤러
+
+    // ② GPU 커널 실행
+    random_access_kernel<<<blocks, threads>>>(ctrls, pc, ...);
+}
+
+// ============ DEVICE 코드 (GPU에서 실행) ============
+__global__ void random_access_kernel(...) {
+    // ③ 여기서는 open/mmap/ioctl 절대 안 함!
+    //    이미 초기화된 포인터(sq.db, sq.vaddr 등)를 직접 사용
+    sq_enqueue(&qp->sq, &cmd);  // GPU VRAM의 SQ에 직접 쓰기
+    asm("st.mmio ...");          // 도어벨에 직접 MMIO write
+    cq_poll(&qp->cq, cid);      // GPU VRAM의 CQ에서 직접 읽기
+}
+```
+
+### 10.2 Host→커널 모듈 호출 체인 상세
+
+```
+main() [HOST, CPU]
+  │
+  ├── Controller("/dev/libnvm0", ...) [HOST 코드, ctrl.h]
+  │     │
+  │     ├── open("/dev/libnvm0")
+  │     │     └──→ 커널 모듈: pci.c의 file_operations
+  │     │
+  │     ├── nvm_ctrl_init(fd)
+  │     │     └── mmap(fd, ...)
+  │     │           └──→ 커널 모듈: mmap_registers()
+  │     │                 └── vm_iomap_memory(BAR0)
+  │     │                       → BAR0가 유저 가상주소에 매핑됨
+  │     │
+  │     ├── cudaHostRegister(BAR0, IoMemory)  [CUDA API, CPU]
+  │     │     → GPU가 BAR0(도어벨)에 접근 가능해짐
+  │     │
+  │     ├── createDma(ctrl, size, cudaDevice)
+  │     │     ├── cudaMalloc() → GPU VRAM 할당
+  │     │     └── ioctl(fd, NVM_MAP_DEVICE_MEMORY, ...)
+  │     │           └──→ 커널 모듈: map_ioctl()
+  │     │                 └── map_device_memory()
+  │     │                       ├── nvidia_p2p_get_pages()
+  │     │                       └── nvidia_p2p_dma_map_pages()
+  │     │                             → GPU VRAM의 DMA 주소 반환
+  │     │
+  │     ├── nvm_admin_cq_create(GPU DMA 주소)  [Admin cmd]
+  │     ├── nvm_admin_sq_create(GPU DMA 주소)  [Admin cmd]
+  │     ├── cudaHostGetDevicePointer(도어벨)   [CUDA API]
+  │     └── cudaMemcpy(Controller → GPU)       [HOST→GPU 복사]
+  │
+  │   ════ 여기까지 전부 CPU에서 실행 (초기화 완료) ════
+  │
+  └── random_access_kernel<<<...>>>(ctrls, pc, ...)
+        │
+        └──→ GPU 커널 시작 (이제부터 GPU에서 실행) ──→
+```
+
+### 10.3 GPU 커널 실행 시: 커널 모듈 관여 없음
+
+```
+__global__ random_access_kernel() [DEVICE, GPU]
+  │
+  │  ★ 이 시점에서 모든 포인터가 이미 준비되어 있음:
+  │    - d_qps[queue].sq.vaddr → GPU VRAM (SQ 메모리)
+  │    - d_qps[queue].sq.db   → GPU 디바이스 포인터 (BAR0 도어벨)
+  │    - pc->prp1[entry]      → GPU VRAM (데이터 버퍼 DMA 주소)
+  │
+  ├── sq_enqueue()  → GPU VRAM에 직접 쓰기 (커널 모듈 관여 없음)
+  ├── st.mmio       → PCIe로 도어벨 직접 쓰기 (커널 모듈 관여 없음)
+  ├── cq_poll()     → GPU VRAM에서 직접 읽기 (커널 모듈 관여 없음)
+  └── (데이터 도착)  → NVMe가 GPU VRAM에 P2P DMA (커널 모듈 관여 없음)
+```
+
+### 10.4 단계별 커널 모듈 관여 여부
+
+| 단계 | 실행 위치 | 커널 모듈 관여 | 목적 |
+|------|:--------:|:------------:|------|
+| `open("/dev/libnvm0")` | CPU (host) | **O** — file open | 디바이스 파일 열기 |
+| `mmap(BAR0)` | CPU (host) | **O** — mmap_registers | BAR0를 유저에 노출 |
+| `cudaHostRegister(IoMemory)` | CPU (host) | X — CUDA 런타임 | BAR0를 GPU에 노출 |
+| `ioctl(NVM_MAP_DEVICE_MEMORY)` | CPU (host) | **O** — map_ioctl | GPU VRAM DMA 매핑 |
+| `Admin Create CQ/SQ` | CPU (host) | X — NVMe 직접 | SQ/CQ를 NVMe에 등록 |
+| `cudaMemcpy(→GPU)` | CPU (host) | X — CUDA 런타임 | 포인터들을 GPU에 전달 |
+| **GPU 커널: sq_enqueue** | **GPU** | **X** ★ | SQ에 커맨드 쓰기 |
+| **GPU 커널: doorbell** | **GPU** | **X** ★ | NVMe에 통지 |
+| **GPU 커널: cq_poll** | **GPU** | **X** ★ | 완료 확인 |
+| **NVMe DMA → GPU VRAM** | **HW** | **X** ★ | 데이터 전송 |
+
+**결론:** 커널 모듈(`libnvm.ko`)은 **초기화 시에만 3번 관여**(open, mmap, ioctl)하고, GPU 커널이 실제 I/O를 수행하는 런타임에는 **커널 모듈이 전혀 개입하지 않는다**. 이것이 BaM이 "CPU 개입 없는 GPU-initiated I/O"를 달성하는 핵심 구조이다.
