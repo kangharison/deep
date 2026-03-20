@@ -36,6 +36,63 @@ main() [CPU Host]
 핵심: Phase 1~4는 CPU, Phase 5만 GPU, Phase 6~7은 CPU
 ```
 
+## 장표 1.5: BaM 커널 모듈 (libnvm.ko) — GPU Direct 접근을 가능하게 하는 3가지 역할
+
+```
+insmod libnvm.ko
+  │
+  ├── PCI probe: NVMe 디바이스(class 0x010802) 탐색
+  ├── /dev/libnvm0 캐릭터 디바이스 생성
+  └── pci_set_master → DMA 버스 마스터 활성화
+
+이후 유저스페이스에서 /dev/libnvm0을 통해 3가지 서비스 제공:
+
+┌────────────────────────────────────────────────────────────────┐
+│                                                                │
+│  역할 ①: mmap — BAR0 레지스터를 유저스페이스에 노출           │
+│                                                                │
+│  mmap(fd, ...) → mmap_registers()                             │
+│    → vm_iomap_memory(pci_resource_start(pdev, 0))             │
+│    → pgprot_noncached (캐시 비활성화)                         │
+│                                                                │
+│  결과: 유저 프로세스가 BAR0(도어벨 포함)에 직접 접근 가능      │
+│  이후: cudaHostRegister(IoMemory) → GPU도 접근 가능            │
+│                                                                │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  역할 ②: ioctl(NVM_MAP_HOST_MEMORY) — Host DMA 매핑          │
+│                                                                │
+│  유저 가상주소 → get_user_pages() → 페이지 pin                │
+│  → dma_map_page() → NVMe 컨트롤러용 DMA 버스 주소 반환       │
+│                                                                │
+│  용도: Admin Queue 메모리 (Host DRAM)를 NVMe가 DMA로 접근     │
+│                                                                │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  역할 ③: ioctl(NVM_MAP_DEVICE_MEMORY) — GPU P2P DMA 매핑 ★  │
+│                                                                │
+│  GPU 가상주소 → nvidia_p2p_get_pages() → GPU VRAM pin        │
+│  → nvidia_p2p_dma_map_pages() → NVMe용 P2P DMA 주소 반환     │
+│                                                                │
+│  용도: SQ/CQ/PRP 버퍼(GPU VRAM)를 NVMe가 P2P DMA로 접근      │
+│  이것이 GPU↔SSD 직접 통신의 핵심 ★                           │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+
+★ 커널 모듈은 초기화 시에만 관여 — 런타임 I/O에는 개입 없음
+
+요약:
+┌──────────┬──────────────────────┬─────────────────────────┐
+│ 역할     │ 커널 함수            │ 결과                    │
+├──────────┼──────────────────────┼─────────────────────────┤
+│ ① mmap  │ vm_iomap_memory      │ BAR0 → 유저 → GPU 접근  │
+│ ② Host  │ get_user_pages +     │ Host DRAM → NVMe DMA    │
+│   DMA   │ dma_map_page         │ (Admin Queue용)         │
+│ ③ GPU   │ nvidia_p2p_get_pages │ GPU VRAM → NVMe P2P DMA │
+│   P2P ★│ nvidia_p2p_dma_map   │ (SQ/CQ/PRP 버퍼용) ★   │
+└──────────┴──────────────────────┴─────────────────────────┘
+```
+
 ## 장표 2: Host 초기화 상세 (Phase 2~3)
 
 ```
@@ -278,6 +335,7 @@ NVMe Controller
 | 장표 | 제목 | 초점 |
 |:----:|------|------|
 | 1 | 전체 프로그램 흐름 | Big Picture — 7 Phase 개요 |
+| **1.5** | **커널 모듈 역할** | **libnvm.ko의 3가지 역할: mmap, Host DMA, GPU P2P** |
 | 2 | Host 초기화 | NVMe Controller + Page Cache 생성 |
 | 3 | 커널 Launch 구성 | grid/block 차원, 파라미터 |
 | 4 | Warp 큐 선택 | 순차 vs 랜덤의 ctrl/queue 배정 차이 |
@@ -286,5 +344,5 @@ NVMe Controller
 | 7 | NVMe 측 처리 | SQ fetch → NAND read → P2P DMA → CQ write |
 | 8 | 성능 측정 | IOPS, Bandwidth, Cache Hit 계산 |
 
-장표 5(Thread I/O 흐름)와 장표 6(Doorbell 배칭)이 발표의 하이라이트.
-이 두 장에서 "GPU가 NVMe 프로토콜을 직접 수행한다"는 것이 가장 선명하게 드러남.
+장표 1.5(커널 모듈)가 "왜 GPU가 NVMe에 접근 가능한가"의 근거.
+장표 5(Thread I/O 흐름)와 장표 6(Doorbell 배칭)이 "어떻게 접근하는가"의 핵심.
