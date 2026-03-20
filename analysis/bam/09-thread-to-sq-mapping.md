@@ -677,19 +677,72 @@ for (size_t i = 0; i < n; i++)
 
 **핵심 차이:** SPDK는 코어당 전용 큐로 경합을 원천 차단하지만, GPU는 SM당 수십 warp가 동시 실행되므로 큐 공유가 불가피 → BaM이 Lamport Ticket + 도어벨 배칭으로 이를 해결.
 
-## 9. 수치 예시
+## 9. 수치 예시: Blackwell (188 SM) + NVMe SSD 1개
 
-A100 GPU(108 SM) + NVMe SSD 1개(n_qps=128, qd=1024) 기준:
+현재 실험 환경 기준 (NVIDIA Blackwell, SM 188개, Warp Scheduler 4개/SM, SSD 1개 P2P 직접 연결).
+
+### 9.1 하드웨어 수치
 
 ```
-SM 수:          108
-Warp/SM:        ~32 (동시 실행 가능)
-총 동시 Warp:   ~3,456
-총 동시 Thread: ~110,592
-QP 수:          128
-Warp/QP (평균): ~27 warp가 1개 QP 공유
-SQ 엔트리:      1024개/QP
-→ 27 warp × 32 thread = 864 thread가 1024 slot 공유
-→ slot 경합은 있으나 ticket 알고리즘으로 lock-free 처리
-→ doorbell 배칭으로 최대 수십 개 커맨드를 1회 doorbell로 통합
+SM 수:                 188
+Warp Scheduler / SM:   4       (한 cycle에 4개 warp 동시 명령 발행)
+SM당 최대 상주 Warp:   ~64     (Blackwell 추정, Hopper 동일)
+최대 상주 Warp:        188 × 64 = 12,032 warp
+최대 상주 Thread:      12,032 × 32 = 385,024 thread
+동시 dispatch Warp:    188 × 4 = 752 warp/cycle
+```
+
+### 9.2 SSD 1개일 때: 단계①이 무효화
+
+`n_ctrls = 1`이므로 `smid % 1 = 항상 0` → 컨트롤러 선택이 의미 없음.
+**실질적인 분산은 단계②(Warp → QueuePair 라운드로빈)만 동작.**
+
+```
+188 SM 전부 ──→ Controller 0 (유일한 SSD)
+                     │
+         queue_counter.fetch_add(1) % n_qps
+                     │
+              QP[0] ~ QP[n_qps-1]
+```
+
+### 9.3 n_qps에 따른 QP당 경합 수준
+
+| n_qps | QP당 상주 warp (최대) | QP당 SQ slot 점유율 (qd=1024) | 경합 수준 |
+|:-----:|:--------------------:|:----------------------------:|:---------:|
+| 16 | 12,032/16 = **752** | 752/1024 = 73% | 높음 — slot 대기 빈번 |
+| 32 | 12,032/32 = **376** | 376/1024 = 37% | 중간 |
+| 64 | 12,032/64 = **188** | 188/1024 = 18% | 낮음 |
+| 128 | 12,032/128 = **94** | 94/1024 = 9% | 매우 낮음 — 권장 |
+
+단, 실제로 모든 warp가 동시에 I/O를 발행하지는 않음 (cache hit, 연산 중 등).
+실효 I/O warp는 cache miss 비율에 따라 전체의 ~10~30% 수준.
+
+### 9.4 Warp Scheduler 4개와 SQ 경합
+
+```
+SM #k 내부 (한 cycle):
+
+  Scheduler 0 ──→ Warp A ──→ sq_enqueue(QP[x])
+  Scheduler 1 ──→ Warp B ──→ sq_enqueue(QP[y])   ← 4개가 동시 발행 가능
+  Scheduler 2 ──→ Warp C ──→ sq_enqueue(QP[z])
+  Scheduler 3 ──→ Warp D ──→ sq_enqueue(QP[w])
+
+  queue_counter 라운드로빈으로 x≠y≠z≠w일 확률 높음
+  → n_qps ≥ 4이면 같은 SM의 동시 4 warp가 서로 다른 QP에 배정
+  → n_qps = 128이면 같은 QP에 동시 접근하는 warp가 사실상 없음
+```
+
+### 9.5 권장 설정
+
+```
+환경:   Blackwell 188 SM + NVMe SSD 1개
+
+n_qps = 64~128 권장
+  → QP당 동시 I/O warp: ~1~3개 (cache miss 10~30% 가정)
+  → ticket 경합 최소화, doorbell 배칭 효과도 유지
+  → SSD 측 제한 확인 필요: nvme id-ctrl /dev/nvmeX → MQES, SQES, 최대 큐 수
+
+queueDepth (SQ 크기) = 1024 권장
+  → QP당 ~94 warp × I/O depth 1~4 = ~94~376 outstanding cmd
+  → 1024 slot이면 충분한 여유 (slot 대기 없음)
 ```
