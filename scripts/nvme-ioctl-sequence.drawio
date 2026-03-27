@@ -1,0 +1,577 @@
+<mxfile host="app.diagrams.net" modified="2026-03-26T00:00:00.000Z" agent="Claude" version="21.0.0" type="device">
+  <diagram id="nvme-ioctl-seq" name="NVMe ioctl Read Sequence">
+    <mxGraphModel dx="1600" dy="3200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1600" pageHeight="4000" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE HEADER BOXES                                            -->
+        <!-- ================================================================ -->
+        <!-- x positions: nvme-cli=120, blk-mq=420, NVMe Driver=720, NVMe SSD=1020 -->
+
+        <mxCell id="h1" value="nvme-cli" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="60" y="30" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="h2" value="blk-mq" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="360" y="30" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="h3" value="NVMe Driver" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="660" y="30" width="120" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="h4" value="NVMe SSD" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="960" y="30" width="120" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE DASHED LINES                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="ll1" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#6c8ebf;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="120" y="70" as="sourcePoint"/>
+            <mxPoint x="120" y="2650" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll2" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#82b366;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="420" y="70" as="sourcePoint"/>
+            <mxPoint x="420" y="2650" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll3" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#d6b656;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="720" y="70" as="sourcePoint"/>
+            <mxPoint x="720" y="2650" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll4" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#b85450;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1020" y="70" as="sourcePoint"/>
+            <mxPoint x="1020" y="2650" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- ACTIVATION BARS                                                  -->
+        <!-- ================================================================ -->
+        <!-- nvme-cli: active at start and end -->
+        <mxCell id="a1a" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="100" width="16" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="a1b" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="2560" width="16" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe Driver: first activation (ioctl entry → doorbell) -->
+        <mxCell id="a3a" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="120" width="16" height="830" as="geometry"/>
+        </mxCell>
+
+        <!-- blk-mq: alloc_request activation -->
+        <mxCell id="a2a" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="340" width="16" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- blk-mq: blk_execute_rq activation -->
+        <mxCell id="a2b" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="540" width="16" height="270" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe Driver: queue_rq callback sub-activation -->
+        <mxCell id="a3b" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=70;" vertex="1" parent="1">
+          <mxGeometry x="720" y="680" width="16" height="270" as="geometry"/>
+        </mxCell>
+
+        <!-- blk-mq: sleep wait -->
+        <mxCell id="a2c" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=30;" vertex="1" parent="1">
+          <mxGeometry x="412" y="990" width="16" height="530" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe SSD: processing activation -->
+        <mxCell id="a4a" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="960" width="16" height="400" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe Driver: interrupt handler activation -->
+        <mxCell id="a3c" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="1400" width="16" height="530" as="geometry"/>
+        </mxCell>
+
+        <!-- blk-mq: end_request activation -->
+        <mxCell id="a2d" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="1960" width="16" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe Driver: post-completion activation (copy_to_user) -->
+        <mxCell id="a3d" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="2180" width="16" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE LABELS (notes)                                             -->
+        <!-- ================================================================ -->
+        <mxCell id="phase1" value="Phase 1: ioctl Entry" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="100" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase2" value="Phase 2: Request Alloc" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="340" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase3" value="Phase 3: Submit to HW" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="540" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase4" value="Phase 4: SSD Processing" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="1050" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase5" value="Phase 5: Interrupt / CQ" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="1400" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase6" value="Phase 6: Completion" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="1960" width="160" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase7" value="Phase 7: Return to User" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="2200" width="160" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 1: nvme-cli → NVMe Driver: ioctl()                       -->
+        <!-- ================================================================ -->
+        <mxCell id="m1" value="1. ioctl(fd, NVME_IOCTL_IO_CMD, &amp;cmd)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="130" as="sourcePoint"/>
+            <mxPoint x="712" y="130" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 2: NVMe Driver self-call: nvme_dev_ioctl()               -->
+        <!-- ================================================================ -->
+        <mxCell id="m2" value="2. nvme_dev_ioctl()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="180" as="sourcePoint"/>
+            <mxPoint x="728" y="210" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="790" y="180"/>
+              <mxPoint x="790" y="210"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 3: NVMe Driver self-call: nvme_user_cmd()                -->
+        <!-- ================================================================ -->
+        <mxCell id="m3" value="3. nvme_user_cmd()&#xa;   copy_from_user() / pin_user_pages()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="240" as="sourcePoint"/>
+            <mxPoint x="728" y="290" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="800" y="240"/>
+              <mxPoint x="800" y="290"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 4: NVMe Driver → blk-mq: blk_mq_alloc_request()         -->
+        <!-- ================================================================ -->
+        <mxCell id="m4" value="4. blk_mq_alloc_request()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="350" as="sourcePoint"/>
+            <mxPoint x="428" y="350" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 5: blk-mq self-call: tag alloc                           -->
+        <!-- ================================================================ -->
+        <mxCell id="m5" value="5. tag 할당 (cmd ID)&#xa;   request 구조체 초기화" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="412" y="380" as="sourcePoint"/>
+            <mxPoint x="412" y="430" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="340" y="380"/>
+              <mxPoint x="340" y="430"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 6: blk-mq → NVMe Driver: return                         -->
+        <!-- ================================================================ -->
+        <mxCell id="m6" value="6. return request" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="428" y="470" as="sourcePoint"/>
+            <mxPoint x="712" y="470" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 7: NVMe Driver → blk-mq: blk_execute_rq()               -->
+        <!-- ================================================================ -->
+        <mxCell id="m7" value="7. blk_execute_rq()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="550" as="sourcePoint"/>
+            <mxPoint x="428" y="550" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 8: blk-mq self-call: insert + run_hw_queue               -->
+        <!-- ================================================================ -->
+        <mxCell id="m8" value="8. blk_mq_insert_request()&#xa;   blk_mq_run_hw_queue()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="412" y="590" as="sourcePoint"/>
+            <mxPoint x="412" y="640" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="340" y="590"/>
+              <mxPoint x="340" y="640"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 9: blk-mq → NVMe Driver: .queue_rq callback             -->
+        <!-- ================================================================ -->
+        <mxCell id="m9" value="9. .queue_rq callback (nvme_queue_rq)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="428" y="690" as="sourcePoint"/>
+            <mxPoint x="712" y="690" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 10: NVMe Driver self-call: nvme_setup_cmd()              -->
+        <!-- ================================================================ -->
+        <mxCell id="m10" value="10. nvme_setup_cmd()&#xa;    opcode=0x02, slba, length" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="736" y="730" as="sourcePoint"/>
+            <mxPoint x="736" y="780" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="730"/>
+              <mxPoint x="820" y="780"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 11: NVMe Driver self-call: nvme_map_data()               -->
+        <!-- ================================================================ -->
+        <mxCell id="m11" value="11. nvme_map_data()&#xa;    dma_map_sg() → nvme_setup_prp_simple()&#xa;    PRP1 = dma_addr" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="736" y="800" as="sourcePoint"/>
+            <mxPoint x="736" y="860" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="830" y="800"/>
+              <mxPoint x="830" y="860"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 12: NVMe Driver self-call: nvme_sq_copy_cmd()            -->
+        <!-- ================================================================ -->
+        <mxCell id="m12" value="12. nvme_sq_copy_cmd()&#xa;    memcpy(SQ[tail], &amp;cmd, 64B)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="736" y="880" as="sourcePoint"/>
+            <mxPoint x="736" y="920" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="830" y="880"/>
+              <mxPoint x="830" y="920"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 13: NVMe Driver self-call: nvme_write_sq_db()            -->
+        <!-- ================================================================ -->
+        <mxCell id="m13" value="13. nvme_write_sq_db()&#xa;    writel(tail, q_db)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="736" y="930" as="sourcePoint"/>
+            <mxPoint x="736" y="960" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="830" y="930"/>
+              <mxPoint x="830" y="960"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 14: NVMe Driver → NVMe SSD: SQ Doorbell (async)          -->
+        <!-- ================================================================ -->
+        <mxCell id="m14" value="14. SQ Doorbell (MMIO write)" style="endArrow=open;endFill=0;dashed=1;strokeColor=#CC0000;fontColor=#CC0000;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="728" y="970" as="sourcePoint"/>
+            <mxPoint x="1012" y="970" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 15: Note - sleep wait                                    -->
+        <!-- ================================================================ -->
+        <mxCell id="m15" value="15. NVMe Driver returns,&#xa;    blk-mq enters sleep wait&#xa;    (process context sleeps)" style="text;html=1;fillColor=#FFF3E0;strokeColor=#FF9800;align=left;verticalAlign=middle;rounded=1;fontSize=10;fontStyle=2;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="200" y="1000" width="200" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 16: NVMe SSD self-call: SQ fetch                         -->
+        <!-- ================================================================ -->
+        <mxCell id="m16" value="16. SQ fetch&#xa;    (DMA read cmd 64B)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1028" y="1070" as="sourcePoint"/>
+            <mxPoint x="1028" y="1110" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1100" y="1070"/>
+              <mxPoint x="1100" y="1110"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 17: NVMe SSD self-call: NAND Flash read                  -->
+        <!-- ================================================================ -->
+        <mxCell id="m17" value="17. NAND Flash read" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1028" y="1140" as="sourcePoint"/>
+            <mxPoint x="1028" y="1180" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1100" y="1140"/>
+              <mxPoint x="1100" y="1180"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 18: NVMe SSD self-call: DMA write 4KB                    -->
+        <!-- ================================================================ -->
+        <mxCell id="m18" value="18. DMA write 4KB data&#xa;    → PRP1 addr (host memory)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1028" y="1210" as="sourcePoint"/>
+            <mxPoint x="1028" y="1260" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1110" y="1210"/>
+              <mxPoint x="1110" y="1260"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 19: NVMe SSD self-call: CQ entry write                   -->
+        <!-- ================================================================ -->
+        <mxCell id="m19" value="19. CQ entry write&#xa;    (DMA write 16B to CQ)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1028" y="1290" as="sourcePoint"/>
+            <mxPoint x="1028" y="1340" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1110" y="1290"/>
+              <mxPoint x="1110" y="1340"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 20: NVMe SSD → NVMe Driver: MSI-X interrupt (async)      -->
+        <!-- ================================================================ -->
+        <mxCell id="m20" value="20. MSI-X interrupt" style="endArrow=open;endFill=0;dashed=1;strokeColor=#CC0000;fontColor=#CC0000;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="1400" as="sourcePoint"/>
+            <mxPoint x="728" y="1400" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 21: NVMe Driver self-call: nvme_irq()                    -->
+        <!-- ================================================================ -->
+        <mxCell id="m21" value="21. nvme_irq()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="1440" as="sourcePoint"/>
+            <mxPoint x="728" y="1480" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="800" y="1440"/>
+              <mxPoint x="800" y="1480"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 22: NVMe Driver self-call: nvme_process_cq()             -->
+        <!-- ================================================================ -->
+        <mxCell id="m22" value="22. nvme_process_cq()&#xa;    phase bit 확인" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="1510" as="sourcePoint"/>
+            <mxPoint x="728" y="1560" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="1510"/>
+              <mxPoint x="820" y="1560"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 23: NVMe Driver self-call: nvme_handle_cqe()             -->
+        <!-- ================================================================ -->
+        <mxCell id="m23" value="23. nvme_handle_cqe()&#xa;    tag → rq 매핑" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="1590" as="sourcePoint"/>
+            <mxPoint x="728" y="1640" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="1590"/>
+              <mxPoint x="820" y="1640"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 24: NVMe Driver self-call: nvme_complete_rq()            -->
+        <!-- ================================================================ -->
+        <mxCell id="m24" value="24. nvme_complete_rq()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="1670" as="sourcePoint"/>
+            <mxPoint x="728" y="1710" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="1670"/>
+              <mxPoint x="820" y="1710"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 25: NVMe Driver self-call: writel(cq_head, q_db+1)       -->
+        <!-- ================================================================ -->
+        <mxCell id="m25" value="25. writel(cq_head, q_db+1)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="1740" as="sourcePoint"/>
+            <mxPoint x="728" y="1780" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="1740"/>
+              <mxPoint x="820" y="1780"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 26: NVMe Driver → NVMe SSD: CQ Doorbell                  -->
+        <!-- ================================================================ -->
+        <mxCell id="m26" value="26. CQ Doorbell (MMIO write)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="728" y="1820" as="sourcePoint"/>
+            <mxPoint x="1012" y="1820" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 27: NVMe Driver → blk-mq: blk_mq_end_request()          -->
+        <!-- ================================================================ -->
+        <mxCell id="m27" value="27. blk_mq_end_request()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="1970" as="sourcePoint"/>
+            <mxPoint x="428" y="1970" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 28: blk-mq self-call: tag release                        -->
+        <!-- ================================================================ -->
+        <mxCell id="m28" value="28. tag 해제" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="412" y="2000" as="sourcePoint"/>
+            <mxPoint x="412" y="2040" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="340" y="2000"/>
+              <mxPoint x="340" y="2040"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 29: blk-mq self-call: wake up                            -->
+        <!-- ================================================================ -->
+        <mxCell id="m29" value="29. wake up (blk_execute_rq returns)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="412" y="2060" as="sourcePoint"/>
+            <mxPoint x="412" y="2100" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="340" y="2060"/>
+              <mxPoint x="340" y="2100"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 30: blk-mq → NVMe Driver: return                        -->
+        <!-- ================================================================ -->
+        <mxCell id="m30" value="30. return" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="428" y="2140" as="sourcePoint"/>
+            <mxPoint x="712" y="2140" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 31: NVMe Driver self-call: copy_to_user()                -->
+        <!-- ================================================================ -->
+        <mxCell id="m31" value="31. copy_to_user()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="2220" as="sourcePoint"/>
+            <mxPoint x="728" y="2260" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="800" y="2220"/>
+              <mxPoint x="800" y="2260"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 32: NVMe Driver self-call: unpin_user_pages()            -->
+        <!-- ================================================================ -->
+        <mxCell id="m32" value="32. unpin_user_pages()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="728" y="2290" as="sourcePoint"/>
+            <mxPoint x="728" y="2330" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="820" y="2290"/>
+              <mxPoint x="820" y="2330"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- MESSAGE 33: NVMe Driver → nvme-cli: ioctl return                 -->
+        <!-- ================================================================ -->
+        <mxCell id="m33" value="33. ioctl return (data in user buffer)" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="2570" as="sourcePoint"/>
+            <mxPoint x="128" y="2570" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- TITLE                                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="title" value="Linux NVMe Read Command — nvme-cli ioctl Path&#xa;(NVME_IOCTL_IO_CMD → Kernel → SSD → Completion)" style="text;html=1;align=center;verticalAlign=middle;fontSize=16;fontStyle=1;fillColor=none;strokeColor=none;fontColor=#1a237e;" vertex="1" parent="1">
+          <mxGeometry x="200" y="-30" width="700" height="50" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
