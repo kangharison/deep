@@ -1,0 +1,603 @@
+<mxfile host="app.diagrams.net" modified="2026-03-26T00:00:00.000Z" agent="Claude" version="21.0.0" type="device">
+  <diagram id="bam-block-bench-seq" name="BaM Block Benchmark - GPU-Initiated NVMe Read Path">
+    <mxGraphModel dx="1800" dy="6400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1800" pageHeight="6200" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ================================================================ -->
+        <!-- TITLE                                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="title" value="BaM Block Benchmark - GPU-Initiated NVMe Read Path" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="300" y="0" width="600" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE HEADER BOXES                                            -->
+        <!-- ================================================================ -->
+        <!-- x positions: GPU Kernel=150, BaM I/O=450, Parallel Queue=750, NVMe SSD=1050 -->
+
+        <mxCell id="h1" value="GPU Kernel&#xa;(CUDA Thread)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="50" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="h2" value="BaM I/O Layer&#xa;(read_data)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="380" y="50" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="h3" value="Parallel Queue&#xa;(Lock-free SQ/CQ)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="680" y="50" width="140" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="h4" value="NVMe SSD&#xa;(Hardware)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="980" y="50" width="140" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE DASHED LINES                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="ll1" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#6c8ebf;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="150" y="100" as="sourcePoint"/>
+            <mxPoint x="150" y="5800" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll2" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#82b366;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="450" y="100" as="sourcePoint"/>
+            <mxPoint x="450" y="5800" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll3" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#d6b656;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="750" y="100" as="sourcePoint"/>
+            <mxPoint x="750" y="5800" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll4" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#b85450;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1050" y="100" as="sourcePoint"/>
+            <mxPoint x="1050" y="5800" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- ACTIVATION BARS                                                  -->
+        <!-- ================================================================ -->
+        <!-- GPU Kernel: Phase 1 (steps 1-4) -->
+        <mxCell id="a1a" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="142" y="140" width="16" height="420" as="geometry"/>
+        </mxCell>
+        <!-- GPU Kernel: Phase 6 return -->
+        <mxCell id="a1b" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="142" y="5550" width="16" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- BaM I/O Layer: Phase 2 (steps 5-12) -->
+        <mxCell id="a2a" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="442" y="570" width="16" height="700" as="geometry"/>
+        </mxCell>
+        <!-- BaM I/O Layer: Phase 3 submit -->
+        <mxCell id="a2b" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="442" y="1290" width="16" height="80" as="geometry"/>
+        </mxCell>
+        <!-- BaM I/O Layer: Phase 5 polling -->
+        <mxCell id="a2c" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="442" y="3650" width="16" height="800" as="geometry"/>
+        </mxCell>
+        <!-- BaM I/O Layer: Phase 6 cleanup -->
+        <mxCell id="a2d" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="442" y="5200" width="16" height="350" as="geometry"/>
+        </mxCell>
+
+        <!-- Parallel Queue: Phase 2 CID alloc -->
+        <mxCell id="a3a" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="742" y="640" width="16" height="280" as="geometry"/>
+        </mxCell>
+        <!-- Parallel Queue: Phase 3 SQ enqueue -->
+        <mxCell id="a3b" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="742" y="1340" width="16" height="1050" as="geometry"/>
+        </mxCell>
+        <!-- Parallel Queue: Phase 5 CQ poll/dequeue -->
+        <mxCell id="a3c" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="742" y="3720" width="16" height="1400" as="geometry"/>
+        </mxCell>
+        <!-- Parallel Queue: Phase 6 put_cid -->
+        <mxCell id="a3d" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="742" y="5250" width="16" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe SSD: Phase 3 doorbell -->
+        <mxCell id="a4a" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1042" y="2400" width="16" height="60" as="geometry"/>
+        </mxCell>
+        <!-- NVMe SSD: Phase 4 processing -->
+        <mxCell id="a4b" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1042" y="2600" width="16" height="850" as="geometry"/>
+        </mxCell>
+        <!-- NVMe SSD: Phase 5 CQ doorbell -->
+        <mxCell id="a4c" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1042" y="5100" width="16" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE LABELS (right side, purple)                                -->
+        <!-- ================================================================ -->
+        <mxCell id="phase1" value="Phase 1: Kernel Entry&#xa;&amp; Address Calculation" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="140" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase2" value="Phase 2: NVMe&#xa;Command Build" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="600" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase3" value="Phase 3: Lock-free&#xa;SQ Submit" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="1300" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase4" value="Phase 4: SSD&#xa;Processing (HW)" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="2600" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase5" value="Phase 5: GPU&#xa;Polling Completion" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="3650" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase6" value="Phase 6: Cleanup&#xa;&amp; Return" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="5200" width="200" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- NOTES (important annotations)                                    -->
+        <!-- ================================================================ -->
+        <mxCell id="note1" value="⚠ CPU 개입 없음&#xa;전체 경로가 GPU에서 실행" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;fontStyle=0;size=14;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="2750" width="200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="note2" value="⚠ Polling 방식&#xa;(인터럽트 없음)" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;fontStyle=0;size=14;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="3800" width="200" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="note3" value="⚠ PCIe P2P DMA&#xa;(CPU DRAM bypass)" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;fontStyle=0;size=14;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="3100" width="200" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 1: Kernel Entry & Address Calculation (Steps 1-4)          -->
+        <!-- ================================================================ -->
+
+        <!-- Step 1: GPU Kernel self-call: kernel entry -->
+        <mxCell id="m1" value="1. sequential_access_kernel()&#xa;   또는 random_access_kernel() 진입" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="158" y="160" as="sourcePoint"/>
+            <mxPoint x="158" y="210" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="240" y="160"/>
+              <mxPoint x="240" y="210"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 2: GPU Kernel self-call: start_block calculation -->
+        <mxCell id="m2" value="2. start_block 계산&#xa;   seq: tid*req_size, rand: assignment[tid]" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="158" y="240" as="sourcePoint"/>
+            <mxPoint x="158" y="300" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="260" y="240"/>
+              <mxPoint x="260" y="300"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 3: GPU Kernel self-call: queue selection -->
+        <mxCell id="m3" value="3. queue 선택&#xa;   seq: smid % n_qps, rand: atomic round-robin" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="158" y="330" as="sourcePoint"/>
+            <mxPoint x="158" y="390" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="270" y="330"/>
+              <mxPoint x="270" y="390"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 4: GPU Kernel self-call: controller selection -->
+        <mxCell id="m4" value="4. controller 선택&#xa;   warp lane 0: atomic fetch_add round-robin" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="158" y="420" as="sourcePoint"/>
+            <mxPoint x="158" y="480" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="270" y="420"/>
+              <mxPoint x="270" y="480"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 2: NVMe Command Build (Steps 5-12)                        -->
+        <!-- ================================================================ -->
+
+        <!-- Step 5: GPU Kernel → BaM I/O Layer: read_data() -->
+        <mxCell id="m5" value="5. read_data(qp, starting_lba, n_blocks, prp_entry)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="158" y="590" as="sourcePoint"/>
+            <mxPoint x="442" y="590" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 6: BaM I/O Layer → Parallel Queue: get_cid() -->
+        <mxCell id="m6" value="6. get_cid(&amp;qp-&gt;sq)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="458" y="650" as="sourcePoint"/>
+            <mxPoint x="742" y="650" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 7: Parallel Queue self-call: cid_ticket.fetch_add -->
+        <mxCell id="m7" value="7. cid_ticket.fetch_add(1)&#xa;   atomic CID 후보" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="690" as="sourcePoint"/>
+            <mxPoint x="758" y="740" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="840" y="690"/>
+              <mxPoint x="840" y="740"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 8: Parallel Queue self-call: CID slot reservation -->
+        <mxCell id="m8" value="8. cid[id].fetch_or(LOCKED)&#xa;   CID 슬롯 예약" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="770" as="sourcePoint"/>
+            <mxPoint x="758" y="830" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="840" y="770"/>
+              <mxPoint x="840" y="830"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 9: Parallel Queue → BaM I/O Layer: CID return (dashed) -->
+        <mxCell id="m9" value="9. CID 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="742" y="870" as="sourcePoint"/>
+            <mxPoint x="458" y="870" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 10: BaM I/O Layer self-call: nvm_cmd_header -->
+        <mxCell id="m10" value="10. nvm_cmd_header(&amp;cmd, cid,&#xa;    NVM_IO_READ, nsid)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="458" y="920" as="sourcePoint"/>
+            <mxPoint x="458" y="980" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="560" y="920"/>
+              <mxPoint x="560" y="980"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 11: BaM I/O Layer self-call: nvm_cmd_data_ptr -->
+        <mxCell id="m11" value="11. nvm_cmd_data_ptr(&amp;cmd, prp1, prp2)&#xa;    PRP1 = GPU 물리주소" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="458" y="1020" as="sourcePoint"/>
+            <mxPoint x="458" y="1090" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="570" y="1020"/>
+              <mxPoint x="570" y="1090"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 12: BaM I/O Layer self-call: nvm_cmd_rw_blks -->
+        <mxCell id="m12" value="12. nvm_cmd_rw_blks(&amp;cmd,&#xa;    starting_lba, n_blocks)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="458" y="1130" as="sourcePoint"/>
+            <mxPoint x="458" y="1200" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="570" y="1130"/>
+              <mxPoint x="570" y="1200"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 3: Lock-free SQ Submit (Steps 13-20)                      -->
+        <!-- ================================================================ -->
+
+        <!-- Step 13: BaM I/O Layer → Parallel Queue: sq_enqueue -->
+        <mxCell id="m13" value="13. sq_enqueue(&amp;qp-&gt;sq, &amp;cmd)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="458" y="1310" as="sourcePoint"/>
+            <mxPoint x="742" y="1310" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 14: Parallel Queue self-call: ticket alloc -->
+        <mxCell id="m14" value="14. ticket = in_ticket.fetch_add(1)&#xa;    순서 티켓 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1370" as="sourcePoint"/>
+            <mxPoint x="758" y="1440" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="1370"/>
+              <mxPoint x="870" y="1440"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 15: Parallel Queue self-call: spin-wait -->
+        <mxCell id="m15" value="15. spin-wait: tickets[pos] == expected_id&#xa;    순서 대기 (busy loop)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1480" as="sourcePoint"/>
+            <mxPoint x="758" y="1560" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="880" y="1480"/>
+              <mxPoint x="880" y="1560"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 16: Parallel Queue self-call: memcpy command -->
+        <mxCell id="m16" value="16. memcpy(SQ[pos], &amp;cmd, 64B)&#xa;    NVMe command 복사" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1600" as="sourcePoint"/>
+            <mxPoint x="758" y="1680" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="880" y="1600"/>
+              <mxPoint x="880" y="1680"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 17: Parallel Queue self-call: tail_mark -->
+        <mxCell id="m17" value="17. tail_mark[pos] = LOCKED&#xa;    슬롯 완료 표시" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1720" as="sourcePoint"/>
+            <mxPoint x="758" y="1800" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="1720"/>
+              <mxPoint x="870" y="1800"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 18: Parallel Queue self-call: leader election -->
+        <mxCell id="m18" value="18. leader election&#xa;    tail_lock.fetch_or(LOCKED)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1840" as="sourcePoint"/>
+            <mxPoint x="758" y="1920" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="1840"/>
+              <mxPoint x="870" y="1920"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 19: Parallel Queue self-call: move_tail -->
+        <mxCell id="m19" value="19. move_tail()&#xa;    연속 LOCKED 슬롯 수집" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="1960" as="sourcePoint"/>
+            <mxPoint x="758" y="2050" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="1960"/>
+              <mxPoint x="870" y="2050"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 20: Parallel Queue → NVMe SSD: SQ Doorbell (async dashed) -->
+        <mxCell id="m20" value="20. st.mmio SQ Doorbell write&#xa;    (PTX MMIO instruction)" style="endArrow=open;endFill=0;dashed=1;strokeColor=#CC0000;fontColor=#CC0000;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="758" y="2420" as="sourcePoint"/>
+            <mxPoint x="1042" y="2420" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 4: SSD Processing (Steps 21-24)                           -->
+        <!-- ================================================================ -->
+
+        <!-- Step 21: NVMe SSD self-call: SQ fetch -->
+        <mxCell id="m21" value="21. SQ fetch&#xa;    (DMA read cmd 64B)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1058" y="2630" as="sourcePoint"/>
+            <mxPoint x="1058" y="2710" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1140" y="2630"/>
+              <mxPoint x="1140" y="2710"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 22: NVMe SSD self-call: NAND Flash read -->
+        <mxCell id="m22" value="22. NAND Flash read" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1058" y="2760" as="sourcePoint"/>
+            <mxPoint x="1058" y="2840" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1140" y="2760"/>
+              <mxPoint x="1140" y="2840"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 23: NVMe SSD self-call: PCIe P2P DMA write → GPU memory -->
+        <mxCell id="m23" value="23. PCIe P2P DMA write → GPU memory&#xa;    (PRP1 주소, CPU DRAM bypass)" style="endArrow=block;endFill=1;strokeColor=#CC0000;fontColor=#CC0000;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1058" y="2890" as="sourcePoint"/>
+            <mxPoint x="1058" y="2990" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1160" y="2890"/>
+              <mxPoint x="1160" y="2990"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 24: NVMe SSD self-call: CQ entry write → GPU memory -->
+        <mxCell id="m24" value="24. CQ entry write → GPU memory&#xa;    (DMA)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1058" y="3040" as="sourcePoint"/>
+            <mxPoint x="1058" y="3130" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1150" y="3040"/>
+              <mxPoint x="1150" y="3130"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 5: GPU Polling Completion (Steps 25-33)                   -->
+        <!-- ================================================================ -->
+
+        <!-- Step 25: BaM I/O Layer → Parallel Queue: cq_poll -->
+        <mxCell id="m25" value="25. cq_poll(&amp;qp-&gt;cq, cid)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="458" y="3720" as="sourcePoint"/>
+            <mxPoint x="742" y="3720" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 26: Parallel Queue self-call: CQ scan -->
+        <mxCell id="m26" value="26. CQ 스캔&#xa;    phase bit + CID 매칭 (busy wait)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="3780" as="sourcePoint"/>
+            <mxPoint x="758" y="3860" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="3780"/>
+              <mxPoint x="870" y="3860"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 27: Parallel Queue self-call: nanosleep backoff -->
+        <mxCell id="m27" value="27. __nanosleep() exponential backoff&#xa;    (8→256ns)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="3900" as="sourcePoint"/>
+            <mxPoint x="758" y="3980" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="880" y="3900"/>
+              <mxPoint x="880" y="3980"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 28: Parallel Queue → BaM I/O Layer: CQ position return (dashed) -->
+        <mxCell id="m28" value="28. CQ position 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="742" y="4040" as="sourcePoint"/>
+            <mxPoint x="458" y="4040" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 29: BaM I/O Layer → Parallel Queue: cq_dequeue -->
+        <mxCell id="m29" value="29. cq_dequeue(&amp;qp-&gt;cq, cq_pos, &amp;qp-&gt;sq)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="458" y="4120" as="sourcePoint"/>
+            <mxPoint x="742" y="4120" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 30: Parallel Queue self-call: head_mark -->
+        <mxCell id="m30" value="30. head_mark[pos] = LOCKED&#xa;    처리 완료 표시" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="4180" as="sourcePoint"/>
+            <mxPoint x="758" y="4260" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="4180"/>
+              <mxPoint x="870" y="4260"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 31: Parallel Queue self-call: leader election head -->
+        <mxCell id="m31" value="31. leader election&#xa;    head_lock.fetch_or(LOCKED)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="4300" as="sourcePoint"/>
+            <mxPoint x="758" y="4380" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="870" y="4300"/>
+              <mxPoint x="870" y="4380"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 32: Parallel Queue self-call: move_head_cq -->
+        <mxCell id="m32" value="32. move_head_cq()&#xa;    연속 처리된 엔트리 수집&#xa;    + SQ head 업데이트" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="4420" as="sourcePoint"/>
+            <mxPoint x="758" y="4530" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="880" y="4420"/>
+              <mxPoint x="880" y="4530"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 33: Parallel Queue → NVMe SSD: CQ Doorbell write (sync arrow) -->
+        <mxCell id="m33" value="33. st.mmio CQ Doorbell write" style="endArrow=block;endFill=1;strokeColor=#CC0000;fontColor=#CC0000;fontSize=11;fontStyle=1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="758" y="5120" as="sourcePoint"/>
+            <mxPoint x="1042" y="5120" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 6: Cleanup & Return (Steps 34-37)                         -->
+        <!-- ================================================================ -->
+
+        <!-- Step 34: BaM I/O Layer → Parallel Queue: put_cid -->
+        <mxCell id="m34" value="34. put_cid(&amp;qp-&gt;sq, cid)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="458" y="5260" as="sourcePoint"/>
+            <mxPoint x="742" y="5260" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 35: Parallel Queue self-call: cid UNLOCKED -->
+        <mxCell id="m35" value="35. cid[id] = UNLOCKED" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="758" y="5310" as="sourcePoint"/>
+            <mxPoint x="758" y="5370" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="860" y="5310"/>
+              <mxPoint x="860" y="5370"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 36: Parallel Queue → BaM I/O Layer: return (dashed) -->
+        <mxCell id="m36" value="36. (return)" style="endArrow=open;endFill=0;dashed=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="742" y="5410" as="sourcePoint"/>
+            <mxPoint x="458" y="5410" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Step 37: BaM I/O Layer → GPU Kernel: read_data() return (dashed) -->
+        <mxCell id="m37" value="37. read_data() 리턴" style="endArrow=open;endFill=0;dashed=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="442" y="5570" as="sourcePoint"/>
+            <mxPoint x="158" y="5570" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
