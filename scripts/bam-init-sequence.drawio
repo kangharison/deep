@@ -1,0 +1,766 @@
+<mxfile host="app.diagrams.net" modified="2026-03-26T00:00:00.000Z" agent="Claude" version="21.0.0" type="device">
+  <diagram id="bam-init-seq" name="BaM Initialization Sequence">
+    <mxGraphModel dx="1800" dy="7600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1800" pageHeight="7400" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ================================================================ -->
+        <!-- TITLE                                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="title" value="BaM Initialization - NVMe Queue Setup for GPU-Initiated I/O" style="text;html=1;align=center;verticalAlign=middle;fontSize=18;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="300" y="0" width="700" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE HEADER BOXES                                            -->
+        <!-- ================================================================ -->
+        <!-- x positions: HostApp=120, KernelModule=420, NVMeSSD=720, CUDARuntime=1020, GPUMemory=1320 -->
+
+        <mxCell id="h1" value="Host App (CPU)&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;benchmark main()&lt;br&gt;Controller constructor&lt;/font&gt;" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="h2" value="Kernel Module&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;libnvm.ko&lt;br&gt;PCI probe, DMA mapping&lt;/font&gt;" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="50" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="h3" value="NVMe SSD&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Admin Queue&lt;br&gt;processes admin cmds&lt;/font&gt;" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="640" y="50" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="h4" value="CUDA Runtime&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;GPU memory alloc&lt;br&gt;registration&lt;/font&gt;" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="940" y="50" width="160" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="h5" value="GPU Memory&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;SQ/CQ/sync structs&lt;/font&gt;" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="50" width="160" height="60" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- LIFELINE DASHED LINES                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="ll1" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#6c8ebf;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="120" y="110" as="sourcePoint"/>
+            <mxPoint x="120" y="3950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll2" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#82b366;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="420" y="110" as="sourcePoint"/>
+            <mxPoint x="420" y="3950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll3" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#b85450;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="720" y="110" as="sourcePoint"/>
+            <mxPoint x="720" y="3950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll4" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#d6b656;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1020" y="110" as="sourcePoint"/>
+            <mxPoint x="1020" y="3950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ll5" value="" style="endArrow=none;dashed=1;dashPattern=4 4;strokeColor=#9673a6;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1320" y="110" as="sourcePoint"/>
+            <mxPoint x="1320" y="3950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE LABELS (right side)                                        -->
+        <!-- ================================================================ -->
+        <mxCell id="phase1" value="Phase 1: Kernel Module &amp; PCI Probe" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="140" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase2" value="Phase 2: Controller Init &amp; BAR0 Mapping" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="430" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase3" value="Phase 3: Admin Queue &amp; Controller Reset" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="730" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase4" value="Phase 4: BAR0 GPU 등록" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="1200" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase5" value="Phase 5: I/O Queue 생성 (per QueuePair)" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="1400" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase6" value="Phase 6: GPU Lock-free 구조체 초기화" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="3280" width="240" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="phase7" value="Phase 7: Controller 정보를 GPU로 복사" style="text;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;align=center;verticalAlign=middle;rounded=1;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="3560" width="240" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- NOTES                                                            -->
+        <!-- ================================================================ -->
+        <mxCell id="note1" value="이 과정은 CPU(Host)에서 수행" style="shape=note;whiteSpace=wrap;html=1;size=14;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=11;fontStyle=2;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="500" width="200" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="note2" value="초기화 완료 후 GPU가 직접&lt;br&gt;SQ/CQ 접근 가능" style="shape=note;whiteSpace=wrap;html=1;size=14;fillColor=#FFF9C4;strokeColor=#F9A825;fontSize=11;fontStyle=2;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1460" y="3700" width="200" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- ACTIVATION BARS                                                  -->
+        <!-- ================================================================ -->
+        <!-- Host App: Phase 1 (insmod) -->
+        <mxCell id="a1p1" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="150" width="16" height="40" as="geometry"/>
+        </mxCell>
+        <!-- Kernel Module: Phase 1 (PCI probe) -->
+        <mxCell id="a2p1" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="160" width="16" height="230" as="geometry"/>
+        </mxCell>
+
+        <!-- Host App: Phase 2-3 (Controller init, admin queue, controller reset) -->
+        <mxCell id="a1p2" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="440" width="16" height="730" as="geometry"/>
+        </mxCell>
+        <!-- Kernel Module: Phase 2 (BAR0 mapping) -->
+        <mxCell id="a2p2" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="510" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- NVMe SSD: Phase 3 (admin commands) -->
+        <mxCell id="a3p3" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="790" width="16" height="370" as="geometry"/>
+        </mxCell>
+
+        <!-- Host App: Phase 4 -->
+        <mxCell id="a1p4" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="1210" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 4 -->
+        <mxCell id="a4p4" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="1220" width="16" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- Host App: Phase 5 (I/O queue creation) -->
+        <mxCell id="a1p5" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="1410" width="16" height="1830" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 5 SQ alloc -->
+        <mxCell id="a4p5a" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="1420" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- GPU Memory: SQ -->
+        <mxCell id="a5p5a" value="" style="fillColor=#e1d5e7;strokeColor=#9673a6;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1312" y="1460" width="16" height="40" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 5 CQ alloc -->
+        <mxCell id="a4p5b" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="1580" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- GPU Memory: CQ -->
+        <mxCell id="a5p5b" value="" style="fillColor=#e1d5e7;strokeColor=#9673a6;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1312" y="1620" width="16" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Kernel Module: Phase 5 SQ DMA map -->
+        <mxCell id="a2p5a" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="1740" width="16" height="230" as="geometry"/>
+        </mxCell>
+        <!-- Kernel Module: Phase 5 CQ DMA map -->
+        <mxCell id="a2p5b" value="" style="fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="412" y="2010" width="16" height="190" as="geometry"/>
+        </mxCell>
+
+        <!-- NVMe SSD: Phase 5 Create CQ/SQ -->
+        <mxCell id="a3p5" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="2240" width="16" height="140" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 5 CQ doorbell -->
+        <mxCell id="a4p5c" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="2420" width="16" height="80" as="geometry"/>
+        </mxCell>
+        <!-- NVMe SSD: Phase 5 Create SQ -->
+        <mxCell id="a3p5b" value="" style="fillColor=#f8cecc;strokeColor=#b85450;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="712" y="2540" width="16" height="140" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 5 SQ doorbell -->
+        <mxCell id="a4p5d" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="2720" width="16" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- Host App: Phase 6 -->
+        <mxCell id="a1p6" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="3290" width="16" height="210" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 6 -->
+        <mxCell id="a4p6" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="3300" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- GPU Memory: Phase 6 -->
+        <mxCell id="a5p6" value="" style="fillColor=#e1d5e7;strokeColor=#9673a6;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1312" y="3340" width="16" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- Host App: Phase 7 -->
+        <mxCell id="a1p7" value="" style="fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="112" y="3570" width="16" height="330" as="geometry"/>
+        </mxCell>
+        <!-- CUDA Runtime: Phase 7 -->
+        <mxCell id="a4p7" value="" style="fillColor=#fff2cc;strokeColor=#d6b656;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1012" y="3580" width="16" height="120" as="geometry"/>
+        </mxCell>
+        <!-- GPU Memory: Phase 7 -->
+        <mxCell id="a5p7" value="" style="fillColor=#e1d5e7;strokeColor=#9673a6;opacity=60;" vertex="1" parent="1">
+          <mxGeometry x="1312" y="3620" width="16" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 1: Kernel Module & PCI Probe                               -->
+        <!-- ================================================================ -->
+
+        <!-- 1. Host App → Kernel Module: insmod libnvm.ko -->
+        <mxCell id="m1" value="1. insmod libnvm.ko" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="160" as="sourcePoint"/>
+            <mxPoint x="412" y="160" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 2. Kernel Module self-call: PCI probe -->
+        <mxCell id="m2" value="2. PCI probe (class 0x010802 매칭)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="200" as="sourcePoint"/>
+            <mxPoint x="428" y="235" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="500" y="200"/>
+              <mxPoint x="500" y="235"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 3. Kernel Module self-call: pci_enable_device() -->
+        <mxCell id="m3" value="3. pci_enable_device(), pci_set_master()&#xa;   DMA bus mastering 활성화" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="260" as="sourcePoint"/>
+            <mxPoint x="428" y="310" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="530" y="260"/>
+              <mxPoint x="530" y="310"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 4. Kernel Module self-call: BAR0 reserve -->
+        <mxCell id="m4" value="4. BAR0 reserve → /dev/libnvm0 생성" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="340" as="sourcePoint"/>
+            <mxPoint x="428" y="380" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="530" y="340"/>
+              <mxPoint x="530" y="380"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 2: Controller Init & BAR0 Mapping                          -->
+        <!-- ================================================================ -->
+
+        <!-- 5. Host App self-call: open("/dev/libnvm0") -->
+        <mxCell id="m5" value="5. open(&quot;/dev/libnvm0&quot;)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="450" as="sourcePoint"/>
+            <mxPoint x="128" y="490" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="50" y="450"/>
+              <mxPoint x="50" y="490"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 6. Host App → Kernel Module: nvm_ctrl_init() → mmap(fd) -->
+        <mxCell id="m6" value="6. nvm_ctrl_init() → mmap(fd)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="520" as="sourcePoint"/>
+            <mxPoint x="412" y="520" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 7. Kernel Module self-call: vm_iomap_memory() -->
+        <mxCell id="m7" value="7. vm_iomap_memory()&#xa;   BAR0 → userspace VA 매핑 (non-cacheable)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="550" as="sourcePoint"/>
+            <mxPoint x="428" y="590" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="540" y="550"/>
+              <mxPoint x="540" y="590"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 8. Kernel Module → Host App: BAR0 virtual address 반환 (dashed) -->
+        <mxCell id="m8" value="8. BAR0 virtual address 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="412" y="620" as="sourcePoint"/>
+            <mxPoint x="128" y="620" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 9. Host App self-call: CAP/VER 레지스터 읽기 -->
+        <mxCell id="m9" value="9. CAP/VER 레지스터 읽기&#xa;   (page_size, MQES, dstrd)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="660" as="sourcePoint"/>
+            <mxPoint x="128" y="710" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="50" y="660"/>
+              <mxPoint x="50" y="710"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 3: Admin Queue & Controller Reset                          -->
+        <!-- ================================================================ -->
+
+        <!-- 10. Host App self-call: Admin Queue 메모리 할당 -->
+        <mxCell id="m10" value="10. Admin Queue 메모리 할당&#xa;    (ACQ + ASQ + Identify page)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="740" as="sourcePoint"/>
+            <mxPoint x="128" y="790" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="40" y="740"/>
+              <mxPoint x="40" y="790"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 11. Host App → NVMe SSD: CC.EN = 0 -->
+        <mxCell id="m11" value="11. CC.EN = 0 (Controller Disable)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="820" as="sourcePoint"/>
+            <mxPoint x="712" y="820" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 12. Host App self-call: Poll CSTS.RDY == 0 -->
+        <mxCell id="m12" value="12. Poll CSTS.RDY == 0" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="855" as="sourcePoint"/>
+            <mxPoint x="128" y="885" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="50" y="855"/>
+              <mxPoint x="50" y="885"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 13. Host App → NVMe SSD: AQA, ACQ, ASQ 레지스터 설정 -->
+        <mxCell id="m13" value="13. AQA, ACQ, ASQ 레지스터 설정" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="915" as="sourcePoint"/>
+            <mxPoint x="712" y="915" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 14. Host App → NVMe SSD: CC.EN = 1 -->
+        <mxCell id="m14" value="14. CC.EN = 1 (Controller Enable)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="950" as="sourcePoint"/>
+            <mxPoint x="712" y="950" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 15. Host App self-call: Poll CSTS.RDY == 1 -->
+        <mxCell id="m15" value="15. Poll CSTS.RDY == 1" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="980" as="sourcePoint"/>
+            <mxPoint x="128" y="1010" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="50" y="980"/>
+              <mxPoint x="50" y="1010"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 16. Host App → NVMe SSD: Identify Controller -->
+        <mxCell id="m16" value="16. Identify Controller (Admin Command)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1040" as="sourcePoint"/>
+            <mxPoint x="712" y="1040" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 17. NVMe SSD → Host App: Controller info 반환 (dashed) -->
+        <mxCell id="m17" value="17. Controller info 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="1075" as="sourcePoint"/>
+            <mxPoint x="128" y="1075" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 18. Host App → NVMe SSD: Set Features - Number of Queues -->
+        <mxCell id="m18" value="18. Set Features - Number of Queues 요청" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1110" as="sourcePoint"/>
+            <mxPoint x="712" y="1110" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 19. NVMe SSD → Host App: 할당된 SQ/CQ 수 반환 (dashed) -->
+        <mxCell id="m19" value="19. 할당된 SQ/CQ 수 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="1145" as="sourcePoint"/>
+            <mxPoint x="128" y="1145" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 4: BAR0 GPU 등록                                           -->
+        <!-- ================================================================ -->
+
+        <!-- 20. Host App → CUDA Runtime: cudaHostRegister(BAR0, cudaHostRegisterIoMemory) -->
+        <mxCell id="m20" value="20. cudaHostRegister(BAR0, cudaHostRegisterIoMemory)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1230" as="sourcePoint"/>
+            <mxPoint x="1012" y="1230" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 21. CUDA Runtime self-call: BAR0 MMIO를 GPU 접근 가능하게 등록 -->
+        <mxCell id="m21" value="21. BAR0 MMIO를 GPU 접근 가능하게 등록" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="1028" y="1260" as="sourcePoint"/>
+            <mxPoint x="1028" y="1290" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="1110" y="1260"/>
+              <mxPoint x="1110" y="1290"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 22. CUDA Runtime → Host App: GPU가 Doorbell 접근 가능 (dashed) -->
+        <mxCell id="m22" value="22. GPU가 Doorbell 접근 가능" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="1320" as="sourcePoint"/>
+            <mxPoint x="128" y="1320" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 5: I/O Queue 생성 (per QueuePair)                          -->
+        <!-- ================================================================ -->
+
+        <!-- 23. Host App → CUDA Runtime: cudaMalloc(&sq_mem) -->
+        <mxCell id="m23" value="23. cudaMalloc(&amp;sq_mem) - SQ 메모리를 GPU에 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1430" as="sourcePoint"/>
+            <mxPoint x="1012" y="1430" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 24. CUDA Runtime → GPU Memory: SQ 공간 할당 -->
+        <mxCell id="m24" value="24. SQ 공간 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1028" y="1465" as="sourcePoint"/>
+            <mxPoint x="1312" y="1465" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 25. CUDA Runtime → Host App: GPU VA 반환 (dashed) -->
+        <mxCell id="m25" value="25. GPU VA 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="1510" as="sourcePoint"/>
+            <mxPoint x="128" y="1510" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 26. Host App → CUDA Runtime: cudaMalloc(&cq_mem) -->
+        <mxCell id="m26" value="26. cudaMalloc(&amp;cq_mem) - CQ 메모리를 GPU에 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1590" as="sourcePoint"/>
+            <mxPoint x="1012" y="1590" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 27. CUDA Runtime → GPU Memory: CQ 공간 할당 -->
+        <mxCell id="m27" value="27. CQ 공간 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1028" y="1625" as="sourcePoint"/>
+            <mxPoint x="1312" y="1625" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 28. CUDA Runtime → Host App: GPU VA 반환 (dashed) -->
+        <mxCell id="m28" value="28. GPU VA 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="1670" as="sourcePoint"/>
+            <mxPoint x="128" y="1670" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 29. Host App → Kernel Module: ioctl(NVM_MAP_DEVICE_MEMORY, sq_addr) -->
+        <mxCell id="m29" value="29. ioctl(NVM_MAP_DEVICE_MEMORY, sq_addr) - SQ DMA 매핑" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="1750" as="sourcePoint"/>
+            <mxPoint x="412" y="1750" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 30. Kernel Module self-call: nvidia_p2p_get_pages() -->
+        <mxCell id="m30" value="30. nvidia_p2p_get_pages()&#xa;    GPU 메모리 pin" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="1790" as="sourcePoint"/>
+            <mxPoint x="428" y="1840" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="540" y="1790"/>
+              <mxPoint x="540" y="1840"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 31. Kernel Module self-call: nvidia_p2p_dma_map_pages() -->
+        <mxCell id="m31" value="31. nvidia_p2p_dma_map_pages()&#xa;    P2P DMA 주소 생성" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="1870" as="sourcePoint"/>
+            <mxPoint x="428" y="1920" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="560" y="1870"/>
+              <mxPoint x="560" y="1920"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 32. Kernel Module → Host App: DMA bus addresses 반환 (dashed) -->
+        <mxCell id="m32" value="32. DMA bus addresses 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="412" y="1960" as="sourcePoint"/>
+            <mxPoint x="128" y="1960" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 33. Host App → Kernel Module: ioctl(NVM_MAP_DEVICE_MEMORY, cq_addr) -->
+        <mxCell id="m33" value="33. ioctl(NVM_MAP_DEVICE_MEMORY, cq_addr) - CQ DMA 매핑" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="2020" as="sourcePoint"/>
+            <mxPoint x="412" y="2020" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 34. Kernel Module self-call: nvidia_p2p_get_pages() + nvidia_p2p_dma_map_pages() -->
+        <mxCell id="m34" value="34. nvidia_p2p_get_pages()&#xa;    + nvidia_p2p_dma_map_pages()" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="428" y="2060" as="sourcePoint"/>
+            <mxPoint x="428" y="2120" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="560" y="2060"/>
+              <mxPoint x="560" y="2120"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 35. Kernel Module → Host App: DMA bus addresses 반환 (dashed) -->
+        <mxCell id="m35" value="35. DMA bus addresses 반환" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="412" y="2160" as="sourcePoint"/>
+            <mxPoint x="128" y="2160" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 36. Host App → NVMe SSD: Create I/O CQ (Admin Command) -->
+        <mxCell id="m36" value="36. Create I/O CQ (Admin Command) - CQ DMA 주소 전달" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="2250" as="sourcePoint"/>
+            <mxPoint x="712" y="2250" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 37. NVMe SSD → Host App: CQ 생성 완료 (dashed) -->
+        <mxCell id="m37" value="37. CQ 생성 완료" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="2290" as="sourcePoint"/>
+            <mxPoint x="128" y="2290" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 38. Host App → CUDA Runtime: cudaHostGetDevicePointer(cq.db) -->
+        <mxCell id="m38" value="38. cudaHostGetDevicePointer(cq.db) - CQ Doorbell GPU 포인터 변환" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="2430" as="sourcePoint"/>
+            <mxPoint x="1012" y="2430" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 39. CUDA Runtime → Host App: GPU-accessible doorbell pointer (dashed) -->
+        <mxCell id="m39" value="39. GPU-accessible doorbell pointer" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="2470" as="sourcePoint"/>
+            <mxPoint x="128" y="2470" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 40. Host App → NVMe SSD: Create I/O SQ (Admin Command) -->
+        <mxCell id="m40" value="40. Create I/O SQ (Admin Command) - SQ DMA 주소 전달, CQ 연결" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="2550" as="sourcePoint"/>
+            <mxPoint x="712" y="2550" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 41. NVMe SSD → Host App: SQ 생성 완료 (dashed) -->
+        <mxCell id="m41" value="41. SQ 생성 완료" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="712" y="2590" as="sourcePoint"/>
+            <mxPoint x="128" y="2590" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 42. Host App → CUDA Runtime: cudaHostGetDevicePointer(sq.db) -->
+        <mxCell id="m42" value="42. cudaHostGetDevicePointer(sq.db) - SQ Doorbell GPU 포인터 변환" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="2730" as="sourcePoint"/>
+            <mxPoint x="1012" y="2730" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 43. CUDA Runtime → Host App: GPU-accessible doorbell pointer (dashed) -->
+        <mxCell id="m43" value="43. GPU-accessible doorbell pointer" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="2770" as="sourcePoint"/>
+            <mxPoint x="128" y="2770" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 6: GPU Lock-free 구조체 초기화                              -->
+        <!-- ================================================================ -->
+
+        <!-- 44. Host App → CUDA Runtime: cudaMalloc(tickets, tail_mark, ...) -->
+        <mxCell id="m44" value="44. cudaMalloc(tickets, tail_mark, cid, head_mark, pos_locks)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="3310" as="sourcePoint"/>
+            <mxPoint x="1012" y="3310" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 45. CUDA Runtime → GPU Memory: Lock-free 동기화 구조체 할당 -->
+        <mxCell id="m45" value="45. Lock-free 동기화 구조체 할당" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1028" y="3345" as="sourcePoint"/>
+            <mxPoint x="1312" y="3345" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 46. CUDA Runtime → Host App: (dashed return) -->
+        <mxCell id="m46" value="46. 할당 완료" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="3390" as="sourcePoint"/>
+            <mxPoint x="128" y="3390" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 47. Host App self-call: init_gpu_specific_struct() -->
+        <mxCell id="m47" value="47. init_gpu_specific_struct()&#xa;    구조체 초기값 설정" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="3430" as="sourcePoint"/>
+            <mxPoint x="128" y="3480" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="40" y="3430"/>
+              <mxPoint x="40" y="3480"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- PHASE 7: Controller 정보를 GPU로 복사                             -->
+        <!-- ================================================================ -->
+
+        <!-- 48. Host App → CUDA Runtime: cudaMemcpy(Controller → GPU, HostToDevice) -->
+        <mxCell id="m48" value="48. cudaMemcpy(Controller → GPU, HostToDevice)" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="128" y="3590" as="sourcePoint"/>
+            <mxPoint x="1012" y="3590" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 49. CUDA Runtime → GPU Memory: Controller + QueuePair 메타데이터 복사 -->
+        <mxCell id="m49" value="49. Controller + QueuePair 메타데이터 복사" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1028" y="3625" as="sourcePoint"/>
+            <mxPoint x="1312" y="3625" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 50. CUDA Runtime → Host App: (dashed return) -->
+        <mxCell id="m50" value="50. 복사 완료" style="endArrow=open;endFill=0;dashed=1;strokeColor=#999999;fontColor=#666666;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1012" y="3670" as="sourcePoint"/>
+            <mxPoint x="128" y="3670" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- 51. Host App self-call: Ready for GPU-initiated I/O! -->
+        <mxCell id="m51" value="51. Ready for GPU-initiated I/O! ✓" style="endArrow=block;endFill=1;strokeColor=#333333;fontColor=#333333;fontSize=12;fontStyle=1;labelBackgroundColor=#FFFFFF;curved=1;" edge="1" parent="1">
+          <mxGeometry x="0.3" relative="1" as="geometry">
+            <mxPoint x="128" y="3710" as="sourcePoint"/>
+            <mxPoint x="128" y="3750" as="targetPoint"/>
+            <Array as="points">
+              <mxPoint x="40" y="3710"/>
+              <mxPoint x="40" y="3750"/>
+            </Array>
+            <mxPoint as="offset"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ================================================================ -->
+        <!-- SEPARATOR LINES between phases                                   -->
+        <!-- ================================================================ -->
+        <mxCell id="sep1" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="420" as="sourcePoint"/>
+            <mxPoint x="1440" y="420" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sep2" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="720" as="sourcePoint"/>
+            <mxPoint x="1440" y="720" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sep3" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="1190" as="sourcePoint"/>
+            <mxPoint x="1440" y="1190" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sep4" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="1390" as="sourcePoint"/>
+            <mxPoint x="1440" y="1390" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sep5" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="3260" as="sourcePoint"/>
+            <mxPoint x="1440" y="3260" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="sep6" value="" style="endArrow=none;dashed=1;dashPattern=8 8;strokeColor=#CCCCCC;strokeWidth=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="20" y="3540" as="sourcePoint"/>
+            <mxPoint x="1440" y="3540" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
