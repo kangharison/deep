@@ -16,6 +16,7 @@ GPU-NVMe 직접 접근(BaM, GPUDirect Storage) 기술을 연구한다.
 - DPDK:        sources/dpdk
 - nvme-cli:    sources/nvme-cli
 - BaM:         sources/bam
+- GIDS:        sources/gids
 - GPGPU-Sim:   sources/gpgpu-sim_distribution
 - QEMU:        sources/qemu
 
@@ -71,7 +72,8 @@ deep/
 │       ├── O-offload/           ← GPU-NVMe 오프로드 (8편)
 │       └── N-industry/          ← 산업 동향 (5편)
 ├── analysis/                    ← 코드 분석 상세
-│   ├── bam/                     ← BaM 코드 분석 (README + 8개 상세)
+│   ├── bam/                     ← BaM 코드 분석 (README + 12개 상세)
+│   ├── gids/                    ← GIDS 코드 분석 (README + 9개 상세)
 │   ├── gpgpu-sim/               ← GPGPU-Sim 시뮬레이터 분석 (9개)
 │   └── kernel/                  ← 커널 I/O 경로 분석
 ├── scripts/                     ← 자주 쓰는 명령어
