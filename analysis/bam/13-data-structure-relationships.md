@@ -440,6 +440,209 @@ struct Controller (ctrl.h:39-62)             생성자에서 값이 채워지는
 
 ---
 
+## 1.55 DmaPtr(shared_ptr) 해제 메커니즘 상세
+
+aq_mem, sq_mem, cq_mem 등 DmaPtr 필드들은 `std::shared_ptr<nvm_dma_t>`인데,
+명시적 `reset()`이나 `delete`가 없다. **어떻게 해제되는가?**
+
+### 답: shared_ptr의 커스텀 deleter가 전체 해제 체인을 자동 실행한다.
+
+```
+DmaPtr 생성 시 (buffer.h:175-179, 215-219):
+
+  ┌─── Host 메모리 (aq_mem) ─────────────────────────────────────────┐
+  │                                                                  │
+  │  createDma(ctrl, ctrl->page_size * 3)           (buffer.h:149)  │
+  │  │                                                               │
+  │  ├── buffer = posix_memalign(4096, size)         (line 162)     │
+  │  │   → 4096바이트 정렬된 Host 힙 메모리 할당                     │
+  │  │                                                               │
+  │  ├── nvm_dma_map_host(&dma, ctrl, buffer, size)  (line 167)     │
+  │  │   → linux/dma.cpp → _nvm_dma_init()                          │
+  │  │   → ioctl(fd, NVM_MAP_HOST_MEMORY, &request)                  │
+  │  │     ─── 커널 모듈 ───                                         │
+  │  │     → get_user_pages(): 페이지 핀닝                           │
+  │  │     → dma_map_page():  DMA 주소 획득                          │
+  │  │     → host_list에 매핑 등록                                   │
+  │  │   → nvm_dma_t* dma 반환 (ioaddrs[] 채워짐)                   │
+  │  │                                                               │
+  │  └── return DmaPtr(dma, [buffer](nvm_dma_t* dma) {              │
+  │                        nvm_dma_unmap(dma);   ← ★ 커스텀 deleter │
+  │                        free(buffer);         ← ★ 원본 메모리 해제│
+  │                    });                            (line 175-179) │
+  │                                                                  │
+  │  shared_ptr 생성자의 두 번째 인자 = 커스텀 deleter 람다          │
+  │  → shared_ptr의 참조 카운트가 0이 되면 이 람다가 호출됨          │
+  └──────────────────────────────────────────────────────────────────┘
+
+
+  ┌─── GPU 메모리 (sq_mem, cq_mem) ──────────────────────────────────┐
+  │                                                                  │
+  │  createDma(ctrl, size, cudaDevice)              (buffer.h:184)  │
+  │  │                                                               │
+  │  ├── getDeviceMemory(cudaDevice, bufferPtr, devicePtr,           │
+  │  │       size, origPtr)                          (line 196)     │
+  │  │   → cudaMalloc(&bufferPtr, size + 64KB)       (line 66)     │
+  │  │   → origPtr = bufferPtr  (원본 포인터 보존)   (line 88)     │
+  │  │   → bufferPtr를 64KB 정렬                     (line 91)     │
+  │  │   ★ origPtr과 bufferPtr가 다를 수 있다 (정렬 때문)          │
+  │  │                                                               │
+  │  ├── nvm_dma_map_device(&dma, ctrl, bufferPtr, size) (line 199) │
+  │  │   → linux/dma.cpp → _nvm_dma_init()                          │
+  │  │   → ioctl(fd, NVM_MAP_DEVICE_MEMORY, &request)                │
+  │  │     ─── 커널 모듈 ───                                         │
+  │  │     → nvidia_p2p_get_pages(): GPU 페이지 테이블 획득          │
+  │  │     → nvidia_p2p_dma_map_pages(): DMA 주소 획득               │
+  │  │     → device_list에 매핑 등록                                 │
+  │  │   → nvm_dma_t* dma 반환                                      │
+  │  │                                                               │
+  │  ├── dma->vaddr = bufferPtr                      (line 213)     │
+  │  │                                                               │
+  │  └── return DmaPtr(dma, [bufferPtr, origPtr](nvm_dma_t* dma) {  │
+  │                        nvm_dma_unmap(dma);   ← ★ 커스텀 deleter │
+  │                        cudaFree(origPtr);    ← ★ GPU 메모리 해제│
+  │                    });                            (line 215-219) │
+  │                                                                  │
+  │  ★ cudaFree(origPtr)이지 cudaFree(bufferPtr)가 아닌 이유:       │
+  │    bufferPtr는 64KB 정렬된 주소 (origPtr + offset)               │
+  │    cudaFree()는 cudaMalloc()이 반환한 원본 주소로 호출해야 함    │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+### nvm_dma_unmap() 내부 해제 체인 (dma.cpp:443-450)
+
+```
+nvm_dma_unmap(dma)                               (dma.cpp:443)
+│
+├── container = _nvm_container_of(dma, struct container, handle)
+│   nvm_dma_t는 사실 struct container의 handle 멤버
+│   container_of로 부모 container* 획득
+│
+└── remove_container(container)                  (dma.cpp:290)
+    │
+    └── put_map(container->map)                  (dma.cpp:192)
+        │
+        ├── _nvm_mutex_lock(&md->lock)
+        ├── --md->count                          참조 카운트 감소
+        │
+        ├── if (count == 0):                     마지막 참조자
+        │   │
+        │   ├── if (md->unmap != NULL):
+        │   │   md->unmap(md->ctrl->device, md->va)
+        │   │   │
+        │   │   └── ioctl_unmap()                (linux/device.cpp:95)
+        │   │       │
+        │   │       └── ioctl(dev->fd, NVM_UNMAP_MEMORY, &addr)
+        │   │           ─── 커널 모듈 ───────────────────────
+        │   │           module/pci.c :: map_ioctl()
+        │   │           │
+        │   │           ├── [Host의 경우]
+        │   │           │   unmap_and_release()
+        │   │           │   → dma_unmap_page(): DMA 매핑 해제
+        │   │           │   → put_page(): 페이지 핀닝 해제
+        │   │           │
+        │   │           └── [GPU의 경우]
+        │   │               unmap_and_release()
+        │   │               → nvidia_p2p_dma_unmap_pages(): DMA 매핑 해제
+        │   │               → nvidia_p2p_put_pages(): GPU 페이지 테이블 해제
+        │   │           ─────────────────────────────────────
+        │   │
+        │   └── md->release(md->va)              va_range 해제
+        │       → release_mapping_descriptor()
+        │       → free(ioctl_mapping)
+        │
+        ├── _nvm_mutex_unlock(&md->lock)
+        │
+        └── if (md->va == NULL):                 count==0이면
+            remove_map(md)
+            → _nvm_ctrl_put(md->ctrl)            컨트롤러 참조 해제
+            → free(md)                           map 구조체 해제
+
+    free(container)                              container 자체 해제
+```
+
+### 해제 시점: Controller 소멸자
+
+```
+Controller::~Controller()                        (ctrl.h:203-213)
+{
+    cudaFree(d_qps);          ← GPU QueuePair 배열 해제
+    for (i = 0; i < n_qps; i++) {
+        delete h_qps[i];      ← 각 QueuePair 소멸
+        │                        QueuePair의 멤버 sq_mem, cq_mem (DmaPtr)
+        │                        shared_ptr 소멸 → 커스텀 deleter 호출
+        │                        → nvm_dma_unmap() → ioctl(NVM_UNMAP_MEMORY)
+        │                        → cudaFree(origPtr) (GPU 메모리)
+        │
+    }
+    free(h_qps);              ← Host 포인터 배열 해제
+    nvm_aq_destroy(aq_ref);   ← Admin Queue 핸들 해제
+    nvm_ctrl_free(ctrl);      ← nvm_ctrl_t 해제 (munmap BAR0 포함)
+    │
+    │  ★ aq_mem (DmaPtr)은 여기서 명시적 해제 없음
+    │    Controller 소멸 시 멤버 변수 aq_mem의 소멸자가 자동 호출
+    │    → shared_ptr::~shared_ptr()
+    │    → 참조 카운트 0 → 커스텀 deleter 호출
+    │    → nvm_dma_unmap(dma) + free(buffer)
+    │
+}
+
+정리: Controller 소멸 순서
+  [1] cudaFree(d_qps)              — GPU QP 배열
+  [2] delete h_qps[i]              — 각 QP 소멸 → DmaPtr(sq_mem, cq_mem) 소멸
+      → nvm_dma_unmap → ioctl(NVM_UNMAP_MEMORY) → 커널 GPU DMA 해제
+      → cudaFree(origPtr)
+  [3] free(h_qps)                  — Host 포인터 배열
+  [4] nvm_aq_destroy(aq_ref)       — Admin Queue RPC 핸들
+  [5] nvm_ctrl_free(ctrl)          — nvm_ctrl_t (munmap BAR0)
+  [6] ~aq_mem() (자동)             — shared_ptr 소멸자
+      → nvm_dma_unmap → ioctl(NVM_UNMAP_MEMORY) → 커널 Host DMA 해제
+      → free(buffer)
+  [7] ~d_ctrl_buff() (자동)        — shared_ptr 소멸자
+      → cudaFree(GPU Controller 복사본)
+```
+
+### 전체 해제 경로 요약
+
+```
+┌────────────────────────┬──────────────────┬──────────────────────────────────┐
+│ DmaPtr 필드             │ 할당 방식         │ 해제 경로 (커스텀 deleter)       │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Controller.aq_mem      │ posix_memalign   │ nvm_dma_unmap()                  │
+│ (Host DMA)             │ + ioctl(MAP_HOST)│   → ioctl(NVM_UNMAP_MEMORY)      │
+│                        │                  │     → dma_unmap_page             │
+│                        │                  │     → put_page                   │
+│                        │                  │ free(buffer)                     │
+│                        │                  │ 시점: Controller 소멸 시 자동    │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ QueuePair.sq_mem       │ cudaMalloc       │ nvm_dma_unmap()                  │
+│ QueuePair.cq_mem       │ + ioctl(MAP_DEV) │   → ioctl(NVM_UNMAP_MEMORY)      │
+│ (GPU DMA)              │                  │     → nvidia_p2p_dma_unmap_pages │
+│                        │                  │     → nvidia_p2p_put_pages       │
+│                        │                  │ cudaFree(origPtr)                │
+│                        │                  │ 시점: delete QueuePair 시 자동   │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ page_cache_t.pages_dma │ cudaMalloc       │ 동일 (GPU DMA)                   │
+│ (캐시 데이터)          │ + ioctl(MAP_DEV) │ 시점: page_cache_t 소멸 시 자동  │
+└────────────────────────┴──────────────────┴──────────────────────────────────┘
+
+★ 결론:
+  shared_ptr의 커스텀 deleter가 nvm_dma_unmap()을 호출하고,
+  nvm_dma_unmap()이 put_map() → ioctl_unmap() → ioctl(NVM_UNMAP_MEMORY)로
+  커널 모듈까지 도달하여 DMA 매핑을 해제한다.
+
+  명시적 reset()이나 unmap 호출이 없어도
+  shared_ptr 소멸 시 (스코프 종료 또는 소유 객체 delete 시)
+  RAII 패턴으로 자동 정리된다.
+
+  내부 구조:
+  nvm_dma_t는 사실 struct container { map*, nvm_dma_t handle } 의 일부
+  container → map → { count, ctrl, va, release, unmap }
+  참조 카운트 방식으로 nvm_dma_remap()을 통한 공유도 지원한다.
+```
+
+---
+
 ## 1.6 Controller::Controller() 생성자 라인별 해석 (ctrl.h:148-199)
 
 ```
