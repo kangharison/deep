@@ -69,7 +69,378 @@ main(argc, argv)
 
 ---
 
-## 1.5 Controller::Controller() 생성자 라인별 해석 (ctrl.h:148-199)
+## 1.5 struct Controller 필드 ↔ 생성자 1:1 매핑
+
+struct 선언(line 39-62)의 18개 필드가 생성자(line 148-199) + initializeController(line 94-123)에서
+어떻게 채워지는지 정확한 매핑:
+
+```
+struct Controller (ctrl.h:39-62)             생성자에서 값이 채워지는 위치
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                             Controller::Controller()  (line 148-199)
+                                             initializeController()    (line 94-123)
+
+┌─ line 41 ─────────────────────────────────────────────────────────────────────────┐
+│ access_counter: atomic<uint64_t>                                                  │
+│                                                                                   │
+│   생성자에서: 명시적 초기화 없음 (미초기화 상태)                                  │
+│   line 198:   cudaMemcpy(d_ctrl_ptr, this, ...) 로 GPU에 복사                     │
+│   GPU에서:    커널이 access_counter.fetch_add(1) 로 I/O마다 증가                  │
+│   읽기:       print_reset_stats()에서 cudaMemcpy로 Host로 복사 후 출력            │
+│                                                                                   │
+│   ★ Host 측 값은 의미 없음. GPU 복사본의 값만 유효하다.                           │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 42 ─────────────────────────────────────────────────────────────────────────┐
+│ ctrl: nvm_ctrl_t*                                                                 │
+│                                                                                   │
+│   초기화 리스트: ctrl(nullptr)                                  (line 149)        │
+│   설정:          nvm_ctrl_init(&ctrl, fd)                       (line 160)        │
+│                  fd = open(path, O_RDWR)                        (line 153)        │
+│                                                                                   │
+│   값: mmap(BAR0)으로 생성된 nvm_ctrl_t 구조체 포인터 (Host 메모리)               │
+│        ctrl->mm_ptr    = BAR0 매핑 주소                                           │
+│        ctrl->page_size = CAP.MPSMIN에서 계산                                      │
+│        ctrl->dstrd     = CAP.DSTRD                                                │
+│        ctrl->timeout   = CAP.TO × 500ms                                           │
+│        ctrl->max_qs    = CAP.MQES + 1                                             │
+│                                                                                   │
+│   이후 사용: aq_mem 생성(line 167), QueuePair 생성(line 187)의 인자               │
+│   GPU에서: 사용 안 함 (Host 포인터이므로 GPU 복사본에서 무의미)                   │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 43 ─────────────────────────────────────────────────────────────────────────┐
+│ aq_ref: nvm_aq_ref                                                                │
+│                                                                                   │
+│   초기화 리스트: aq_ref(nullptr)                                (line 150)        │
+│   설정:          nvm_aq_create(&ctrl.aq_ref, ctrl.ctrl,                           │
+│                                 ctrl.aq_mem.get())              (line 97)         │
+│                  initializeController() 내부에서                                  │
+│                                                                                   │
+│   값: Admin Queue RPC 핸들 (내부적으로 ASQ/ACQ + 컨트롤러 리셋 수행)             │
+│                                                                                   │
+│   이후 사용: nvm_admin_ctrl_info(line 104), nvm_admin_ns_info(line 111),          │
+│              nvm_admin_get_num_queues(line 118), reserveQueues(line 179),          │
+│              QueuePair 생성(line 187)에서 CQ/SQ Create 명령 발행                  │
+│   GPU에서: 사용 안 함                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 44 ─────────────────────────────────────────────────────────────────────────┐
+│ aq_mem: DmaPtr (= shared_ptr<nvm_dma_t>)                                          │
+│                                                                                   │
+│   설정: aq_mem = createDma(ctrl, ctrl->page_size * 3)           (line 167)        │
+│                                                                                   │
+│   값: 3페이지 DMA 매핑 메모리                                                    │
+│        aq_mem->vaddr     = Host 가상 주소                                         │
+│        aq_mem->ioaddrs[0]= Page 0 DMA 주소 (ASQ)                                 │
+│        aq_mem->ioaddrs[1]= Page 1 DMA 주소 (ACQ)                                 │
+│        aq_mem->ioaddrs[2]= Page 2 DMA 주소 (Identify 데이터 버퍼)                │
+│                                                                                   │
+│   이후 사용: nvm_aq_create(line 97)에서 ASQ/ACQ 주소로 사용                       │
+│              nvm_admin_ctrl_info(line 104), nvm_admin_ns_info(line 111)에서        │
+│              Page 2를 Identify 응답 수신 버퍼로 사용                               │
+│   GPU에서: 사용 안 함                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 45 ─────────────────────────────────────────────────────────────────────────┐
+│ info: struct nvm_ctrl_info                                                        │
+│                                                                                   │
+│   설정: nvm_admin_ctrl_info(ctrl.aq_ref, &ctrl.info,                              │
+│              NVM_DMA_OFFSET(ctrl.aq_mem, 2),                                      │
+│              ctrl.aq_mem->ioaddrs[2])                           (line 104)        │
+│         initializeController() 내부에서                                           │
+│                                                                                   │
+│   값: Identify Controller Admin 명령 결과 파싱                                    │
+│        info.page_size, info.db_stride, info.max_entries                            │
+│        info.serial_no[20], info.model_no[40], info.firmware[8]                    │
+│        info.max_data_size, info.sq_entry_size(=64), info.cq_entry_size(=16)       │
+│                                                                                   │
+│   이후 사용: QueuePair 생성자 인자(line 187) → pageSize = info.page_size          │
+│   GPU에서: 사용 안 함                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 46 ─────────────────────────────────────────────────────────────────────────┐
+│ ns: struct nvm_ns_info                                                            │
+│                                                                                   │
+│   설정: nvm_admin_ns_info(ctrl.aq_ref, &ctrl.ns, ns_id,                           │
+│              NVM_DMA_OFFSET(ctrl.aq_mem, 2),                                      │
+│              ctrl.aq_mem->ioaddrs[2])                           (line 111)        │
+│         initializeController() 내부에서                                           │
+│                                                                                   │
+│   값: Identify Namespace Admin 명령 결과 파싱                                     │
+│        ns.ns_id          = 1 (네임스페이스 ID)                                    │
+│        ns.size           = 네임스페이스 크기 (LBA 수)                             │
+│        ns.lba_data_size  = LBA 크기 (보통 512B)                                   │
+│        ns.metadata_size  = 메타데이터 크기                                        │
+│                                                                                   │
+│   이후 사용:                                                                      │
+│     line 177: blk_size = this->ns.lba_data_size                                   │
+│     line 187: QueuePair 생성자 인자 → block_size, nvmNamespace                    │
+│   GPU에서: 사용 안 함 (파생값 blk_size, blk_size_log이 GPU에서 사용됨)            │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 47-48 ──────────────────────────────────────────────────────────────────────┐
+│ n_sqs: uint16_t                                                                   │
+│ n_cqs: uint16_t                                                                   │
+│                                                                                   │
+│   설정 ①: nvm_admin_get_num_queues(ctrl.aq_ref,                                   │
+│                &ctrl.n_cqs, &ctrl.n_sqs)                       (line 118)         │
+│            initializeController() 내부에서                                        │
+│            → SSD가 지원하는 최대 SQ/CQ 수 반환                                    │
+│                                                                                   │
+│   설정 ②: reserveQueues(MAX_QUEUES, MAX_QUEUES)                (line 179)         │
+│            → nvm_admin_request_num_queues() (line 233)                            │
+│            → n_sqs, n_cqs가 SSD가 실제 할당한 값으로 갱신                         │
+│                                                                                   │
+│   이후 사용: n_qps 계산(line 180)의 입력                                          │
+│   GPU에서: 직접 참조 안 함 (n_qps만 사용)                                         │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 49 ─────────────────────────────────────────────────────────────────────────┐
+│ n_qps: uint16_t                                                                   │
+│                                                                                   │
+│   설정: n_qps = std::min(n_sqs, n_cqs)                         (line 180)        │
+│         n_qps = std::min(n_qps, (uint16_t)numQueues)           (line 181)        │
+│                                                                                   │
+│   값: 실제 생성할 QueuePair 수                                                    │
+│        = min(SSD가 준 SQ 수, SSD가 준 CQ 수, 사용자 요청 numQueues)              │
+│                                                                                   │
+│   이후 사용:                                                                      │
+│     line 183: h_qps 배열 크기                                                     │
+│     line 184: d_qps 배열 크기                                                     │
+│     line 185: QueuePair 생성 루프 횟수                                            │
+│   GPU에서: ctrls[ctrl]->n_qps — queue 선택에 사용                                 │
+│            queue = smid % n_qps 또는 queue_counter % n_qps                        │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 50 ─────────────────────────────────────────────────────────────────────────┐
+│ deviceId: uint32_t                                                                │
+│                                                                                   │
+│   초기화 리스트: deviceId(cudaDevice)                           (line 151)        │
+│                                                                                   │
+│   값: Settings.cudaDevice (기본 0)                                                │
+│   이후 사용: 직접 참조하는 곳 없음 (cudaDevice를 직접 전달)                       │
+│   GPU에서: 사용 안 함                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 51 ─────────────────────────────────────────────────────────────────────────┐
+│ h_qps: QueuePair**                                                                │
+│                                                                                   │
+│   설정: h_qps = (QueuePair**)malloc(sizeof(QueuePair)*n_qps)   (line 183)        │
+│         h_qps[i] = new QueuePair(ctrl, cudaDevice, ns,                            │
+│                         info, aq_ref, i+1, queueDepth)         (line 187)        │
+│                                                                                   │
+│   값: Host측 QueuePair 포인터 배열 [n_qps]                                       │
+│        각 h_qps[i]는 Host 힙에 할당된 QueuePair                                  │
+│                                                                                   │
+│   이후 사용: 소멸자(line 206-208)에서 delete h_qps[i], free(h_qps)               │
+│   GPU에서: 사용 안 함 (Host 포인터)                                               │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 52 ─────────────────────────────────────────────────────────────────────────┐
+│ d_qps: QueuePair*                                                                 │
+│                                                                                   │
+│   설정 ①: cudaMalloc(&d_qps, sizeof(QueuePair)*n_qps)          (line 184)        │
+│            GPU VRAM에 QueuePair 배열 공간 할당                                    │
+│                                                                                   │
+│   설정 ②: cudaMemcpy(d_qps+i, h_qps[i],                                          │
+│                sizeof(QueuePair), H2D)                         (line 189)        │
+│            Host에서 만든 QueuePair를 GPU에 복사 (루프)                             │
+│                                                                                   │
+│   값: GPU VRAM의 QueuePair 배열 시작 주소                                         │
+│        d_qps[0] = h_qps[0]의 복사본, d_qps[1] = h_qps[1]의 복사본, ...          │
+│                                                                                   │
+│   ★★★ GPU 커널에서 가장 많이 쓰이는 필드 ★★★                                    │
+│   GPU에서: ctrls[ctrl]->d_qps[queue] → QueuePair 접근                             │
+│            → d_qps[q].sq (SQ에 커맨드 enqueue)                                    │
+│            → d_qps[q].cq (CQ에서 완료 poll)                                       │
+│            → d_qps[q].block_size_log (LBA 계산)                                   │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 54 ─────────────────────────────────────────────────────────────────────────┐
+│ queue_counter: atomic<uint64_t>                                                   │
+│                                                                                   │
+│   설정: queue_counter = 0                                      (line 175)        │
+│                                                                                   │
+│   값: 큐 라운드로빈 카운터 (0부터 시작)                                           │
+│                                                                                   │
+│   GPU에서 (random_access_kernel, line 162):                                       │
+│     queue = ctrls[ctrl]->queue_counter.fetch_add(1) % n_qps                       │
+│     매 warp마다 1 증가 → 동적 큐 분산                                             │
+│                                                                                   │
+│   ★ sequential_access_kernel에서는 사용 안 함                                     │
+│     (대신 smid % n_qps 사용)                                                      │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 56 ─────────────────────────────────────────────────────────────────────────┐
+│ page_size: uint32_t                                                               │
+│                                                                                   │
+│   설정: page_size = ctrl->page_size                            (line 176)        │
+│                                                                                   │
+│   값: NVMe 컨트롤러의 Memory Page Size (보통 4096)                                │
+│        ctrl->page_size ← BAR0 CAP.MPSMIN에서 계산                                │
+│                                                                                   │
+│   GPU에서: 직접 참조하는 곳 없음 (QueuePair.pageSize로 전달됨)                    │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 57 ─────────────────────────────────────────────────────────────────────────┐
+│ blk_size: uint32_t                                                                │
+│                                                                                   │
+│   설정: blk_size = this->ns.lba_data_size                      (line 177)        │
+│                                                                                   │
+│   값: LBA 블록 크기 (보통 512B)                                                   │
+│        ns.lba_data_size ← Identify Namespace 결과                                │
+│                                                                                   │
+│   GPU에서: 직접 참조하는 곳 없음 (QueuePair.block_size로 전달됨)                  │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 58 ─────────────────────────────────────────────────────────────────────────┐
+│ blk_size_log: uint32_t                                                            │
+│                                                                                   │
+│   설정: blk_size_log = std::log2(blk_size)                     (line 178)        │
+│                                                                                   │
+│   값: log2(512) = 9 (비트 시프트 연산용)                                          │
+│                                                                                   │
+│   GPU에서: 직접 참조하는 곳 없음                                                  │
+│            (GPU 커널은 ctrls[ctrl]->d_qps[q].block_size_log를 사용)               │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 61 ─────────────────────────────────────────────────────────────────────────┐
+│ d_ctrl_ptr: void*                                                                 │
+│                                                                                   │
+│   설정 ①: d_ctrl_buff = createBuffer(sizeof(Controller),                           │
+│                cudaDevice)                                     (line 196)        │
+│            GPU VRAM에 Controller 크기만큼 메모리 할당                              │
+│                                                                                   │
+│   설정 ②: d_ctrl_ptr = d_ctrl_buff.get()                       (line 197)        │
+│            GPU 메모리 포인터 저장                                                 │
+│                                                                                   │
+│   설정 ③: cudaMemcpy(d_ctrl_ptr, this,                                            │
+│                sizeof(Controller), H2D)                        (line 198)        │
+│            Controller 구조체 전체를 GPU에 복사                                    │
+│                                                                                   │
+│   값: GPU VRAM에 있는 Controller 복사본의 시작 주소                               │
+│                                                                                   │
+│   ★★★ 이 포인터가 page_cache_t 생성 시 d_ctrls[i]에 등록됨 ★★★                   │
+│   GPU에서: d_ctrls[ctrl_idx] = 이 d_ctrl_ptr                                      │
+│            → ctrls[ctrl]->d_qps[queue] 참조 가능                                  │
+│            → ctrls[ctrl]->n_qps 참조 가능                                         │
+│            → ctrls[ctrl]->queue_counter 참조 가능                                 │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ line 62 ─────────────────────────────────────────────────────────────────────────┐
+│ d_ctrl_buff: BufferPtr (= shared_ptr<void>)                                       │
+│                                                                                   │
+│   설정: d_ctrl_buff = createBuffer(sizeof(Controller),                             │
+│              cudaDevice)                                       (line 196)        │
+│                                                                                   │
+│   값: d_ctrl_ptr의 GPU 메모리를 관리하는 스마트 포인터                             │
+│        Controller 소멸 시 자동으로 cudaFree()                                     │
+│                                                                                   │
+│   GPU에서: 사용 안 함                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 한눈에 보는 테이블
+
+```
+┌────┬──────────────────────┬─────────────┬───────────────────────────────┬──────────┐
+│line│ 필드                  │ 타입         │ 값을 채우는 코드 (라인)       │ GPU 사용 │
+├────┼──────────────────────┼─────────────┼───────────────────────────────┼──────────┤
+│ 41 │ access_counter       │ atomic<u64> │ (미초기화, GPU에서 0부터)     │ ★ 커널   │
+│ 42 │ ctrl                 │ nvm_ctrl_t* │ nvm_ctrl_init()      (160)   │ ✗        │
+│ 43 │ aq_ref               │ nvm_aq_ref  │ nvm_aq_create()      (97)   │ ✗        │
+│ 44 │ aq_mem               │ DmaPtr      │ createDma()          (167)   │ ✗        │
+│ 45 │ info                 │ ctrl_info   │ nvm_admin_ctrl_info()(104)   │ ✗        │
+│ 46 │ ns                   │ ns_info     │ nvm_admin_ns_info()  (111)   │ ✗        │
+│ 47 │ n_sqs                │ uint16_t    │ get_num_queues()     (118)   │ ✗        │
+│    │                      │             │ reserveQueues()      (179)   │          │
+│ 48 │ n_cqs                │ uint16_t    │ get_num_queues()     (118)   │ ✗        │
+│    │                      │             │ reserveQueues()      (179)   │          │
+│ 49 │ n_qps                │ uint16_t    │ min(n_sqs,n_cqs,nQ)  (180-1)│ ★ 커널   │
+│ 50 │ deviceId             │ uint32_t    │ 초기화 리스트         (151)   │ ✗        │
+│ 51 │ h_qps                │ QueuePair** │ malloc()             (183)   │ ✗        │
+│    │                      │             │ new QueuePair()      (187)   │          │
+│ 52 │ d_qps                │ QueuePair*  │ cudaMalloc()         (184)   │ ★★★ 핵심│
+│    │                      │             │ cudaMemcpy()         (189)   │          │
+│ 54 │ queue_counter        │ atomic<u64> │ = 0                  (175)   │ ★ 커널   │
+│ 56 │ page_size            │ uint32_t    │ = ctrl->page_size    (176)   │ ✗        │
+│ 57 │ blk_size             │ uint32_t    │ = ns.lba_data_size   (177)   │ ✗        │
+│ 58 │ blk_size_log         │ uint32_t    │ = log2(blk_size)     (178)   │ ✗        │
+│ 61 │ d_ctrl_ptr           │ void*       │ d_ctrl_buff.get()    (197)   │ ★ 간접   │
+│ 62 │ d_ctrl_buff          │ BufferPtr   │ createBuffer()       (196)   │ ✗        │
+├────┴──────────────────────┴─────────────┴───────────────────────────────┴──────────┤
+│                                                                                    │
+│  GPU에서 실제로 접근하는 필드 (★ 표시): 5개                                       │
+│  ─────────────────────────────────────                                             │
+│  access_counter  — I/O 카운터 (atomic 증가)                                       │
+│  n_qps           — queue 선택: smid % n_qps 또는 queue_counter % n_qps            │
+│  d_qps           — QueuePair 배열: d_qps[queue].sq, d_qps[queue].cq               │
+│  queue_counter   — random 커널: queue_counter.fetch_add(1) % n_qps                │
+│  d_ctrl_ptr      — page_cache에서 d_ctrls[i] = d_ctrl_ptr로 등록                  │
+│                                                                                    │
+│  나머지 13개 필드는 Host에서만 사용되고 GPU 복사본에서는 무의미                    │
+│  (Host 포인터 ctrl, aq_ref, aq_mem, h_qps 등은 GPU에서 역참조 불가)               │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 필드 간 의존 관계 (화살표 = "이 필드의 값이 저 필드에서 유래")
+
+```
+                  BAR0 (NVMe 레지스터)
+                    │
+           nvm_ctrl_init() (line 160)
+                    │
+                    ▼
+              ┌── ctrl ──┐
+              │          │
+              │          ├──► ctrl->page_size ═══► page_size (line 176)
+              │          │                          ═══► QueuePair.pageSize
+              │          │
+              │          └──► ctrl->mm_ptr ═══► cudaHostRegister (line 170)
+              │                                  ═══► QueuePair.sq.db
+              │                                  ═══► QueuePair.cq.db
+              │
+              ├──► aq_mem = createDma(ctrl, page_size*3) (line 167)
+              │      │
+              │      └──► aq_ref = nvm_aq_create(ctrl, aq_mem) (line 97)
+              │             │
+              │             ├──► info = nvm_admin_ctrl_info(aq_ref) (line 104)
+              │             │     └══► QueuePair.pageSize
+              │             │
+              │             ├──► ns = nvm_admin_ns_info(aq_ref) (line 111)
+              │             │     ├══► blk_size = ns.lba_data_size (line 177)
+              │             │     │     └══► blk_size_log = log2() (line 178)
+              │             │     ├══► QueuePair.block_size
+              │             │     ├══► QueuePair.block_size_log
+              │             │     └══► QueuePair.nvmNamespace = ns.ns_id
+              │             │
+              │             ├──► n_sqs, n_cqs = get_num_queues(aq_ref) (line 118)
+              │             │     │
+              │             │     └──► reserveQueues(1024,1024) (line 179)
+              │             │           │
+              │             │           └──► n_qps = min(n_sqs, n_cqs, numQueues)
+              │             │                          (line 180-181)
+              │             │                 │
+              │             │                 ├──► h_qps = malloc(n_qps) (line 183)
+              │             │                 └──► d_qps = cudaMalloc(n_qps) (line 184)
+              │             │
+              │             └──► QueuePair 생성: nvm_admin_cq/sq_create(aq_ref)
+              │                   (line 187 → queue.h:181, 199)
+              │
+              └──► d_ctrl_buff = createBuffer(sizeof(Controller)) (line 196)
+                     │
+                     └──► d_ctrl_ptr = d_ctrl_buff.get() (line 197)
+                            │
+                            └──► cudaMemcpy(d_ctrl_ptr, this) (line 198)
+                                   전체 struct → GPU 복사
+                                   GPU에서 d_ctrls[i] = d_ctrl_ptr
+```
+
+---
+
+## 1.6 Controller::Controller() 생성자 라인별 해석 (ctrl.h:148-199)
 
 ```
 Controller::Controller(
