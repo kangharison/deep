@@ -69,6 +69,572 @@ main(argc, argv)
 
 ---
 
+## 1.5 Controller::Controller() 생성자 라인별 해석 (ctrl.h:148-199)
+
+```
+Controller::Controller(
+    const char* path,       // "/dev/libnvm0" — BaM 커널 모듈이 만든 char device
+    uint32_t ns_id,         // 1 — NVMe 네임스페이스 ID
+    uint32_t cudaDevice,    // 0 — CUDA 디바이스 번호
+    uint64_t queueDepth,    // 16 — 큐 깊이 (Settings에서)
+    uint64_t numQueues      // 1 — 큐 개수 (Settings에서)
+)
+: ctrl(nullptr)             // 초기화 리스트: nvm_ctrl_t* = NULL
+, aq_ref(nullptr)           // 초기화 리스트: nvm_aq_ref = NULL
+, deviceId(cudaDevice)      // 초기화 리스트: deviceId = 0
+{
+```
+
+### Phase A: NVMe 컨트롤러 핸들 획득 (line 153-164)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [A1] fd = open(path, O_RDWR)                      (line 153)   │
+    │      path = "/dev/libnvm0"                                     │
+    │      ────────────────────                                      │
+    │      BaM 커널 모듈(module/pci.c)이 NVMe PCI 장치 탐지 시       │
+    │      생성한 character device를 연다.                            │
+    │      이 fd가 이후 모든 커널 모듈 통신의 기반이 된다.            │
+    │                                                                │
+    │ [A2] nvm_ctrl_init(&ctrl, fd)                     (line 160)   │
+    │      src/ctrl.cpp 내부:                                        │
+    │      │                                                         │
+    │      ├── mmap(fd, 0, 0x2000, PROT_READ|PROT_WRITE,             │
+    │      │        MAP_SHARED|MAP_FILE|MAP_LOCKED)                   │
+    │      │   ─────────────────────────────────────                  │
+    │      │   커널 모듈의 mmap_registers() 호출 (module/pci.c:66)   │
+    │      │   → vm_iomap_memory()로 BAR0를 userspace에 매핑         │
+    │      │   → pgprot_noncached() 설정 (캐시 비활성화)             │
+    │      │   결과: ctrl->mm_ptr = BAR0 시작 주소                   │
+    │      │         ctrl->mm_size = 0x2000 (8KB)                    │
+    │      │                                                         │
+    │      ├── BAR0 레지스터에서 컨트롤러 속성 읽기:                  │
+    │      │   cap = *(volatile uint64_t*)mm_ptr      ← CAP 레지스터 │
+    │      │   ctrl->page_size = 2^(12 + CAP.MPSMIN)  ← MPS          │
+    │      │   ctrl->dstrd     = CAP.DSTRD             ← Doorbell Stride│
+    │      │   ctrl->timeout   = CAP.TO * 500ms        ← Timeout     │
+    │      │   ctrl->max_qs    = CAP.MQES + 1          ← Max Queue Entries│
+    │      │                                                         │
+    │      └── nvm_ctrl_t 할당 & 반환                                │
+    │          ctrl = { mm_ptr, mm_size, page_size, dstrd,           │
+    │                   timeout, max_qs }                             │
+    │                                                                │
+    │      연결:                                                      │
+    │        fd ──(open)──► /dev/libnvm0 ──(mmap)──► BAR0            │
+    │        BAR0 ──(읽기)──► ctrl->page_size, dstrd, timeout, max_qs│
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase B: Admin Queue 생성 & 컨트롤러 식별 (line 167-169)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [B1] aq_mem = createDma(ctrl, ctrl->page_size * 3)  (line 167) │
+    │      buffer.h :: createDma()                                   │
+    │      │                                                         │
+    │      ├── cudaMalloc() 또는 posix_memalign()으로 3페이지 할당   │
+    │      │   크기 = page_size × 3 (예: 4096 × 3 = 12KB)           │
+    │      │   용도: Page 0 = ASQ, Page 1 = ACQ, Page 2 = Identify 버퍼│
+    │      │                                                         │
+    │      ├── ioctl(fd, NVM_MAP_HOST_MEMORY, &request)              │
+    │      │   ─────────────────────────────────────                  │
+    │      │   커널 모듈 map_ioctl() → map_userspace()               │
+    │      │   → get_user_pages(): 유저 페이지 핀닝                  │
+    │      │   → dma_map_page(): DMA 주소 획득                       │
+    │      │   → copy_to_user(): DMA 주소를 userspace로 반환         │
+    │      │                                                         │
+    │      └── nvm_dma_t 반환:                                       │
+    │          aq_mem->vaddr     = 할당된 메모리 시작 주소            │
+    │          aq_mem->ioaddrs[0] = Page 0의 DMA 주소 (ASQ용)        │
+    │          aq_mem->ioaddrs[1] = Page 1의 DMA 주소 (ACQ용)        │
+    │          aq_mem->ioaddrs[2] = Page 2의 DMA 주소 (Identify 버퍼)│
+    │          aq_mem->n_ioaddrs  = 3                                 │
+    │          aq_mem->page_size  = ctrl->page_size                   │
+    │                                                                │
+    │ [B2] initializeController(*this, ns_id)             (line 169) │
+    │      ctrl.h :: initializeController() (line 94-123)            │
+    │      │                                                         │
+    │      ├── nvm_aq_create(&aq_ref, ctrl, aq_mem.get())  (line 97) │
+    │      │   src/rpc.cpp 내부:                                     │
+    │      │   ├── nvm_queue_clear(): ACQ, ASQ 초기화                │
+    │      │   └── nvm_raw_ctrl_reset():                             │
+    │      │       ├── CC.EN = 0              (컨트롤러 비활성화)    │
+    │      │       ├── wait CSTS.RDY = 0      (비활성화 대기)        │
+    │      │       ├── AQA = (cq_size << 16) | sq_size               │
+    │      │       ├── ASQ = aq_mem->ioaddrs[0]  (SQ DMA 주소)       │
+    │      │       ├── ACQ = aq_mem->ioaddrs[1]  (CQ DMA 주소)       │
+    │      │       ├── CC = MPS | IOSQES(6) | IOCQES(4) | EN=1      │
+    │      │       └── wait CSTS.RDY = 1      (활성화 대기)          │
+    │      │                                                         │
+    │      │   결과: aq_ref = Admin Queue RPC 핸들                    │
+    │      │   SSD 컨트롤러가 리셋 → ASQ/ACQ 등록 → 활성화 완료     │
+    │      │                                                         │
+    │      ├── nvm_admin_ctrl_info(aq_ref, &info, ...)     (line 104)│
+    │      │   Admin 명령 Identify Controller (opcode 0x06) 발행     │
+    │      │   → SSD가 aq_mem Page 2에 4KB 데이터 기록               │
+    │      │   → info에 파싱:                                        │
+    │      │     info.page_size       = ctrl->page_size              │
+    │      │     info.db_stride       = 4 << ctrl->dstrd             │
+    │      │     info.max_entries     = ctrl->max_qs                 │
+    │      │     info.max_data_size   = MDTS (최대 전송 크기)        │
+    │      │     info.sq_entry_size   = 64 (고정)                    │
+    │      │     info.cq_entry_size   = 16 (고정)                    │
+    │      │     info.serial_no[20], model_no[40], firmware[8]       │
+    │      │                                                         │
+    │      ├── nvm_admin_ns_info(aq_ref, &ns, ns_id, ...)  (line 111)│
+    │      │   Admin 명령 Identify Namespace (opcode 0x06, CNS=0)    │
+    │      │   → ns에 파싱:                                          │
+    │      │     ns.ns_id           = ns_id (1)                      │
+    │      │     ns.size            = 네임스페이스 크기 (LBA 수)     │
+    │      │     ns.lba_data_size   = LBA 크기 (보통 512B)           │
+    │      │     ns.metadata_size   = 메타데이터 크기                │
+    │      │                                                         │
+    │      └── nvm_admin_get_num_queues(aq_ref, &n_cqs, &n_sqs) (118)│
+    │          Admin 명령 Get Features (Feature ID = 0x07)           │
+    │          → SSD가 지원하는 최대 SQ/CQ 수 반환                   │
+    │          → n_sqs, n_cqs에 저장                                 │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase C: BAR0를 GPU에 등록 (line 170-174)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [C1] cudaHostRegister(ctrl->mm_ptr,                            │
+    │          NVM_CTRL_MEM_MINSIZE,         // 0x2000 = 8KB         │
+    │          cudaHostRegisterIoMemory)              (line 170)      │
+    │                                                                │
+    │      ctrl->mm_ptr = BAR0의 mmap된 userspace 주소               │
+    │      cudaHostRegisterIoMemory = MMIO 메모리임을 CUDA에 알림    │
+    │                                                                │
+    │      이 호출 후:                                               │
+    │      → cudaHostGetDevicePointer()로 GPU에서 접근 가능한        │
+    │        device pointer를 획득할 수 있게 된다                    │
+    │      → 이것이 나중에 QueuePair에서 sq.db, cq.db에 사용됨       │
+    │                                                                │
+    │      연결:                                                      │
+    │        ctrl->mm_ptr (Host, mmap)                                │
+    │        → cudaHostRegister → CUDA pinned                        │
+    │        → cudaHostGetDevicePointer → GPU device pointer          │
+    │        → sq.db, cq.db (BAR0 Doorbell을 GPU에서 직접 쓸 수 있음)│
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase D: 스칼라 필드 설정 (line 175-178)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [D1] queue_counter = 0                             (line 175)  │
+    │      GPU 커널에서 queue 라운드로빈 선택에 사용하는 atomic 카운터│
+    │                                                                │
+    │ [D2] page_size = ctrl->page_size                   (line 176)  │
+    │      nvm_ctrl_t에서 복사 ← BAR0 CAP.MPSMIN에서 유도            │
+    │                                                                │
+    │ [D3] blk_size = this->ns.lba_data_size             (line 177)  │
+    │      Identify Namespace 결과에서 복사 (보통 512B)              │
+    │                                                                │
+    │ [D4] blk_size_log = std::log2(blk_size)            (line 178)  │
+    │      = log2(512) = 9  (시프트 연산용)                          │
+    │      GPU 커널에서 ctrls[ctrl]->d_qps[q].block_size_log로 참조  │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase E: I/O Queue 개수 확정 & 할당 (line 179-184)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [E1] reserveQueues(MAX_QUEUES, MAX_QUEUES)         (line 179)  │
+    │      MAX_QUEUES = 1024 (ctrl.h:36)                             │
+    │      │                                                         │
+    │      └── nvm_admin_request_num_queues(aq_ref, &1024, &1024)    │
+    │          Admin 명령 Set Features (Feature ID = 0x07)           │
+    │          → SSD에게 "SQ 1024개, CQ 1024개 달라" 요청            │
+    │          → SSD가 실제 할당 가능한 수를 반환                     │
+    │          → n_sqs = 실제 SQ 수, n_cqs = 실제 CQ 수             │
+    │          (보통 SSD가 128~1024개 범위에서 응답)                  │
+    │                                                                │
+    │ [E2] n_qps = std::min(n_sqs, n_cqs)                (line 180)  │
+    │      SQ와 CQ 중 적은 쪽                                       │
+    │                                                                │
+    │ [E3] n_qps = std::min(n_qps, (uint16_t)numQueues)  (line 181)  │
+    │      사용자가 요청한 numQueues와 비교하여 최종 결정             │
+    │      numQueues = Settings.numQueues (기본 1)                    │
+    │                                                                │
+    │      예: SSD가 SQ=256, CQ=256 응답, numQueues=128              │
+    │          → n_qps = min(256, 256) = 256                         │
+    │          → n_qps = min(256, 128) = 128                         │
+    │                                                                │
+    │ [E4] printf("SQs: %d  CQs: %d  n_qps: %d")       (line 182)  │
+    │                                                                │
+    │ [E5] h_qps = malloc(sizeof(QueuePair) * n_qps)     (line 183)  │
+    │      Host측 QueuePair 포인터 배열                              │
+    │                                                                │
+    │ [E6] cudaMalloc(&d_qps, sizeof(QueuePair) * n_qps) (line 184)  │
+    │      Device측 QueuePair 배열 (GPU VRAM)                        │
+    │      → GPU 커널에서 ctrls[ctrl]->d_qps[queue]로 접근           │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase F: QueuePair 생성 루프 (line 185-190)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ for (i = 0; i < n_qps; i++) {                      (line 185)  │
+    │                                                                │
+    │   [F1] h_qps[i] = new QueuePair(                   (line 187)  │
+    │            ctrl,          // nvm_ctrl_t* — BAR0 핸들           │
+    │            cudaDevice,    // 0 — GPU 번호                      │
+    │            ns,            // nvm_ns_info — 네임스페이스 정보   │
+    │            info,          // nvm_ctrl_info — 컨트롤러 정보     │
+    │            aq_ref,        // Admin Queue 핸들                  │
+    │            i+1,           // qp_id (1부터 시작, 0은 Admin)     │
+    │            queueDepth     // Settings.queueDepth (16)          │
+    │        )                                                       │
+    │        ─── QueuePair 생성자 상세는 아래 §1.6 참조 ───          │
+    │                                                                │
+    │   [F2] cudaMemcpy(d_qps+i, h_qps[i],               (line 189) │
+    │            sizeof(QueuePair), cudaMemcpyHostToDevice)           │
+    │        Host에서 만든 QueuePair를 GPU VRAM에 복사                │
+    │        → 이후 GPU 커널은 d_qps[i]로 접근                       │
+    │        ★ QueuePair 내부의 sq.vaddr, cq.vaddr, sq.db, cq.db,  │
+    │          sq.tickets 등 포인터들은 이미 GPU 주소이므로           │
+    │          복사 후에도 유효하다                                   │
+    │                                                                │
+    │ }  // end for                                                  │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase G: Controller 자체를 GPU에 복사 (line 194-198)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [G1] close(fd)                                     (line 194)  │
+    │      /dev/libnvm0 fd 닫기                                      │
+    │      ★ 이미 mmap으로 BAR0 매핑 & ioctl로 DMA 매핑 완료했으므로│
+    │        fd는 더 이상 필요 없다                                  │
+    │                                                                │
+    │ [G2] d_ctrl_buff = createBuffer(sizeof(Controller), cudaDevice)│
+    │                                                    (line 196)  │
+    │      GPU VRAM에 Controller 구조체 크기만큼 메모리 할당          │
+    │                                                                │
+    │ [G3] d_ctrl_ptr = d_ctrl_buff.get()                (line 197)  │
+    │      GPU 메모리 포인터 저장                                    │
+    │                                                                │
+    │ [G4] cudaMemcpy(d_ctrl_ptr, this,                  (line 198)  │
+    │          sizeof(Controller), cudaMemcpyHostToDevice)           │
+    │      Controller 전체를 GPU에 복사                              │
+    │      ★ 복사되는 내용:                                         │
+    │        access_counter (0으로 초기화)                            │
+    │        queue_counter  (0으로 초기화)                            │
+    │        n_qps, blk_size, blk_size_log                           │
+    │        d_qps ← 이 포인터는 GPU VRAM 주소이므로 복사 후에도 유효│
+    │        d_ctrl_ptr ← 자기 자신의 GPU 주소 (자기참조)            │
+    │                                                                │
+    │      ★ 복사되지만 GPU에서 사용하지 않는 것:                    │
+    │        ctrl (Host nvm_ctrl_t*), aq_ref, aq_mem, info, ns       │
+    │        h_qps (Host 포인터), d_ctrl_buff (shared_ptr)           │
+    │                                                                │
+    │      연결:                                                      │
+    │        page_cache_t 생성 시:                                   │
+    │          d_ctrls[i] = ctrls[i]->d_ctrl_ptr                    │
+    │        GPU 커널에서:                                            │
+    │          Controller* c = d_ctrls[ctrl_idx]                     │
+    │          QueuePair* qp = &c->d_qps[queue_idx]                  │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### 전체 흐름도
+
+```
+Controller::Controller("/dev/libnvm0", 1, 0, 16, 1)
+│
+├── [A] open("/dev/libnvm0") → fd
+│       nvm_ctrl_init(&ctrl, fd) → mmap BAR0 → nvm_ctrl_t
+│
+├── [B] createDma(3 pages) → aq_mem (Host DMA)
+│       initializeController():
+│         nvm_aq_create()    → Admin Queue 생성, 컨트롤러 리셋
+│         nvm_admin_ctrl_info() → info (모델명, MDTS 등)
+│         nvm_admin_ns_info()   → ns (LBA 크기, 용량 등)
+│         nvm_admin_get_num_queues() → n_sqs, n_cqs
+│
+├── [C] cudaHostRegister(BAR0, IoMemory)
+│       → 이후 Doorbell을 GPU에서 직접 쓸 수 있게 됨
+│
+├── [D] queue_counter=0, page_size, blk_size, blk_size_log 설정
+│
+├── [E] reserveQueues(1024,1024) → SSD에 큐 요청
+│       n_qps = min(n_sqs, n_cqs, numQueues)
+│       malloc(h_qps), cudaMalloc(d_qps)
+│
+├── [F] for i = 0..n_qps:
+│         h_qps[i] = new QueuePair(..., i+1, queueDepth)
+│         cudaMemcpy(d_qps+i, h_qps[i]) → GPU에 복사
+│
+├── [G] close(fd)
+│       createBuffer(sizeof(Controller)) → d_ctrl_buff
+│       d_ctrl_ptr = d_ctrl_buff.get()
+│       cudaMemcpy(d_ctrl_ptr, this) → Controller 전체를 GPU에 복사
+│
+└── 완료: 이 Controller의 GPU 복사본 주소 = d_ctrl_ptr
+          page_cache_t에서 d_ctrls[i] = d_ctrl_ptr로 등록됨
+```
+
+---
+
+## 1.6 QueuePair::QueuePair() 생성자 라인별 해석 (queue.h:89-221)
+
+```
+QueuePair::QueuePair(
+    const nvm_ctrl_t* ctrl,          // BAR0 핸들
+    const uint32_t cudaDevice,       // 0
+    const struct nvm_ns_info ns,     // 네임스페이스 정보
+    const struct nvm_ctrl_info info, // 컨트롤러 정보
+    nvm_aq_ref& aq_ref,              // Admin Queue 핸들
+    const uint16_t qp_id,            // 큐 번호 (1, 2, 3, ...)
+    const uint64_t queueDepth        // 큐 깊이 (16)
+)
+```
+
+### Phase QA: 큐 크기 결정 (line 95-111)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QA1] cap = *(volatile uint64_t*)ctrl->mm_ptr      (line 95)   │
+    │       BAR0 오프셋 0x00 = CAP (Controller Capabilities) 레지스터│
+    │                                                                │
+    │ [QA2] cqr = (cap & 0x10000) == 0x10000             (line 96)   │
+    │       CAP bit 16 = CQR (Contiguous Queues Required)            │
+    │       true = 큐 메모리가 물리적으로 연속이어야 함              │
+    │                                                                │
+    │ [QA3] MQES = *(volatile uint16_t*)ctrl->mm_ptr + 1  (line 101) │
+    │       CAP bits[15:0] = MQES (Maximum Queue Entries Supported)  │
+    │       +1 = 0-based이므로 실제 엔트리 수로 변환                 │
+    │                                                                │
+    │ [QA4] sq_size 결정:                                 (line 100) │
+    │       if (cqr):                                                │
+    │         sq_size = min(MAX_SQ_ENTRIES_64K, MQES)                 │
+    │         MAX_SQ_ENTRIES_64K = 64*1024/64 = 1024                 │
+    │         (64KB 이내에 들어가는 최대 SQ 엔트리 수)               │
+    │       else:                                                    │
+    │         sq_size = MQES                                         │
+    │                                                                │
+    │ [QA5] cq_size 결정:                                 (line 103) │
+    │       동일 로직, MAX_CQ_ENTRIES_64K = 64*1024/16 = 4096        │
+    │                                                                │
+    │ [QA6] sq_size = min(queueDepth, sq_size)            (line 106) │
+    │       cq_size = min(queueDepth, cq_size)            (line 107) │
+    │       사용자 지정 queueDepth로 제한                             │
+    │       예: queueDepth=16 → sq_size=16, cq_size=16               │
+    │                                                                │
+    │ [QA7] sq_need_prp = false                           (line 110) │
+    │       cq_need_prp = false                           (line 111) │
+    │       PRP 리스트 불필요 (64KB 이내이므로)                       │
+    │                                                                │
+    │ [QA8] sq_mem_size = sq_size * sizeof(nvm_cmd_t)     (line 113) │
+    │                   = 16 * 64 = 1024 bytes                       │
+    │       cq_mem_size = cq_size * sizeof(nvm_cpl_t)     (line 114) │
+    │                   = 16 * 16 = 256 bytes                        │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase QB: SQ/CQ DMA 메모리 할당 (line 122-126)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QB1] sq_mem = createDma(ctrl,                     (line 122)  │
+    │           NVM_PAGE_ALIGN(sq_mem_size, 1UL << 16),              │
+    │           cudaDevice)                                          │
+    │                                                                │
+    │       NVM_PAGE_ALIGN(1024, 65536) = 65536 (64KB 정렬)          │
+    │       createDma() 내부:                                        │
+    │       ├── cudaMalloc(&vaddr, 65536)  → GPU VRAM 할당           │
+    │       ├── ioctl(fd, NVM_MAP_DEVICE_MEMORY, &request)           │
+    │       │   ────────────────────────────────────                  │
+    │       │   커널 모듈 map_ioctl() → map_device_memory()          │
+    │       │   → nvidia_p2p_get_pages(): GPU 페이지 테이블 획득     │
+    │       │   → nvidia_p2p_dma_map_pages(): GPU→SSD DMA 주소 획득  │
+    │       │   → copy_to_user(): DMA 주소 반환                      │
+    │       │   ────────────────────────────────────                  │
+    │       └── nvm_dma_t 반환:                                      │
+    │           sq_mem->vaddr     = GPU VRAM 주소 (GPU 스레드가 쓸 곳)│
+    │           sq_mem->ioaddrs[0]= DMA 주소 (SSD가 읽을 주소)       │
+    │           sq_mem->local     = 1 (GPU 로컬)                     │
+    │                                                                │
+    │       ★ 같은 메모리의 두 주소:                                 │
+    │         vaddr   = GPU가 nvm_cmd_t를 쓰는 주소                  │
+    │         ioaddrs = SSD가 DMA로 cmd를 읽어가는 주소               │
+    │                                                                │
+    │ [QB2] cq_mem = createDma(...)                      (line 124)  │
+    │       동일 과정, CQ용                                          │
+    │       cq_mem->vaddr     = GPU VRAM (SSD가 nvm_cpl_t 쓸 곳)     │
+    │       cq_mem->ioaddrs[0]= DMA 주소 (SSD가 CQ에 쓸 주소)       │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase QC: 스칼라 필드 복사 (line 129-139)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QC1] pageSize        = info.page_size             (line 129)  │
+    │ [QC2] block_size      = ns.lba_data_size           (line 130)  │
+    │ [QC3] block_size_minus_1 = ns.lba_data_size - 1    (line 132)  │
+    │ [QC4] block_size_log  = log2(ns.lba_data_size)     (line 133)  │
+    │       = log2(512) = 9                                          │
+    │       GPU 커널: start_block = (tid*req_size) >> block_size_log │
+    │                                                                │
+    │ [QC5] nvmNamespace    = ns.ns_id                   (line 135)  │
+    │       NVMe 커맨드의 NSID 필드에 들어감                         │
+    │                                                                │
+    │ [QC6] qp_id           = qp_id                      (line 139)  │
+    │       큐 번호 (1부터 시작)                                     │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase QD: CQ 생성 & Doorbell (line 181-195)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QD1] nvm_admin_cq_create(aq_ref, &this->cq, qp_id,           │
+    │           this->cq_mem.get(), 0, cq_size, false)   (line 181)  │
+    │                                                                │
+    │       Admin 명령 Create I/O Completion Queue (opcode 0x05)     │
+    │       → SSD 펌웨어에 CQ 등록                                   │
+    │       → cq.no     = qp_id                                     │
+    │       → cq.qs     = cq_size (16)                               │
+    │       → cq.es     = 16 (sizeof(nvm_cpl_t))                    │
+    │       → cq.vaddr  = cq_mem->vaddr (GPU VRAM)                   │
+    │       → cq.ioaddr = cq_mem->ioaddrs[0] (DMA 주소)             │
+    │       → cq.db     = BAR0 + 0x1000 + (2*qp_id+1) * (4<<dstrd) │
+    │                     ★ 이 시점에서 db는 Host mmap 주소          │
+    │       → cq.phase  = 1 (초기 phase)                             │
+    │       → cq.head   = 0, cq.tail = 0                            │
+    │                                                                │
+    │ [QD2] cudaHostGetDevicePointer(&devicePtr, cq.db, 0) (line 190)│
+    │       Host mmap 주소 → GPU device pointer로 변환               │
+    │                                                                │
+    │ [QD3] cq.db = (volatile uint32_t*)devicePtr        (line 195)  │
+    │       ★ 이제 cq.db는 GPU 스레드가 직접 쓸 수 있는 포인터       │
+    │       *(cq.db) = head  → BAR0 CQ Head Doorbell에 직접 쓰기    │
+    │                                                                │
+    │       주소 변환 체인:                                           │
+    │       BAR0 물리 → mmap (Host virtual)                          │
+    │       → cudaHostRegister (Phase C에서)                         │
+    │       → cudaHostGetDevicePointer (여기서)                      │
+    │       → cq.db (GPU device pointer)                             │
+    │       → GPU 스레드가 *(cq.db) = val 쓰면                      │
+    │       → PCIe MMIO Write → NVMe BAR0 CQ Doorbell               │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase QE: SQ 생성 & Doorbell (line 199-212)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QE1] nvm_admin_sq_create(aq_ref, &this->sq, &this->cq,       │
+    │           qp_id, this->sq_mem.get(), 0, sq_size, false)        │
+    │                                                    (line 199)  │
+    │                                                                │
+    │       Admin 명령 Create I/O Submission Queue (opcode 0x01)     │
+    │       → SQ를 CQ에 연결 (어느 CQ로 완료를 보낼지)              │
+    │       → sq.no     = qp_id                                     │
+    │       → sq.qs     = sq_size (16)                               │
+    │       → sq.es     = 64 (sizeof(nvm_cmd_t))                    │
+    │       → sq.vaddr  = sq_mem->vaddr (GPU VRAM)                   │
+    │       → sq.ioaddr = sq_mem->ioaddrs[0] (DMA 주소)             │
+    │       → sq.db     = BAR0 + 0x1000 + (2*qp_id) * (4<<dstrd)   │
+    │                                                                │
+    │ [QE2] cudaHostGetDevicePointer(&devicePtr, sq.db, 0) (line 207)│
+    │                                                                │
+    │ [QE3] sq.db = (volatile uint32_t*)devicePtr        (line 212)  │
+    │       *(sq.db) = tail → BAR0 SQ Tail Doorbell에 직접 쓰기     │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### Phase QF: GPU 동기화 구조체 초기화 (line 215)
+
+```
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [QF1] init_gpu_specific_struct(cudaDevice)          (line 215) │
+    │       queue.h:58-85                                            │
+    │       │                                                        │
+    │       ├── SQ 동기화 배열 할당 (GPU VRAM):                      │
+    │       │   sq_tickets  = createBuffer(qs * 32B)  → sq.tickets  │
+    │       │   sq_tail_mark= createBuffer(qs * 32B)  → sq.tail_mark│
+    │       │   sq_cid      = createBuffer(65536*32B) → sq.cid      │
+    │       │                                                        │
+    │       │   sq.qs_minus_1 = sq.qs - 1  (= 15)                   │
+    │       │   sq.qs_log2    = log2(sq.qs) (= 4)                   │
+    │       │                                                        │
+    │       ├── CQ 동기화 배열 할당 (GPU VRAM):                      │
+    │       │   cq_head_mark= createBuffer(qs * 32B)  → cq.head_mark│
+    │       │   cq_pos_locks= createBuffer(qs * 32B)  → cq.pos_locks│
+    │       │                                                        │
+    │       │   cq.qs_minus_1 = cq.qs - 1  (= 15)                   │
+    │       │   cq.qs_log2    = log2(cq.qs) (= 4)                   │
+    │       │                                                        │
+    │       └── createBuffer = cudaMalloc + cudaMemset(0)            │
+    │           모든 배열이 0으로 초기화됨                            │
+    │           → tickets[i].val = 0 (라운드 0부터 시작)             │
+    │           → tail_mark[i].val = 0 (UNLOCKED)                   │
+    │           → head_mark[i].val = 0 (UNLOCKED)                   │
+    │           → pos_locks[i].val = 0 (UNLOCKED)                   │
+    │           → cid[i].val = 0                                    │
+    │                                                                │
+    │       ★ 이 시점에서 QueuePair의 모든 필드가 유효:              │
+    │         sq.vaddr, cq.vaddr   = GPU VRAM (큐 데이터)            │
+    │         sq.db, cq.db         = GPU→BAR0 Doorbell 포인터        │
+    │         sq.tickets, sq.tail_mark, sq.cid = GPU 동기화 배열     │
+    │         cq.head_mark, cq.pos_locks      = GPU 동기화 배열      │
+    │         block_size_log, nvmNamespace     = I/O 파라미터        │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### QueuePair 생성 후 메모리 레이아웃
+
+```
+QueuePair #1 (qp_id=1, queueDepth=16) 생성 완료 후:
+
+  Host 메모리                          GPU VRAM (Device)
+  ┌──────────────┐                    ┌──────────────────────────┐
+  │ h_qps[0] ────┼────────────────────┤ d_qps[0] (복사본)       │
+  │  │           │  cudaMemcpy        │  │                      │
+  │  ├─ sq_mem ──┼─(DmaPtr, shared)───┤  ├─ sq.vaddr ──────────►│
+  │  │           │                    │  │  nvm_cmd_t[16] 배열   │
+  │  │           │                    │  │  (1024B, DMA 매핑)    │
+  │  │           │                    │  │                      │
+  │  ├─ cq_mem ──┼─(DmaPtr, shared)───┤  ├─ cq.vaddr ──────────►│
+  │  │           │                    │  │  nvm_cpl_t[16] 배열   │
+  │  │           │                    │  │  (256B, DMA 매핑)     │
+  │  │           │                    │  │                      │
+  │  │           │                    │  ├─ sq.db ──────► BAR0   │
+  │  │           │                    │  │  SQ Tail Doorbell     │
+  │  │           │                    │  │  (PCIe MMIO)         │
+  │  │           │                    │  │                      │
+  │  │           │                    │  ├─ cq.db ──────► BAR0   │
+  │  │           │                    │  │  CQ Head Doorbell     │
+  │  │           │                    │  │                      │
+  │  ├─sq_tickets┼─(BufferPtr)────────┤  ├─ sq.tickets ────────►│
+  │  │           │                    │  │  padded_struct[16]    │
+  │  │           │                    │  │  (512B, 각 32B 정렬)  │
+  │  │           │                    │  │                      │
+  │  ├─sq_tail_mk┼─(BufferPtr)────────┤  ├─ sq.tail_mark ─────►│
+  │  │           │                    │  │  padded_struct[16]    │
+  │  │           │                    │  │                      │
+  │  ├─sq_cid ──┼─(BufferPtr)────────┤  ├─ sq.cid ────────────►│
+  │  │           │                    │  │  padded_struct[65536] │
+  │  │           │                    │  │  (2MB)               │
+  │  │           │                    │  │                      │
+  │  ├─cq_hd_mk─┼─(BufferPtr)────────┤  ├─ cq.head_mark ─────►│
+  │  │           │                    │  │  padded_struct[16]    │
+  │  │           │                    │  │                      │
+  │  └─cq_pos_lk┼─(BufferPtr)────────┤  └─ cq.pos_locks ─────►│
+  │              │                    │     padded_struct[16]    │
+  └──────────────┘                    └──────────────────────────┘
+```
+
+---
+
 ## 2. 모든 자료구조의 필드-필드 연결 (완전판)
 
 아래 다이어그램에서:
