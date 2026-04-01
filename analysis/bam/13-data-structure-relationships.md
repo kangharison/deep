@@ -836,7 +836,241 @@ array_d_t<T>  (GPU에서 접근하는 가상 배열)
 
 ---
 
-## 7. 전체 구조의 한 눈 요약
+## 7. GPU 커널 내부: ctrl/queue 선택 로직 (main.cu:98-199)
+
+두 커널 모두 warp(32스레드)의 **lane 0만** ctrl/queue를 선택하고
+`__shfl_sync`로 나머지 31개 lane에 broadcast한다.
+단, 두 커널의 선택 방식이 **다르다.**
+
+```
+sequential_access_kernel (main.cu:98-147)
+│
+│  커널 인자로 받는 것:
+│    Controller** ctrls  ← h_pc.pdt.d_ctrls (Device 포인터 배열)
+│    page_cache_d_t* pc  ← h_pc.d_pc_ptr (Device 디스크립터)
+│
+├── tid    = blockIdx.x * blockDim.x + threadIdx.x     (line 101)
+├── laneid = lane_id()                                  (line 102)
+├── smid   = get_smid()       ← SM(Streaming Multiprocessor) 번호  (line 104)
+│
+├── if (laneid == 0):                                   (line 108)
+│   │
+│   │  ┌─── ctrl 선택 ────────────────────────────────────────────┐
+│   │  │                                                          │
+│   │  │  ctrl = pc->ctrl_counter                                 │
+│   │  │           ->fetch_add(1, relaxed)                        │
+│   │  │           % pc->n_ctrls                  (line 109)      │
+│   │  │                                                          │
+│   │  │  pc->ctrl_counter: page_cache_d_t 내 atomic<uint64_t>*  │
+│   │  │  pc->n_ctrls:      컨트롤러 수 (예: 4)                  │
+│   │  │                                                          │
+│   │  │  동작: 전역 atomic 카운터를 1 증가시키고                  │
+│   │  │        n_ctrls로 모듈러 → 라운드로빈 SSD 선택            │
+│   │  │                                                          │
+│   │  │  예: 4 SSD, warp 순서대로:                               │
+│   │  │    warp 0 → ctrl=0 (SSD0)                                │
+│   │  │    warp 1 → ctrl=1 (SSD1)                                │
+│   │  │    warp 2 → ctrl=2 (SSD2)                                │
+│   │  │    warp 3 → ctrl=3 (SSD3)                                │
+│   │  │    warp 4 → ctrl=0 (SSD0) ...                            │
+│   │  │                                                          │
+│   │  │  연결: pc->ctrl_counter (GPU atomic)                     │
+│   │  │        → ctrl 값                                         │
+│   │  │        → ctrls[ctrl] (Controller** 인덱싱)               │
+│   │  │        → ctrls[ctrl]->d_qps (QueuePair 배열)             │
+│   │  └──────────────────────────────────────────────────────────┘
+│   │
+│   │  ┌─── queue 선택 ───────────────────────────────────────────┐
+│   │  │                                                          │
+│   │  │  queue = smid % (ctrls[ctrl]->n_qps)     (line 111)     │
+│   │  │                                                          │
+│   │  │  smid:  이 warp가 실행 중인 SM의 하드웨어 ID             │
+│   │  │  n_qps: 이 컨트롤러의 QueuePair 수 (예: 128)            │
+│   │  │                                                          │
+│   │  │  동작: SM 번호를 QP 수로 모듈러                          │
+│   │  │        → 같은 SM의 warp들은 같은 QP를 공유               │
+│   │  │        → 다른 SM은 다른 QP → 경합 최소화                 │
+│   │  │                                                          │
+│   │  │  연결: smid (HW register)                                │
+│   │  │        → queue 값                                        │
+│   │  │        → ctrls[ctrl]->d_qps[queue] (QueuePair)           │
+│   │  │        → qp.sq, qp.cq                                   │
+│   │  └──────────────────────────────────────────────────────────┘
+│   │
+│   └── 주석 처리된 대안 (line 110):
+│       // queue = ctrls[ctrl]->queue_counter.fetch_add(1, relaxed) % n_qps
+│       // → atomic 카운터로 라운드로빈 (비활성화됨)
+│
+├── ctrl  = __shfl_sync(0xFFFFFFFF, ctrl, 0)            (line 113)
+├── queue = __shfl_sync(0xFFFFFFFF, queue, 0)            (line 114)
+│   │
+│   │  __shfl_sync: warp 내 lane 0의 값을 모든 lane에 복사
+│   │  → 32개 스레드 모두 동일한 ctrl, queue 사용
+│   │  → 같은 warp = 같은 SSD의 같은 QueuePair
+│   │
+│   └── 이유: warp divergence 방지 + 동일 큐에서 연속 커맨드 발행
+│
+└── 이후 I/O:
+    start_block = (tid * req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log
+    n_blocks    = req_size >> ctrls[ctrl]->d_qps[queue].block_size_log
+    │
+    │  ★ ctrls[ctrl]->d_qps[queue].block_size_log 참조:
+    │    ctrls[ctrl] = Controller** 인덱싱 → Controller*
+    │    ->d_qps     = Controller.d_qps (Device QueuePair 배열)
+    │    [queue]     = QueuePair 인덱싱
+    │    .block_size_log = QueuePair.block_size_log (= log2(512) = 9)
+    │
+    └── read_data(pc, (ctrls[ctrl]->d_qps)+(queue), start_block, n_blocks, tid)
+                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                       QueuePair* = &ctrls[ctrl]->d_qps[queue]
+                       이 포인터가 read_data의 qp 인자가 됨
+
+
+random_access_kernel (main.cu:149-199)
+│
+│  sequential과 동일하지만 ctrl/queue 선택 방식이 다름:
+│
+├── if (laneid == 0):                                   (line 159)
+│   │
+│   │  ┌─── ctrl 선택 (동일) ─────────────────────────────────────┐
+│   │  │  ctrl = pc->ctrl_counter                                 │
+│   │  │           ->fetch_add(1, relaxed)                        │
+│   │  │           % pc->n_ctrls                  (line 161)      │
+│   │  └──────────────────────────────────────────────────────────┘
+│   │
+│   │  ┌─── queue 선택 (★ 다름!) ─────────────────────────────────┐
+│   │  │                                                          │
+│   │  │  queue = ctrls[ctrl]->queue_counter                      │
+│   │  │            .fetch_add(1, relaxed)                        │
+│   │  │            % ctrls[ctrl]->n_qps          (line 162)      │
+│   │  │                                                          │
+│   │  │  ★ sequential은 smid % n_qps (SM 기반 고정 매핑)        │
+│   │  │  ★ random은 queue_counter 라운드로빈 (동적 분산)         │
+│   │  │                                                          │
+│   │  │  이유: random access는 접근 패턴이 불규칙하므로           │
+│   │  │        SM 기반 고정 매핑보다 동적 분산이 부하 균등화에   │
+│   │  │        더 유리                                           │
+│   │  │                                                          │
+│   │  │  연결: Controller.queue_counter (Device atomic)           │
+│   │  │        → queue 값                                        │
+│   │  │        → ctrls[ctrl]->d_qps[queue]                       │
+│   │  │                                                          │
+│   │  │  주석 처리된 대안 (line 163):                            │
+│   │  │  // queue = smid % (ctrls[ctrl]->n_qps)                  │
+│   │  │  // → SM 기반 고정 매핑 (비활성화됨)                     │
+│   │  └──────────────────────────────────────────────────────────┘
+│   │
+│   └── 또한 주석 처리된 ctrl 대안 (line 160):
+│       // ctrl = smid % (pc->n_ctrls)
+│       // → SM 번호 기반 고정 매핑 (비활성화됨)
+│
+├── ctrl  = __shfl_sync(0xFFFFFFFF, ctrl, 0)            (line 165)
+├── queue = __shfl_sync(0xFFFFFFFF, queue, 0)            (line 166)
+│
+└── 이후 I/O:
+    start_block = (assignment[tid] * req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log
+                   ~~~~~~~~~~~~~~~
+                   random은 assignment[] 배열에서 LBA 결정
+                   (main.cu에서 미리 랜덤 생성한 인덱스)
+```
+
+### ctrl/queue 선택에 사용되는 자료구조 연결 요약
+
+```
+┌───────────────��─────────────────────────────────────────────────────────┐
+│                                                                         │
+│  커널 인자                                                              │
+│  ┌──────────────────┐   ┌──────────────────────────────────┐           │
+│  │ Controller** ctrls│   │ page_cache_d_t* pc               │           │
+│  │ (= h_pc.pdt.     │   │ (= h_pc.d_pc_ptr)                │           │
+│  │    d_ctrls)       │   │                                  │           │
+│  └────────┬─────────┘   └───────────────┬──────────────────┘           │
+│           │                              │                              │
+│           │                              │                              │
+│           │              ┌───────────────▼────────────────┐             │
+│           │              │ pc->ctrl_counter               │             │
+│           │              │ (atomic<uint64_t>*, GPU VRAM)  │             │
+│           │              │                                │             │
+│           │              │ val = fetch_add(1) % n_ctrls   │             │
+│           │              │       ═══════════▼══════════   │             │
+│           │              │              ctrl (uint32_t)   │             │
+│           │              └───────────────┬────────────────┘             │
+│           │                              │                              │
+│           ▼                              ▼                              │
+│  ┌────────────────────────────────────────────────────────────┐        │
+│  │ ctrls[ctrl]  →  Controller (Device copy)                   │        │
+│  │                                                            │        │
+│  │  ┌─ sequential ──────────────────────────────────────┐     │        │
+│  │  │                                                    │     │        │
+│  │  │  smid = get_smid()          (HW SM ID register)   │     │        │
+│  │  │           │                                        │     │        │
+│  │  │           ▼                                        │     │        │
+│  │  │  queue = smid % ctrls[ctrl]->n_qps                │     │        │
+│  │  │  (같은 SM → 같은 QP, 경합 감소)                    │     │        │
+│  │  │                                                    │     │        │
+│  │  └────────────────────────────────────────────────────┘     │        │
+│  │                                                            │        │
+│  │  ┌─ random ──────────────────────────────────────────┐     │        │
+│  │  │                                                    │     │        │
+│  │  │  ctrls[ctrl]->queue_counter                       │     │        │
+│  │  │  (atomic<uint64_t>, Controller 내부)               │     │        │
+│  │  │           │                                        │     │        │
+│  │  │           ▼                                        │     │        │
+│  │  │  queue = fetch_add(1) % ctrls[ctrl]->n_qps       │     │        │
+│  │  │  (동적 라운드로빈, 부하 균등 분산)                  │     │        │
+│  │  │                                                    │     │        │
+│  │  └────────────────────────────────────────────────────┘     │        │
+│  │                                                            │        │
+│  │                         ▼                                  │        │
+│  │  ┌──────────────────────────────────────────────────┐      │        │
+│  │  │ ctrls[ctrl]->d_qps[queue]  →  QueuePair         │      │        │
+│  │  │                                                  │      │        │
+│  │  │  .sq  →  nvm_queue_t (Submission Queue)          │      │        │
+│  │  │  .cq  →  nvm_queue_t (Completion Queue)          │      │        │
+│  │  │  .block_size_log  → LBA 계산에 사용              │      │        │
+│  │  └──────────────────────────────────────────────────┘      │        │
+│  └────────────────────────────────────────────────────────────┘        │
+│                                                                         │
+│  __shfl_sync(0xFFFFFFFF, ctrl, 0)  → warp 전체에 broadcast             │
+│  __shfl_sync(0xFFFFFFFF, queue, 0) → warp 전체에 broadcast             │
+│                                                                         │
+│  → 32개 lane 모두 동일 ctrl, queue 사용                                │
+│  → read_data(pc, &ctrls[ctrl]->d_qps[queue], lba, n_blocks, tid)      │
+│                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                    │
+│                   이 QueuePair*가 read_data/write_data에 전달           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+두 경로의 비교:
+
+┌────────────────────┬──────────────────────────┬──────────────────────────┐
+│                    │ sequential_access_kernel  │ random_access_kernel     │
+├────────────────────┼──────────────────────────┼──────────────────────────┤
+│ ctrl 선택          │ pc->ctrl_counter         │ pc->ctrl_counter         │
+│                    │ .fetch_add(1) % n_ctrls  │ .fetch_add(1) % n_ctrls  │
+│                    │ (atomic 라운드로빈)       │ (atomic 라운드로빈)       │
+│ 소스               │ page_cache_d_t 내 필드   │ page_cache_d_t 내 필드   │
+├────────────────────┼──────────────────────────┼──────────────────────────┤
+│ queue 선택         │ smid % n_qps             │ queue_counter            │
+│                    │ (SM 번호 기반 고정 매핑)  │ .fetch_add(1) % n_qps   │
+│                    │                          │ (atomic 라운드로빈)       │
+│ 소스               │ HW register (get_smid()) │ Controller 내 필드       │
+├────────────────────┼──────────────────────────┼──────────────────────────┤
+│ 특성               │ SM별 QP 고정 → 캐시      │ 동적 분산 → 부하 균등    │
+│                    │ locality 활용            │ random access에 적합     │
+├────────────────────┼──────────────────────────┼──────────────────────────┤
+│ LBA 결정           │ tid * req_size           │ assignment[tid] *        │
+│                    │ (연속 접근)              │ req_size (랜덤 접근)     │
+├────────────────────┼──────────────────────────┼──────────────────────────┤
+│ broadcast          │ __shfl_sync (lane 0 →    │ __shfl_sync (lane 0 →   │
+│                    │  전체 warp)              │  전체 warp)             │
+└────────────────────┴──────────────────────────┴──────────────────────────┘
+```
+
+---
+
+## 8. 전체 구조의 한 눈 요약
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
