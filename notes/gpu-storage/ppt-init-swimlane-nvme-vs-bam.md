@@ -18,122 +18,157 @@
 
 ## 2. NVMe PCIe 드라이버 초기화 Swimlane
 
+**실제 Linux kernel upstream 소스 (`drivers/nvme/host/pci.c` 및 `core.c`) 기반.**
+검증 기준: `pci.c:3712` `nvme_probe()`의 호출 순서를 한 줄씩 따라감.
+
 레인 구성: User / Block Layer / NVMe Driver / Host DRAM / SSD BAR0 / SSD Controller FW / NAND
 
 ```
- 시간 ──────────────────────────────────────────────────────────────────────────▶
-         │①insmod  │②PCI      │③Ctrl    │④Admin Q │⑤I/O Q   │⑥blk-mq  │⑦NS scan │완성    │
-         │nvme.ko  │probe     │enable   │ setup   │ setup   │ setup   │         │(idle)  │
- ════════╪═════════╪══════════╪═════════╪═════════╪═════════╪═════════╪═════════╪════════╡
-         │         │          │         │         │         │         │         │        │
- User    │         │          │         │         │         │         │┌───────┐│  ▲     │
- space   │         │          │         │         │         │         ││/dev/  ││  │     │
-         │         │          │         │         │         │         ││nvme0n1││ read() │
-         │         │          │         │         │         │         │└───▲───┘│        │
- ────────┼─────────┼──────────┼─────────┼─────────┼─────────┼─────────┼────┼────┼────────┤
-         │         │          │         │         │         │         │    │    │        │
- VFS /   │         │          │         │         │         │┌───────┐│┌───┴───┐│        │
- Block   │         │          │         │         │         ││blk_mq_││gendisk││ bio →  │
- Layer   │         │          │         │         │         ││tag_set││+req_  ││ req    │
- (blk-mq)│         │          │         │         │         ││hctx[] ││ queue ││        │
-         │         │          │         │         │         ││tags[] ││       ││        │
-         │         │          │         │         │         │└───┬───┘│└───────┘│        │
- ────────┼─────────┼──────────┼─────────┼─────────┼─────────┼────┼────┼─────────┼────────┤
-         │         │          │         │         │         │    │    │         │        │
- NVMe    │┌───────┐│┌────────┐│┌───────┐│┌───────┐│┌───────┐│    │    │         │        │
- PCIe    ││pci_   │││nvme_   │││CC.EN  │││Identify│││alloc_ │└──▶ .queue_rq =    │        │
- driver  ││driver │││dev     │││=0→1   │││ctrl    │││queue  ││   nvme_queue_rq  │ queue_ │
- (kernel)││등록   │││+BAR0   │││+CAP   │││+SET_   │││(i)×N  ││                  │ rq()   │
-         │└───────┘││ioremap │││  읽기 │││ FEAT   │││+CREATE│                   │        │
-         │         │└───┬────┘│└───┬───┘│││NUM_QS │││ IO_SQ/│                   │        │
-         │         │┌───▼────┐│    │    │└───┬───┘│││  CQ   │                   │        │
-         │         ││dev->   ││    │    │    │    │└───┬───┘│                   │        │
-         │         ││queues[]││    │    │    │    │    │    │                   │        │
-         │         ││kcalloc ││    │    │    │    │    │    │                   │        │
-         │         ││(N+1빈  ││    │    │    │    │    │    │                   │        │
-         │         ││ 슬롯)  ││    │    │    │    │    │    │                   │        │
-         │         │└───┬────┘│    │    │    │    │    │    │                   │        │
-         │         │    │ 슬롯[0] 채움│  │    │    │ 슬롯[1..N] 채움             │        │
-         │         │    └─────┼────┼────┼────►    ◄────┘    │                   │        │
- ════ ═ ═╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═│═ ═ ═╪═ ═│═ ═ ═╪═ ═ ═ ═ ╪═ ═ ═ ═ ═╪═══════╡
-         │         │          │         │   │     │   │     │         │         │        │
- Host    │         │          │         │ ┌─▼────┐│ ┌─▼────┐│         │         │ PRP    │
- DRAM    │         │          │         │ │sq_   ││ │sq_   ││         │         │ buf    │
- (DMA-   │         │          │         │ │cmds[]││ │cmds[]││         │         │ 적재   │
-  coh,   │         │          │         │ │cqes[]││ │cqes[]││         │         │        │
-  rings) │         │          │         │ │admin ││ │IO    ││         │         │        │
-         │         │          │         │ │ring  ││ │1..N  ││         │         │        │
-         │         │          │         │ │      ││ │+PRP  ││         │         │        │
-         │         │          │         │ └──┬───┘│ └──┬───┘│         │         │        │
- ════════╪═════════╪══════════╪═════════╪════╪═════╪════╪════╪═════════╪═════════╪═══════╡ ◀ PCIe
-         │         │          │         │    ▼     │    ▼    │         │         │        │
- SSD     │         │┌────────┐│┌───────┐│┌───────┐│┌───────┐│         │         │ door-  │
- BAR0    │         ││BAR0    │││CAP/   │││ASQ_   │││SQ/CQ  ││         │         │ bell   │
- (MMIO)  │         ││주소공간│││CC/    │││TDBL,  │││Door-  ││         │         │ write  │
-         │         ││노출    │││CSTS   │││ACQ_   │││bells  ││         │         │        │
-         │         ││        │││regs   │││HDBL   │││[1..N] ││         │         │        │
-         │         │└────────┘│└───────┘│└───┬───┘│└───┬───┘│         │         │        │
- ────────┼─────────┼──────────┼─────────┼────┼────┼────┼────┼─────────┼─────────┼────────┤
-         │         │          │         │    ▼    │    ▼    │         │         │ SQE    │
- SSD     │         │          │         │┌───────┐│┌───────┐│         │         │ fetch  │
- Ctrl    │         │          │         ││Admin Q│││I/O Q  ││         │         │ (DMA)  │
- FW      │         │          │         ││proc.  │││arbiter││         │         │ →FTL   │
- (on-SSD)│         │          │         │└───┬───┘│└───┬───┘│         │         │ →LBA   │
-         │         │          │         │    ▼    │    ▼    │         │         │        │
-         │         │          │         │┌───────┐│┌───────┐│         │         │        │
-         │         │          │         ││FTL L2P│││DMA    ││         │         │        │
-         │         │          │         ││ map   │││engine ││         │         │        │
-         │         │          │         │└───┬───┘│└───┬───┘│         │         │        │
- ────────┼─────────┼──────────┼─────────┼────┼────┼────┼────┼─────────┼─────────┼────────┤
-         │         │          │         │    │    │    ▼    │         │         │ NAND   │
- NAND    │         │          │         │    │    │┌───────┐│         │         │ read/  │
- Media   │         │          │         │    │    ││Chan   ││         │         │ program│
-         │         │          │         │    │    ││0..K   ││         │         │        │
-         │         │          │         │    │    │└───────┘│         │         │        │
- ════════╧═════════╧══════════╧═════════╧════╧════╧════╧════╧═════════╧═════════╧════════╡
+ 시간 ─────────────────────────────────────────────────────────────────────────────────────────▶
+         │①      │②alloc_  │③dev_   │④pci_enable          │⑤admin_ │⑥ctrl_  │⑦setup_ │⑧io_   │완성    │
+         │insmod │ dev     │ map    │ +configure_admin_Q  │ tagset │ finish │ io_Qs  │ tagset│(idle)  │
+         │       │(3717)   │(3725)  │(3735) → (3229)      │(3739)  │(3755)  │(3772)  │(3777) │        │
+         │       │         │        │                     │        │Identify│        │+ scan │        │
+ ════════╪═══════╪═════════╪════════╪═════════════════════╪════════╪════════╪════════╪═══════╪════════╡
+         │       │         │        │                     │        │        │        │       │        │
+ User    │       │         │        │                     │        │        │        │┌─────┐│  ▲     │
+ space   │       │         │        │                     │        │        │        ││/dev/││  │     │
+         │       │         │        │                     │        │        │        ││nvme ││ read() │
+         │       │         │        │                     │        │        │        ││0n1  ││        │
+         │       │         │        │                     │        │        │        │└──▲──┘│        │
+ ────────┼───────┼─────────┼────────┼─────────────────────┼────────┼────────┼────────┼───┼───┼────────┤
+         │       │         │        │                     │        │        │        │   │   │        │
+ VFS /   │       │         │        │                     │┌──────┐│        │        │┌──┴──┐│        │
+ Block   │       │         │        │                     ││admin ││        │        ││IO   ││bio →   │
+ Layer   │       │         │        │                     ││blk-mq││        │        ││blk-mq│req    │
+ (blk-mq)│       │         │        │                     ││tag_  ││        │        ││tag_ ││        │
+         │       │         │        │                     ││set   ││        │        ││set  ││        │
+         │       │         │        │                     ││hctx  ││        │        ││hctx[]│        │
+         │       │         │        │                     ││(admin)│        │        ││tags[]│        │
+         │       │         │        │                     │└──┬───┘│        │        │└─┬───┘│        │
+         │       │         │        │                     │   │    │        │        │  │    │        │
+         │       │         │        │                     │   │ .queue_rq = nvme_queue_rq    │        │
+ ────────┼───────┼─────────┼────────┼─────────────────────┼───┼────┼────────┼────────┼──┼────┼────────┤
+         │       │         │        │                     │   │    │        │        │  │    │        │
+ NVMe    │┌─────┐│┌───────┐│┌──────┐│┌──────┬────────────┐│   │    │┌──────┐│┌──────┐│  │    │        │
+ PCIe    ││pci_ │││nvme_  │││nvme_ │││pci_  │configure_  ││   │    ││Ident.│││alloc_│└──▶      queue_ │
+ driver  ││drvr │││dev    │││dev_  │││enable│admin_Q     ││   │    ││Ctrl  │││queue │          rq()   │
+ (kernel)││등록 │││kzalloc│││map   │││_device│@3229      ││   │    ││+SET_ │││(i)×N │                 │
+         │└─────┘││+dev-> │││bar=  │││+CAP   │nvme_alloc_││   │    ││FEAT  │││+     │                 │
+         │       ││queues[│││ioremap│+IRQ   │queue(0):  ││   │    ││NUM_QS│││CREATE│                 │
+         │       ││] kcall│││(3160 ││vec 1  │sq_cmds/   ││   │    │└──┬───┘│││IO_CQ │                 │
+         │       ││oc(빈) │││-ish) ││       │cqes 할당  ││   │    │   │    ││  /SQ │                 │
+         │       ││(3647- │││      ││dev-> │(dev->queues││   │    │   │    │└──┬───┘│                 │
+         │       ││ 3658) │││      ││dbs=  │[0] 채움)   ││   │    │   │    │   │    │                 │
+         │       ││+INIT_W│││      ││bar+  │+ASQ/ACQ reg│   │    │   │    │   │    │                 │
+         │       ││ORK    │││      ││4096  │write       ││   │    │   │    │   │    │                 │
+         │       ││(reset │││      ││       │+CC.EN=1   ││   │    │   │    │   │    │                 │
+         │       ││_work) │││      ││       │→CSTS.RDY  ││   │    │   │    │   │    │                 │
+         │       │└───┬───┘│└──┬───┘│└──────┴────────────┘│   │    │   │    │   │    │                 │
+         │       │    │ 슬롯[0] 채움        │              │   │    │   │    │ 슬롯[1..N] 채움         │
+         │       │    └────────┼────────────┘              │   │    │   │    │   │    │                 │
+ ════════╪═══════╪════════════╪═══════════════════════════╪═══╪════╪═══╪════╪═══╪════╪════════════════╡
+         │       │            │          ▼                │   │    │   │    │   ▼    │                 │
+ Host    │       │            │        ┌──────┐           │   │    │   │    │ ┌──────┐                │
+ DRAM    │       │            │        │admin │           │   │    │   │    │ │IO    │                │
+ (DMA-   │       │            │        │sq_cm │           │   │    │   │    │ │sq_cm │  PRP buf      │
+  coh,   │       │            │        │ds[]  │           │   │    │   │    │ │ds[]  │  적재         │
+  rings) │       │            │        │cqes[]│           │   │    │   │    │ │cqes[]│                │
+         │       │            │        │(dev->│           │   │    │   │    │ │1..N+ │                │
+         │       │            │        │ q[0])│           │   │    │   │    │ │PRP   │                │
+         │       │            │        └──┬───┘           │   │    │   │    │ └──┬───┘                │
+ ════════╪═══════╪════════════╪═══════════╪═══════════════╪═══╪════╪═══╪════╪════╪════════════════════╡◀PCIe
+         │       │            │    ▼       ▼              │   │    │   │    │    ▼                    │
+ SSD     │       │            │┌─────┐  ┌──────┐          │   │    │   │    │ ┌──────┐                │
+ BAR0    │       │            ││BAR0 │  │CAP/  │          │   │    │   │    │ │IO SQ/│ doorbell       │
+ (MMIO)  │       │            ││공간 │  │CC/   │          │   │    │   │    │ │CQ    │ write          │
+         │       │            ││매핑 │  │CSTS/ │          │   │    │   │    │ │Door- │ from driver    │
+         │       │            ││     │  │ASQ/  │          │   │    │   │    │ │bells │                │
+         │       │            ││     │  │ACQ/  │          │   │    │   │    │ │[1..N]│                │
+         │       │            ││     │  │AQ DB │          │   │    │   │    │ │      │                │
+         │       │            │└─────┘  └──┬───┘          │   │    │   │    │ └──┬───┘                │
+ ────────┼───────┼────────────┼────────────┼──────────────┼───┼────┼───┼────┼────┼────────────────────┤
+         │       │            │            ▼              │   │    │   │    │    ▼                    │
+ SSD     │       │            │        ┌──────┐           │   │    │┌──▼───┐│ ┌──────┐                │
+ Ctrl    │       │            │        │Admin │           │   │    ││Ident.││ │I/O Q │ SQE fetch     │
+ FW      │       │            │        │ Q    │           │   │    ││명령  ││ │arbit.│ →FTL L2P      │
+ (on-SSD)│       │            │        │proc. │           │   │    ││처리  ││ │+ DMA │ →채널 스케줄  │
+         │       │            │        │(CSTS │           │   │    ││(→CQE)│ │engine│                │
+         │       │            │        │ .RDY)│           │   │    │└──┬───┘│ └──┬───┘                │
+         │       │            │        └──┬───┘           │   │    │   │    │    ▼                    │
+ ────────┼───────┼────────────┼────────────┼──────────────┼───┼────┼───┼────┼────┼────────────────────┤
+         │       │            │            │              │   │    │   │    │  ┌──────┐               │
+ NAND    │       │            │            │              │   │    │   │    │  │Chan  │               │
+ Media   │       │            │            │              │   │    │   │    │  │0..K  │               │
+         │       │            │            │              │   │    │   │    │  │read/ │               │
+         │       │            │            │              │   │    │   │    │  │prog  │               │
+         │       │            │            │              │   │    │   │    │  └──────┘               │
+ ════════╧═══════╧════════════╧════════════╧══════════════╧═══╧════╧═══╧════╧══════════════════════╡
 
   ▣ 박스 = 그 단계에 그 레인에서 새로 만들어지는 객체
+  (숫자) = pci.c 라인 번호 (upstream)
   ──▶ 레인 내부: 단계 진행 / 동일 객체의 후속 채움
   세로 화살표(↓): 공간 간 상호작용 (Driver→DRAM ring, DRAM ring 주소 → BAR0 register, …)
   ════ 굵은 가로 점선: PCIe 경계 (Host ↔ SSD)
 ```
 
-### 핵심: `dev->queues[]` 의 두-단계 생성
+### 단계별 함수/객체 요약 (실제 코드 기준)
+
+| Phase | 위치 | 함수 | 하는 일 |
+|---|---|---|---|
+| ① insmod | — | `nvme_init` → `pci_register_driver` | `pci_driver` 등록 |
+| ② alloc_dev | pci.c:3717→3638 | `nvme_pci_alloc_dev` | `kzalloc(struct nvme_dev)`, `INIT_WORK(reset_work)`, **`dev->queues = kcalloc_node(nr_allocated_queues=max_io_queues+1, sizeof(struct nvme_queue))` @3657** (빈 컨테이너), `nvme_init_ctrl` (ctrl framework 등록), DMA mask 설정 |
+| ③ dev_map | pci.c:3725 | `nvme_dev_map` | **BAR0 ioremap** — `dev->bar`에 가상주소 설정 |
+| ④ pci_enable + admin Q | pci.c:3735→3158 | `nvme_pci_enable` | `pci_enable_device_mem`, `pci_set_master`, `pci_alloc_irq_vectors(1,1)` (admin vec만), CAP 레지스터 읽기, `dev->dbs = bar+4096` (doorbell base), **`nvme_pci_configure_admin_queue` @3229**: `nvme_alloc_queue(0,depth)`로 `dev->queues[0]`의 `sq_cmds`/`cqes` `dma_alloc_coherent` 할당 + ASQ/ACQ base register에 DMA 주소 write + **`CC.EN=1`→CSTS.RDY 대기** |
+| ⑤ admin tag_set | pci.c:3739 | `nvme_alloc_admin_tag_set` | **admin용 blk-mq tag_set** 할당 — admin hctx/tags/request_queue 설정 (Identify를 보낼 경로) |
+| ⑥ ctrl_finish | pci.c:3755→core.c | `nvme_init_ctrl_finish` | **Admin queue로 Identify Controller 발행** + Identify NS + `SET_FEATURES(NUM_QUEUES)` + APST, timestamp 설정 |
+| ⑦ setup_io_queues | pci.c:3772 | `nvme_setup_io_queues` | `pci_alloc_irq_vectors`로 N+1 벡터 확장, `nvme_create_io_queues` → 각 qid에 대해 `nvme_alloc_queue(i)` (pci.c:2103, DMA ring alloc) + `nvme_create_queue` (admin 명령 `CREATE_IO_CQ` → `CREATE_IO_SQ`로 SSD에 등록) — **`dev->queues[1..N]` 채움** |
+| ⑧ io_tagset + scan | pci.c:3777, 3794 | `nvme_alloc_io_tag_set` + `nvme_start_ctrl` | **IO용 blk-mq tag_set** (IO Q가 존재한 뒤에야 `nr_hw_queues`를 알 수 있음), `nvme_queue_scan` → `nvme_scan_work` 큐잉 → `nvme_alloc_ns` (비동기지만 probe 끝에서 `flush_work`로 대기) → `/dev/nvme0n1` 등록 |
+
+### 이 순서의 핵심 포인트 (당초 다이어그램과 달라진 부분)
+
+1. **`BAR0 ioremap`은 `nvme_pci_alloc_dev` 밖** (`nvme_dev_map @3725`, 별도 단계). alloc_dev는 순수 커널 메모리 작업만.
+2. **`dev->queues[]` kcalloc은 alloc_dev 안**(`@3657`). 이 시점엔 BAR 매핑 전이라서 doorbell 주소 세팅은 불가능 — 슬롯은 진짜로 **빈 컨테이너**.
+3. **Admin queue ring DMA alloc은 `nvme_pci_configure_admin_queue` 안**(`@3229`), 즉 `nvme_pci_enable` 호출 내부. Controller reset/enable(`CC.EN=1`)과 **같은 함수** 안에서 묶여 있음 — 논리적으로 "Admin Q가 살아야 reset 완료"이기 때문.
+4. **Admin blk-mq tag_set이 Identify보다 먼저**(`@3739 < @3755`). Identify는 admin queue + admin tag_set을 통해 발행되므로.
+5. **IO blk-mq tag_set은 IO queue 생성 뒤**(`@3777 > @3772`). `nvme_alloc_io_tag_set`은 `nr_hw_queues = dev->online_queues - 1`이 결정된 뒤에야 호출 가능.
+6. **Namespace scan은 비동기 워커** — `nvme_start_ctrl @3794`에서 `scan_work` 큐잉, `flush_work @3796`으로 probe 종료 직전 대기. 유저 입장에선 "probe 완료 = /dev/nvme0n1 존재"로 보임.
+
+### `dev->queues[]`의 두-단계 채움 (upstream 기준)
 
 ```
-② PCI probe (kcalloc)              ④/⑤ Admin/IO Q setup (dma_alloc_coherent)
-─────────────────────              ───────────────────────────────────────
-struct nvme_queue dev->queues[]   각 슬롯 dev->queues[i] 안의 ring buffer:
-┌──────────┬──────────┬─────┐
-│ slot[0]  │ slot[1]  │ ... │  →  ④에서 slot[0] 채움:
-│ (Admin)  │ (IO 1)   │     │       ▸ sq_cmds = dma_alloc_coherent(...)
-│  비어있음│  비어있음│     │       ▸ cqes    = dma_alloc_coherent(...)
-└──────────┴──────────┴─────┘       ▸ q_db   = BAR0 + admin doorbell offset
-   ↑                                 ▸ qid=0, depth=ASQ depth
-   nr_allocated_queues =          →  ⑤에서 slot[1..N] 채움:
-   max_io_queues + 1 만큼            ▸ 동일하게 ring 할당 + Admin 명령
-   "비어있는 컨테이너"              ▸ CREATE_IO_CQ → CREATE_IO_SQ
-                                     ▸ q_db = BAR0 + per-queue doorbell offset
+② alloc_dev (kernel 일반 메모리, kcalloc_node)
+─────────────────────────────────────────────
+struct nvme_queue dev->queues[nr_allocated_queues]
+┌──────────┬──────────┬──────────┬─────┐
+│ slot[0]  │ slot[1]  │ slot[2]  │ ... │   모든 슬롯 zero-filled
+│ (Admin)  │ (IO 1)   │ (IO 2)   │     │   sq_cmds=NULL, cqes=NULL,
+│  비어있음│  비어있음│  비어있음│     │   q_db=NULL, qid=0
+└──────────┴──────────┴──────────┴─────┘
+
+④ pci_enable → configure_admin_queue → nvme_alloc_queue(dev, 0, depth)
+────────────────────────────────────────────────────────────────
+slot[0] 채움:
+   ▸ sq_cmds  = dma_alloc_coherent(...)           — admin SQ ring
+   ▸ cqes     = dma_alloc_coherent(...)           — admin CQ ring
+   ▸ q_db     = dev->dbs + (0 * 2 * stride)       — admin SQ doorbell
+   ▸ qid      = 0, q_depth = NVME_AQ_DEPTH
+
+   + ASQ/ACQ base register에 DMA 주소 MMIO write
+   + CC.EN = 1 → CSTS.RDY 폴링
+
+⑦ setup_io_queues → nvme_alloc_queue(dev, i, depth) × N
+────────────────────────────────────────────────────────
+slot[1..N] 채움 (동일 패턴):
+   ▸ sq_cmds  = dma_alloc_coherent(...)
+   ▸ cqes     = dma_alloc_coherent(...)
+   ▸ q_db     = dev->dbs + (i * 2 * stride)
+   ▸ qid      = i
+
+   + admin 명령 CREATE_IO_CQ(qid=i) → CREATE_IO_SQ(qid=i)로 SSD에 등록
 ```
 
-→ ② 단계에서는 **컨테이너만 (kernel 메모리, kcalloc, DMA 아님)** 생성, ④⑤ 단계에서 **각 슬롯의 실제 ring buffer는 host DRAM에 dma_alloc_coherent로** 별도 할당된다는 점이 핵심.
-
-### 단계별 함수/객체 요약
-
-| Phase | 함수 | 만들어지는 객체 |
-|---|---|---|
-| ① insmod | `nvme_init` → `pci_register_driver` | `pci_driver` 등록 |
-| ② PCI probe | `nvme_probe` → `nvme_pci_alloc_dev` → `nvme_dev_map` + `kcalloc_node` | `nvme_dev`, BAR0 ioremap, **`dev->queues[]` 배열** (`struct nvme_queue` 컨테이너, `nr_allocated_queues = max_io_queues+1` 만큼 빈 슬롯) |
-| ③ Ctrl reset | `nvme_pci_enable` / `nvme_enable_ctrl` | CC/CSTS 설정 |
-| ④ Admin Q | `nvme_pci_configure_admin_queue` → `nvme_alloc_queue(0)` → `nvme_init_queue(0)` | `dev->queues[0]` 채움: ASQ/ACQ ring (`dma_alloc_coherent`로 `sq_cmds`, `cqes` 할당) |
-| ⑤ I/O Q | `nvme_setup_io_queues` → `nvme_alloc_queue(i)` × N + Admin 명령 `CREATE_IO_SQ/CQ` | `dev->queues[1..N]` 채움: 각 큐의 SQ/CQ ring + PRP pool |
-| ⑥ blk-mq | `nvme_dev_add` → `blk_mq_alloc_tag_set` | `tag_set`, `hctx[]`, `tags[]` |
-| ⑦ NS scan | `nvme_scan_work` → `nvme_alloc_ns` | `request_queue`, `/dev/nvme0n1` |
-
-### 이 그림의 포인트
-- **Block Layer와 NVMe Driver를 분리**: `.queue_rq = nvme_queue_rq` 바인딩(⑥ 말미)으로 연결. 같은 blk-mq 프레임워크를 SCSI/virtio도 쓰는 이유가 설명됨.
-- **SSD 내부를 3 레인으로 분해**: BAR0(얼굴) / Controller FW(펌웨어) / NAND(미디어).
-- **④·⑤ 단계의 세로 화살표 집중**: 드라이버가 DRAM에 SQ/CQ 버퍼 만듦 → 그 주소를 BAR0에 MMIO write → SSD FW가 DMA fetch. **호스트와 SSD의 "악수"** 구간.
+→ ② 단계는 **커널 메모리(kcalloc, DMA 아님)** 에 컨테이너만 깔아두고, ④⑦ 단계에서 **각 슬롯의 ring buffer를 DMA-coherent 영역**(`dma_alloc_coherent`)에 별도 할당.
 
 ---
 
@@ -280,10 +315,20 @@ struct nvme_queue dev->queues[]   각 슬롯 dev->queues[i] 안의 ring buffer:
 
 ## 6. 참고 (소스 파일 매핑)
 
-### Kernel NVMe
-- `linux/drivers/nvme/host/pci.c` — `nvme_probe`, `nvme_pci_alloc_dev`, `nvme_pci_configure_admin_queue`, `nvme_setup_io_queues`
-- `linux/drivers/nvme/host/core.c` — `nvme_init_identify`, `nvme_dev_add`, `nvme_scan_work`
-- `linux/block/blk-mq.c` — `blk_mq_alloc_tag_set`, `blk_mq_init_queue`
+### Kernel NVMe (upstream, `/home/harison/company/linux-study/`)
+- `drivers/nvme/host/pci.c`
+  - `nvme_probe` @3712 — 진입점, 아래 함수들을 순차 호출
+  - `nvme_pci_alloc_dev` @3638 — `kzalloc(nvme_dev)` + `dev->queues[] kcalloc @3657`
+  - `nvme_dev_map` — BAR0 ioremap
+  - `nvme_pci_enable` @3158 — `pci_enable_device`, CAP, IRQ, `configure_admin_queue` @3229
+  - `nvme_pci_configure_admin_queue` @2300 — admin queue ring DMA alloc + ASQ/ACQ reg + CC.EN=1
+  - `nvme_alloc_queue` @2103 — 특정 qid에 대해 SQ/CQ ring `dma_alloc_coherent`
+  - `nvme_setup_io_queues` — MSI-X 확장, `nvme_create_io_queues` 루프
+- `drivers/nvme/host/core.c`
+  - `nvme_init_ctrl_finish` — Identify Controller/NS, SET_FEATURES
+  - `nvme_alloc_admin_tag_set` / `nvme_alloc_io_tag_set` — blk-mq tag_set 래퍼
+  - `nvme_scan_work` / `nvme_alloc_ns` — 비동기 namespace 등록
+- `block/blk-mq.c` — `blk_mq_alloc_tag_set`, `blk_mq_init_queue`
 
 ### BaM
 - `bam/module/pci.c` — `libnvm_helper_entry`, `add_pci_dev`, `map_ioctl`, `mmap_registers`
