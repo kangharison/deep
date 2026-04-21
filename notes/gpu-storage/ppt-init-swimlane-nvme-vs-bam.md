@@ -228,101 +228,393 @@ Phase C: slot[1..N] 채움 (IO Q rings, dma_alloc_coherent)
 
 ---
 
-## 4. BaM 초기화 Swimlane
+## 4. BaM 초기화 Swimlane (발표용)
 
-레인 구성: User / Kernel(libnvm 얇은 헬퍼) / Host DRAM(Admin 만) / **GPU VRAM(신설)** / SSD BAR0 / SSD Controller FW / NAND
+**실제 BaM (NVIDIA PDL @UIUC, ASPLOS'23) 소스 (`bam-study/module/` + `src/` + `include/`) 기반.**
+
+Phase 경계는 insmod부터 GPU 커널 실행까지 **8단계** — NVMe의 `nvme_probe()` 8단계와 **의도적으로 같은 개수**로 대응시켜 대비가 드러나도록 구성. 핵심 차이는 **주체의 이동**이다: NVMe는 ①~⑧이 전부 커널, BaM은 ①②만 커널이고 ③~⑧이 **유저스페이스 + GPU**.
+
+레인 구성: User / libnvm Kernel Module / Host DRAM (Admin 전용) / **GPU VRAM (신설)** / SSD BAR0 / SSD Controller FW / NAND
+
+### Phase 한 줄 요약
+- **① Module Load** — `insmod libnvm.ko` → `libnvm_helper_entry` (`module/pci.c:726`):
+  1. `list_init(&ctrl_list)` + `list_init(&host_list)` + `list_init(&device_list)` — **세 개**의 전역 리스트 (컨트롤러 / 호스트 DMA 매핑 / GPU P2P 매핑) 초기화
+  2. `alloc_chrdev_region(&dev_first, 0, max_num_ctrls, "libnvm helper")` — MAJOR 동적 + MINOR 64개 예약
+  3. `dev_class = class_create(THIS_MODULE, "libnvm helper")` — `/sys/class/libnvm*/` 생성, udev 자동 mknod 트리거 준비
+  4. `pci_register_driver(&driver)` — PCI 서브시스템에 등록. `driver.id_table = PCI_DEVICE_CLASS(PCI_CLASS_NVME,...)` 이므로 **모든 NVMe 클래스 장치**에 대해 `add_pci_dev()` 즉시 호출
+- **② PCI Probe** — `add_pci_dev` (`module/pci.c:469`) 안에서 **순차로**:
+  1. `ctrl_get(&ctrl_list, dev_class, dev, curr_ctrls)` — `struct ctrl` kzalloc, `ctrl_list`에 삽입, MINOR 번호 할당
+  2. `pci_request_region(dev, 0, DRIVER_NAME)` — **BAR0만** reserve (BaM은 BAR0 외 BAR 사용 안 함)
+  3. `pci_enable_device(dev)` — Command 레지스터 MEM/IO 비트 셋
+  4. `ctrl_chrdev_create(ctrl, dev_first, &dev_fops)` (`module/ctrl.c:250`): `cdev_init(&ctrl->cdev, &dev_fops)` + `cdev_add(&ctrl->cdev, rdev, 1)` + `device_create(dev_class, ..., "libnvm%u", MINOR)` → **`/dev/libnvm0` 생성**
+  5. `pci_set_master(dev)` — **Bus Master Enable** (이후 SSD가 host/GPU로 DMA 가능)
+  → **커널 모듈의 일은 여기까지**. NVMe 커널 드라이버(`nvme_pci_enable`, `configure_admin_queue`, `CC.EN=1`, `Identify`, IO Q 생성)에 해당하는 작업은 **하나도 안 한다**. 단순 "chrdev 문지기 + DMA 매핑 서비스".
+- **③ User Open + BAR0 Mmap + nvm_ctrl_init** — 유저스페이스 `Controller::Controller` (`include/ctrl.h:401`) 진입:
+  1. `fd = open("/dev/libnvm0", O_RDWR)`
+  2. `nvm_ctrl_init(&ctrl, fd)` 내부에서 `mmap(..., BAR0_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)` 호출 → 커널 `mmap_registers()` (`module/pci.c:185`) 진입: `vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot)` + `vm_iomap_memory(vma, pci_resource_start(pdev,0), ...)` → **BAR0 MMIO가 유저 VA로 매핑**
+  3. 유저 `nvm_ctrl_t` 채움: `mm_ptr = BAR0 VA`, `CAP` 레지스터 readq → `page_size`, `dstrd`(doorbell stride), `max_qs` 추출, `dbs = mm_ptr + 4096` (doorbell base — NVMe 스펙 3.1.10)
+- **④ Admin Q Setup (host DRAM)** — `Controller::Controller` 계속 (`ctrl.h:422`):
+  1. `aq_mem = createDma(ctrl, page_size * 3)` — user `posix_memalign` 3페이지 → `ioctl(fd, NVM_MAP_HOST_MEMORY, &req)` → 커널 `map_userspace()` (`module/map.c:474`) → `map_user_pages()` (`map.c:348`): `get_user_pages(vaddr, n_pages, FOLL_WRITE, pages, NULL)` 으로 페이지 핀, `dma_map_page(dev, pg, PAGE_SIZE, DMA_BIDIRECTIONAL)` 반복 → `map->addrs[]` (IOVA 배열) `copy_to_user`
+  2. `nvm_aq_create(&aq_ref, ctrl, aq_mem.get())` (`include/nvm_aq.h:92`, `src/rpc.cpp`):
+     - CC.EN=0 writel, CSTS.RDY=0 폴링 (controller reset)
+     - AQA 레지스터 writel (admin Q attrs: SQS/CQS size)
+     - ASQ base 레지스터 writeq ← `aq_mem->ioaddrs[0]`
+     - ACQ base 레지스터 writeq ← `aq_mem->ioaddrs[1]`
+     - CC.EN=1, CSTS.RDY=1 폴링 (timeout = CAP.TO)
+- **⑤ Identify + Negotiate + CUDA Bind** — `initializeController()` (`ctrl.h:306-339`):
+  1. `nvm_admin_ctrl_info(aq_ref, &info, buf)` — **Identify Controller** (opcode 0x06, CNS=0x01, data buffer = aq_mem 3번째 페이지)
+  2. `nvm_admin_ns_info(aq_ref, &ns, ns_id, buf)` — **Identify Namespace** (opcode 0x06, CNS=0x00)
+  3. `nvm_admin_get_num_queues(aq_ref, &n_cqs, &n_sqs)` — **Get Features NUM_QUEUES** (opcode 0x0A, FID=0x07): 현재 허용치 질의
+  4. `reserveQueues(MAX_QUEUES, MAX_QUEUES)` (`ctrl.h:530`) → `nvm_admin_request_num_queues(...)` — **Set Features NUM_QUEUES** (opcode 0x09): 허용치 협상 (NVMe와 동일)
+  5. **`cudaHostRegisterIoMemory(ctrl.mm_ptr, NVM_CTRL_MEM_MINSIZE, ...)` (`ctrl.h:425`)** — BaM의 결정적 한 줄. BAR0 유저 VA를 **CUDA unified 주소공간에 등록**해서 GPU 커널이 **같은 VA로 doorbell을 MMIO write** 할 수 있게 한다 (P2P doorbell의 관문)
+- **⑥ I/O Q Setup on GPU VRAM** — `for qp_id in 1..n_qps: new QueuePair(ctrl, aq_ref, qp_id, qs, cudaDevice)` (`include/queue.h:250`):
+  1. `cudaSetDevice(cudaDevice)`
+  2. `sq_mem = createDma(ctrl, qs*64, cudaDevice)` → 내부: `cudaMalloc(&sq_va, qs*64)` → `ioctl(fd, NVM_MAP_DEVICE_MEMORY, &req)` → 커널 `map_device_memory()` (`module/map.c:887`) → `map_gpu_memory()`: `nvidia_p2p_get_pages(0,0,va,size,&page_tbl, p2p_free_cb, gd)` (`map.c:766`) → `nvidia_p2p_dma_map_pages(pdev, page_tbl, &dma_map)` → `dma_map->hw_address[]` (**P2P IOVA** — GPU VRAM ↔ SSD 직통 주소) `copy_to_user`
+  3. `cq_mem = createDma(ctrl, qs*16, cudaDevice)` — 같은 경로로 CQ ring도 GPU VRAM
+  4. `nvm_admin_cq_create(aq_ref, &cq, qp_id, cq_mem.get(), ivec)` — **Admin 명령 opcode 0x05 (Create I/O CQ)**, CQ base = **P2P IOVA**, interrupt vector=0 (BaM은 IRQ 대신 polling)
+  5. `cudaHostGetDevicePointer(&cq.db, mm_ptr + (2*qp_id+1)*4*(1<<dstrd), 0)` — GPU VA에서 CQ doorbell 접근
+  6. `nvm_admin_sq_create(aq_ref, &sq, &cq, qp_id, sq_mem.get())` — **Admin 명령 opcode 0x01 (Create I/O SQ)**, SQ base = P2P IOVA, linked `CQID = cq.id`
+  7. `cudaHostGetDevicePointer(&sq.db, mm_ptr + (2*qp_id)*4*(1<<dstrd), 0)` — SQ doorbell GPU VA
+  8. `init_gpu_specific_struct(cudaDevice)` (`queue.h:187`): **GPU VRAM 전용** lock-free 동기화 구조 6종 할당 — `sq_tickets[qs]` (ticket 예약), `sq_tail_mark[qs]` (slot 채움 완료 플래그), `sq_cid[65536]` (CID↔slot 역매핑), `cq_head_mark[qs]`, `cq_pos_locks[qs]`
+- **⑦ page_cache + range_t + array_t (GPU-side runtime 객체)** — `page_cache_t pc(page_size, n_pages, ctrl_list, ...)` (`include/page_cache.h`):
+  1. `createBuffer(n_pages*page_size, cudaDevice)` + `NVM_MAP_DEVICE_MEMORY` → **데이터 풀** (GPU VRAM, SSD가 직접 DMA write할 타겟)
+  2. `createBuffer(n_pages*sizeof(data_page_t))` → per-page 상태 배열 (FREE/VALID/BUSY atomic)
+  3. `createBuffer(n_slots*sizeof(cache_page_t))` → per-slot lock + LBA→slot translation
+  4. `createBuffer(n_prps*sizeof(u64))` + P2P 등록 → **PRP list** (>4KB 전송용)
+  - `range_t<T> rng(start_lba, n_blocks, ctrl_id, dist)` — 논리적 데이터 영역 (REPLICATE/STRIPE)
+  - `array_t<T> arr(rng, ..., cudaDevice)` — GPU-side view, `bam_ptr` 반환
+  - **`cudaMemcpy(d_ctrl_ptr, this, sizeof(Controller), H2D)` (`ctrl.h:453`)** — Controller 객체 자체를 GPU VRAM에 복제 → GPU 커널이 `d_ctrl->sq[i].db` 참조를 dereference 가능
+- **⑧ Kernel Launch (완성)** — `app_kernel<<<grid, block>>>(d_ctrls, d_pc, d_arr, ...)` → 각 GPU thread:
+  1. `bam_ptr<T>::read(lba)` → page_cache 룩업
+  2. miss → `sq.tickets` atomicAdd로 SQ slot 예약
+  3. `sq_cmds[tail] = SQE` (VRAM→VRAM store)
+  4. `*sq.db = sq.tail` — **GPU 커널이 직접 BAR0 doorbell MMIO write** (PCIe P2P, CPU 개입 없음)
+  5. CQ polling (`cqes[cq.head].status` atomic read)
+  6. SSD가 page_cache 데이터 슬롯으로 P2P DMA write → GPU thread read
 
 ```
- 시간 ─────────────────────────────────────────────────────────────────────────────▶
-        │①insmod  │②PCI     │③Ctrl    │④Admin Q │⑤I/O Q   │⑥page_   │⑦range_  │완성   │
-        │libnvm.ko│probe    │객체생성 │ setup   │ setup    │ cache   │ array   │(GPU   │
-        │         │+chrdev  │(user)   │(user)   │ (VRAM)   │ (VRAM)  │         │kernel)│
- ═══════╪═════════╪═════════╪═════════╪═════════╪══════════╪═════════╪═════════╪═══════╡
-        │         │         │         │         │          │         │         │       │
- User   │         │         │┌───────┐│┌───────┐│┌────────┐│┌───────┐│┌───────┐│ app   │
- space  │         │         ││open() │││nvm_aq_│││Identify│││page_  │││range_t│││ calls │
- (host  │         │         ││mmap   │││create │││+       │││cache_ │││ +     │││ CUDA  │
-  CPU)  │         │         ││(BAR0) │││nvm_   │││CREATE_│││t      │││array_t│││kernel │
-        │         │         ││       │││admin_*│││IO_SQ/ │││(host  │││       │││       │
-        │         │         ││       │││       │││  CQ   │││ proxy)│││       │││       │
-        │         │         │└──┬────┘│└──┬────┘│└──┬─────┘│└──┬────┘│└──┬────┘│       │
- ───────┼─────────┼─────────┼───┼─────┼───┼─────┼───┼──────┼───┼─────┼───┼─────┼───────┤
-        │         │         │   │     │   │     │   │      │   │     │   │     │       │
- Kernel │┌───────┐│┌───────┐│   │     │   │     │┌──▼────┐ │   │     │   │     │       │
- (libnvm││pci_   │││ctrl   ││   │     │   │     ││ioctl  │ │   │     │   │     │       │
-  helper││driver │││+      ││   │     │   │     ││MAP    │ │   │     │   │     │       │
-  얇음) ││등록   │││/dev/  ││   │     │   │     ││→nvidia│ │   │     │   │     │       │
-        ││       │││libnvm0│││   │     │   │     ││_p2p_  │ │   │     │   │     │       │
-        ││       │││chrdev │││   │     │   │     ││get_   │ │   │     │   │     │       │
-        │└───────┘│└───────┘│   │     │   │     ││pages  │ │   │     │   │     │       │
-        │         │         │   │     │   │     │└──┬────┘ │   │     │   │     │       │
-        │         │         │   │     │   │     │   │IOVA  │   │     │   │     │       │
- ───────┼─────────┼─────────┼───┼─────┼───┼─────┼───┼──────┼───┼─────┼───┼─────┼───────┤
-        │         │         │   │     │   │     │   │      │   │     │   │     │       │
- Host   │         │         │   │     │   ▼     │   │      │   │     │   │     │       │
- DRAM   │         │         │   │     │┌──────┐ │   │      │   │     │   │     │       │
- (admin │         │         │   │     ││ASQ/  │ │   │      │   │     │   │     │       │
-  만)   │         │         │   │     ││ACQ   │ │   │      │   │     │   │     │       │
-        │         │         │   │     ││ring  │ │   │      │   │     │   │     │       │
-        │         │         │   │     ││(작음)│ │   │      │   │     │   │     │       │
-        │         │         │   │     │└──┬───┘ │   │      │   │     │   │     │       │
- ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═│═ ═ ═╪═ ═│═ ═ ═╪═ ═│═ ═ ═ ╪═ ═│═ ═ ═╪═ ═│═ ═ ═╪═══════╡ ◀ PCIe
-        │         │         │   │     │   │     │   ▼      │   ▼     │   ▼     │       │
- GPU    │         │         │   │     │   │     │┌────────┐│┌───────┐│┌───────┐│┌─────┐│
- VRAM   │         │         │   │     │   │     ││QueuePair│││page_  │││range/ │││__glob││
- (CUDA  │         │         │   │     │   │     ││[1..nQ] │││cache_t│││array_ │││al__  ││
- context)         │         │   │     │   │     ││▸SQ ring│││▸pages │││ (GPU  │││커널  ││
-        │         │         │   │     │   │     ││▸CQ ring│││▸meta  │││ view) │││bam_  ││
-        │         │         │   │     │   │     ││▸PRP    │││▸lock  │││       │││ptr.  ││
-        │         │         │   │     │   │     ││ cache  │││       │││       │││read()││
-        │         │         │   │     │   │     │└──┬─────┘│└──┬────┘│└──┬────┘│└──┬───┘│
- ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═╪═ ═│═ ═ ═╪═ ═│═ ═ ═╪═ ═│═ ═ ═ ╪═ ═│═ ═ ═╪═ ═│═ ═ ═╪═ ═│═══╡ ◀ PCIe
-        │         │         │   ▼     │   ▼     │   ▼      │   │     │   │     │   │   │
- SSD    │         │┌───────┐│┌──────┐ │┌──────┐ │┌────────┐│   │     │   │     │   │   │
- BAR0   │         ││BAR0   │││CAP/  │ ││ASQ_  │ ││SQ/CQ   ││   │     │   │     │   │   │
- (MMIO) │         ││공간   │││CC/   │ ││TDBL, │ ││Doorbell│   │     │    │     │ doorbell │
-        │         ││노출   │││CSTS  │ ││ACQ_  │ ││[1..nQ] ││   │     │   │     │ write │
-        │         ││(GPU가 │││regs  │ ││HDBL  │ ││(GPU P2P│   │     │    │     │ from  │
-        │         ││mmap)  │││      │ ││      │ ││ mmap)  ││   │     │   │     │ GPU   │
-        │         │└───────┘│└──────┘ │└──┬───┘ │└──┬─────┘│   │     │   │     │   │   │
- ───────┼─────────┼─────────┼─────────┼───┼─────┼───┼──────┼───┼─────┼───┼─────┼───┼───┤
-        │         │         │         │   ▼     │   ▼      │   │     │   │     │   ▼   │
- SSD    │         │         │         │┌──────┐ │┌────────┐│   │     │   │     │ SQE   │
- Ctrl   │         │         │         ││Admin │ ││I/O Q   │    │     │   │     │ fetch │
- FW     │         │         │         ││Q     │ ││arbiter │    │     │   │     │ (DMA  │
- (on-   │         │         │         ││proc. │ ││+ DMA   │    │     │   │     │  from │
-  SSD)  │         │         │         │└──┬───┘ ││engine  │    │     │   │     │  VRAM)│
-        │         │         │         │   │     │└──┬─────┘│   │     │   │     │       │
-        │         │         │         │   │     │   ▼      │   │     │   │     │       │
-        │         │         │         │   │     │┌────────┐│   │     │   │     │       │
-        │         │         │         │   │     ││FTL L2P │    │     │   │     │       │
-        │         │         │         │   │     │└──┬─────┘│   │     │   │     │       │
- ───────┼─────────┼─────────┼─────────┼───┼─────┼───┼──────┼───┼─────┼───┼─────┼───┼───┤
- NAND   │         │         │         │   │     │   ▼      │   │     │   │     │ page  │
- Media  │         │         │         │   │     │ Channels │   │     │   │     │ read  │
-        │         │         │         │   │     │ (read/   │   │     │   │     │ →VRAM │
-        │         │         │         │   │     │  program)│   │     │   │     │       │
- ═══════╧═════════╧═════════╧═════════╧═══╧═════╧═══╧══════╧═══╧═════╧═══╧═════╧═══╧═══╡
+ 시간 ───────────────────────────────────────────────────────────────────────────────────────────────────────▶
+         │①Module  │②PCI      │③User+BAR0│④Admin Q   │⑤Identify+ │⑥I/O Q on    │⑦page_cache│⑧Kernel  │
+         │ Load    │ Probe    │ Mmap+init│ (host DRAM)│ CUDA Bind │ GPU VRAM    │ +array_t  │ Launch  │
+ ════════╪═════════╪══════════╪══════════╪═══════════╪═══════════╪═════════════╪═══════════╪═════════╡
+ User    │         │          │┌────────┐│┌─────────┐│┌─────────┐│┌───────────┐│┌─────────┐│┌───────┐│
+ space   │         │          ││open()  │││createDma│││Identify │││QueuePair  │││page_    │││kernel ││
+ (host   │         │          ││mmap    │││(aq_mem  │││Ctrl+NS  │││×N:        │││cache_t  │││launch ││
+  CPU)   │         │          ││BAR0    │││3 host   │││GetFeat  │││▸cudaMalloc│││(GPU)    │││args:  ││
+         │         │          ││        │││ pages)  │││NUM_Q    │││▸ioctl MAP │││range_t  │││d_ctrls││
+         │         │          ││nvm_ctrl│││nvm_aq_  │││SetFeat  │││▸admin     │││array_t  │││d_pc   ││
+         │         │          ││_init:  │││create:  │││NUM_Q    │││ CREATE_IO │││         │││d_arr  ││
+         │         │          ││CAP read│││ASQ/ACQ  │││         │││ _CQ/_SQ   │││cudaMem  │││       ││
+         │         │          ││dstrd,  │││reg write│││cudaHost │││▸GPU DB    │││cpy(ctrl │││       ││
+         │         │          ││max_qs  │││CC.EN=1  │││Register │││ GetDevPtr │││ , H2D)  │││       ││
+         │         │          ││dbs base│││CSTS poll│││IoMemory │││▸gpu sync  │││         │││       ││
+         │         │          │└──┬─────┘│└────┬────┘│└────┬────┘│└─────┬─────┘│└────┬────┘│└────┬──┘│
+ ────────┼─────────┼──────────┼──mmap────┼──ioctl─────┼────MMIO───┼────ioctl────┼───ioctl────┼──launch┤
+ libnvm  │┌───────┐│┌────────┐│┌────────┐│┌─────────┐│           │┌───────────┐│┌─────────┐│         │
+ Kernel  ││lib_   │││add_pci_│││mmap_   │││map_user_│││           │││map_device_│││map_dev_ │││         │
+ Module  ││helper_│││dev:    │││registers│││space:  │││           │││memory:    │││memory   │││         │
+ (얇음   ││entry: │││ctrl_get│││vm_iomap│││get_user │││           │││nvidia_p2p_│││(2nd     │││         │
+  ②까지) ││list_  │││request_│││_memory  │││_pages   │││           │││get_pages  │││call for │││         │
+         ││init×3 │││region  │││(BAR0,   │││dma_map_ │││           │││dma_map_   │││pc pages)│││         │
+         ││alloc_ │││enable_ │││pgprot_  │││page:    │││           │││pages:     │││         │││         │
+         ││chrdev │││device  │││nocached)│││host IOVA│││           │││P2P IOVA   │││         │││         │
+         ││class_ │││chrdev_ │││         │││ returned│││           │││ returned  │││         │││         │
+         ││create │││create  │││         │││         │││           │││           │││         │││         │
+         ││pci_reg│││set_    │││         │││         │││           │││           │││         │││         │
+         ││ister_ │││master  │││         │││         │││           │││           │││         │││         │
+         ││driver │└────────┘│└─────────┘│└────┬────┘│           │└──────┬────┘│└────┬────┘│         │
+         │└───────┘│/dev/     │          │     │IOVA │           │       │P2P  │     │P2P  │         │
+         │         │libnvm0   │          │     ▼     │           │       ▼     │     ▼     │         │
+ ════════╪═════════╪══════════╪══════════╪═══════════╪═══════════╪═════════════╪═══════════╪═════════╡
+ Host    │         │          │          │┌─────────┐│           │             │           │         │
+ DRAM    │         │          │          ││ASQ/ACQ  ││           │  (사용 안   │           │         │
+ (Admin  │         │          │          ││+data buf││           │   함 — I/O  │           │         │
+  only)  │         │          │          ││3 pages  ││           │   전부 VRAM)│           │         │
+         │         │          │          │└────┬────┘│           │             │           │         │
+ ═ ═ ═ ═ ╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═ ╪═ ═ ═ ═ ═ ╪═ ═ │═ ═ ═╪═ ═ ═ ═ ═ ═╪═ ═ ═ ═ ═ ═ ╪═ ═ ═ ═ ═ ═╪═ ═ ═ ═ ╡ ◀ PCIe (H↔GPU)
+ GPU     │         │          │          │    │      │           │┌───────────┐│┌─────────┐│┌───────┐│
+ VRAM    │         │          │          │    │      │           │││SQ/CQ rings││││data    │││app    ││
+ (CUDA   │         │          │          │    │      │           │││×N (P2P    │││pool    │││kernel ││
+  ctx)   │         │          │          │    │      │           │││ IOVA)     │││+PRP    │││ threads││
+         │         │          │          │    │      │           │││sq_tickets │││list    │││bam_ptr││
+         │         │          │          │    │      │           │││sq_cid     │││cache   │││.read()││
+         │         │          │          │    │      │           │││cq_locks   │││state   │││       ││
+         │         │          │          │    │      │           │││+ d_ctrl   │││array_t │││       ││
+         │         │          │          │    │      │           │└─────┬─────┘│└────┬────┘│└───┬───┘│
+ ═ ═ ═ ═ ╪═ ═ ═ ═ ═╪═ ═ ═ ═ ═ ╪═ ═ ═ ═ ═ ╪═ ═ │═ ═ ═╪═ ═ ═ ═ ═ ═╪═ ═ ═ │═ ═ ═ ╪═ ═ ═ │═ ═ ═╪═ ═ │═ ═╡ ◀ PCIe (GPU↔SSD)
+ SSD     │         │┌────────┐│┌────────┐│    ▼      │           │      ▼      │     ▼     │    ▼    │
+ BAR0    │         ││BAR0    │││CAP/CC/ ││┌─────────┐│┌─────────┐│┌───────────┐│           │doorbell │
+ (MMIO)  │         ││reserved│││CSTS    │││ASQ/ACQ  │││Admin    │││IO SQ/CQ   ││           │write    │
+         │         ││(request│││regs    │││base regs│││Submit   │││Doorbells  ││           │from     │
+         │         ││_region)│││(유저 VA│││ written │││Queue    │││[1..N]     ││           │GPU      │
+         │         ││        │││ 접근)  │││AQA reg  │││CAP.TO   │││(GPU VA)   ││           │(P2P)    │
+         │         │└────────┘│└────────┘│└────┬────┘│└────┬────┘│└─────┬─────┘│           │         │
+ ────────┼─────────┼──────────┼──────────┼─────┼─────┼─────┼─────┼──────┼──────┼───────────┼─────────┤
+         │         │          │          │     ▼     │     ▼     │      ▼      │           │  SQE    │
+ SSD     │         │          │          │┌─────────┐│┌─────────┐│┌───────────┐│           │ fetch   │
+ Ctrl FW │         │          │          ││ctrl    ││││Identify │││CREATE_IO_ ││           │(DMA     │
+ (on-SSD)│         │          │          ││reset & ││││Ctrl/NS  │││SQ/CQ 처리 ││           │from     │
+         │         │          │          ││enable  ││││SetFeat  │││ → I/O Q   ││           │VRAM     │
+         │         │          │          ││(CC.EN=1│││NUM_Q    │││  registered ││           │P2P)     │
+         │         │          │          │└────────┘│└─────────┘│└─────┬─────┘│           │→ FTL    │
+         │         │          │          │           │           │      ▼      │           │  L2P    │
+         │         │          │          │           │           │┌───────────┐│           │         │
+         │         │          │          │           │           │││FTL L2P    ││           │         │
+         │         │          │          │           │           │└─────┬─────┘│           │         │
+ ────────┼─────────┼──────────┼──────────┼───────────┼───────────┼──────┼──────┼───────────┼─────────┤
+ NAND    │         │          │          │           │           │      ▼      │           │ page    │
+ Media   │         │          │          │           │           │  Channels   │           │ read    │
+         │         │          │          │           │           │  0..K       │           │ → VRAM  │
+         │         │          │          │           │           │  (ready)    │           │ (P2P)   │
+ ════════╧═════════╧══════════╧══════════╧═══════════╧═══════════╧═════════════╧═══════════╧═════════╡
 
- ══ 두꺼운 점선: PCIe 경계 (위쪽=Host↔GPU, 아래쪽=GPU↔SSD)
- ──▶ 레인 내부: 단계 진행 / 소유
- 세로 화살표: 공간 간 상호작용 (ioctl / MMIO / P2P DMA)
+  ▣ 박스 = 그 Phase에서 그 레인에 "추가되는" 리소스 (이전 Phase 박스는 유지)
+  ══ 굵은 가로 점선 = PCIe 경계 (두 개! Host↔GPU, GPU↔SSD)
+  세로 화살표(↓) = 공간 경계를 넘는 상호작용 (mmap / ioctl / MMIO / P2P DMA)
 ```
 
-### 단계별 함수/객체 요약
+### Phase 간 "결정적 사건" (발표 시 narration)
 
-| Phase | 주체 | 함수/객체 | 생성 위치 |
-|---|---|---|---|
-| ① insmod | Kernel | `libnvm_helper_entry` → `pci_register_driver` | Kernel |
-| ② PCI probe | Kernel | `add_pci_dev` → `ctrl_chrdev_create` → `/dev/libnvm0` | Kernel (얇음) |
-| ③ Controller 객체 | User | `Controller::Controller` → `open`/`mmap(BAR0)` → `nvm_ctrl_init` | User |
-| ④ Admin Q | User | `nvm_aq_create` → Admin SQ/CQ ring | Host DRAM |
-| ⑤ I/O Q | User + GPU | `QueuePair::QueuePair` → `cudaMalloc` + `ioctl(MAP)` → `nvidia_p2p_get_pages` → `CREATE_IO_SQ/CQ` | **GPU VRAM** (SQ/CQ) |
-| ⑥ page_cache | GPU | `page_cache_t(page_size, n_pages, ...)` | GPU VRAM |
-| ⑦ range_t/array_t | GPU | `range_t<T>(...)` → `array_t<T>(...)` | GPU VRAM |
-| 완성 | GPU | `__global__` 커널에서 `bam_ptr.read()` | GPU kernel |
+| 전환 | 무엇이 일어나는가 | 왜 중요한가 |
+|---|---|---|
+| ① → ② | `pci_register_driver` 직후 PCI 서브시스템이 **즉시** `add_pci_dev` 호출 (기존 NVMe 장치 전부) | 한 함수 리턴 안에서 `/dev/libnvm0`까지 생성 완료 |
+| ② 내부 | **`pci_set_master` 후 BAR0 ioremap/CC.EN은 안 함** | NVMe 커널 드라이버와의 **핵심 차이**. 커널은 DMA만 허용하고 컨트롤러 초기화는 유저에게 위임 |
+| ② → ③ | 유저가 `open` → `mmap` 호출해야 비로소 BAR0가 프로세스 VA에 매핑 | 커널 모듈이 자발적으로 ioremap하지 않으므로 유저 트리거가 필수 |
+| ③ → ④ | BAR0 mmap 완료 후에야 CC/CSTS 레지스터 접근 가능 → Admin Q 세팅 가능 | NVMe와 동일한 의존성이지만 **호출 주체가 커널이 아닌 유저** |
+| ④ 내부 | 유저 페이지를 **`get_user_pages` + `dma_map_page`**로 핀 → 반환된 IOVA를 **유저가 직접** ASQ/ACQ 레지스터에 MMIO write | NVMe 커널 드라이버의 `dma_alloc_coherent` 대신 **user-pinned** 경로. 페이지 수명이 유저 프로세스에 묶임 |
+| ④ → ⑤ | Admin Q 살아야 Identify/Set Features 발행 가능 | NVMe와 동일 |
+| ⑤ 내부 | **`cudaHostRegisterIoMemory(BAR0)`** — BAR0 유저 VA를 CUDA 컨텍스트에 등록 | 이게 있어야 ⑥에서 `cudaHostGetDevicePointer`로 GPU가 doorbell을 쓸 수 있음 — BaM의 **doorbell P2P 관문** |
+| ⑤ → ⑥ | Set Features로 협상된 queue 개수로 I/O Q 개수 결정 | NVMe와 동일 |
+| ⑥ 내부 | `cudaMalloc` → `ioctl(NVM_MAP_DEVICE_MEMORY)` → `nvidia_p2p_get_pages` + `nvidia_p2p_dma_map_pages` → **P2P IOVA** → 이 주소를 Admin `CREATE_IO_SQ`의 SQ base로 등록 | **BaM 초기화의 하이라이트**. 이 체인이 완성되어야 SSD가 GPU VRAM으로 직접 DMA 가능 |
+| ⑥ → ⑦ | I/O Q가 살아야 page_cache가 submit할 대상 존재 | page_cache는 "큐 준비된 상태"를 전제 |
+| ⑦ 내부 | `cudaMemcpy(d_ctrl, &ctrl, H2D)` — Controller 객체를 GPU VRAM에 **복제** | GPU 커널이 `d_ctrl->sq[i].db`를 dereference해 doorbell을 쓰려면 구조 자체가 GPU에 있어야 함 |
+| ⑦ → ⑧ | 모든 GPU-side 객체가 준비되면 application `__global__` 커널 런치 가능 | NVMe의 `/dev/nvmeXnY` 노출에 해당하는 "사용 가능 상태" 완성 |
+
+→ 8 phase는 **독립된 단계가 아니라 직렬 의존성**. 하지만 NVMe와 달리 ①②만 커널에서, ③~⑧은 **유저스페이스 생성자 호출 한 번(`Controller` + `QueuePair` + `page_cache_t`)에 전부 묶여** 있음. `nvme_probe()`가 커널에서 하던 일을 **유저 C++ 생성자 체인이 대체**.
 
 ---
+
+## 4.1 BaM 초기화 상세 호출 Flow (참고용)
+
+위 swimlane의 각 phase가 실제 소스에서 어떤 함수 호출 트리를 거치는지. NVMe §3에 대응.
+
+```
+insmod libnvm.ko
+ │
+ └─[Phase ①: Module Load]────────────────────────── module/pci.c
+     libnvm_helper_entry()                            @726
+     ├─ list_init(&ctrl_list)                         @730  ◀ 컨트롤러 리스트
+     ├─ list_init(&host_list)                         @732  ◀ 호스트 DMA 매핑
+     ├─ list_init(&device_list)                       @734  ◀ GPU P2P 매핑
+     ├─ alloc_chrdev_region(&dev_first, 0, 64, DRIVER_NAME)  @739
+     ├─ dev_class = class_create(THIS_MODULE, ...)    @756
+     └─ pci_register_driver(&driver)                  @775
+         └─ driver = {
+              .id_table = [PCI_DEVICE_CLASS(NVMe, mask)],
+              .probe    = add_pci_dev,
+              .remove   = remove_pci_dev,
+           }
+           → PCI 서브시스템이 기존 NVMe 장치마다 즉시:
+              add_pci_dev(pdev, id) 호출
+
+ ┌─[Phase ②: PCI Probe callback]──────────────────── module/pci.c
+ │  add_pci_dev(dev, id)                              @469
+ │  ├─ ctrl = ctrl_get(&ctrl_list, dev_class, dev, curr_ctrls)  @493
+ │  │   (module/ctrl.c) → kzalloc(struct ctrl) + list_insert
+ │  ├─ pci_request_region(dev, 0, DRIVER_NAME)        @508  ◀ BAR0만
+ │  ├─ pci_enable_device(dev)                         @526
+ │  ├─ ctrl_chrdev_create(ctrl, dev_first, &dev_fops) @544
+ │  │   (module/ctrl.c:250)
+ │  │   ├─ ctrl->rdev = MKDEV(MAJOR(first), MINOR(first)+ctrl->number)
+ │  │   ├─ cdev_init(&ctrl->cdev, fops)
+ │  │   ├─ cdev_add(&ctrl->cdev, ctrl->rdev, 1)
+ │  │   └─ device_create(dev_class, NULL, rdev, NULL, "libnvm%u")
+ │  │        → /dev/libnvm0 udev로 생성
+ │  └─ pci_set_master(dev)                            @564  ◀ Bus Master EN
+
+---- 여기서부터 유저스페이스 ----
+
+ User application (예: benchmarks/block/main.cu)
+ │
+ ├─[Phase ③: Controller 생성자]─────────────────── include/ctrl.h + src/ctrl.cpp
+ │  Controller ctrl(device_id, ns_id, cudaDevice, n_qps, queue_depth)  @401
+ │  ├─ fd = open("/dev/libnvm0", O_RDWR)              @406
+ │  ├─ nvm_ctrl_init(&this->ctrl, fd)                 (include/nvm_ctrl.h)
+ │  │   ├─ mmap(NULL, BAR0_SIZE, PROT_RW, MAP_SHARED, fd, 0)
+ │  │   │   └─ 커널: mmap_registers()                 module/pci.c:185
+ │  │   │       ├─ ctrl = ctrl_find_by_inode(...)
+ │  │   │       ├─ vma->vm_page_prot = pgprot_noncached(...)
+ │  │   │       └─ vm_iomap_memory(vma, pci_resource_start(pdev,0), ...)
+ │  │   ├─ ctrl->mm_ptr = (BAR0 유저 VA)
+ │  │   ├─ CAP readq → page_size, dstrd, max_qs 추출
+ │  │   └─ ctrl->dbs = ctrl->mm_ptr + 4096 (doorbell base)
+ │
+ ├─[Phase ④: Admin Queue setup]─────────────────── ctrl.h:422
+ │  ├─ aq_mem = createDma(ctrl, page_size * 3)
+ │  │   ├─ posix_memalign(&va, page_size, 3*page_size)
+ │  │   └─ ioctl(fd, NVM_MAP_HOST_MEMORY, &req={va, n_pages=3})
+ │  │       └─ 커널: map_ioctl() → map_userspace()     module/map.c:474
+ │  │           └─ map_user_pages()                    module/map.c:348
+ │  │               ├─ kvcalloc(n_addrs, struct page*)
+ │  │               ├─ get_user_pages(vaddr, n, FOLL_WRITE, pages, NULL)  @383
+ │  │               └─ for i in 0..n:
+ │  │                    dma_map_page(dev, pages[i], 0, PAGE_SIZE, BIDIR)
+ │  │                    map->addrs[i] = dma_addr  ◀ IOVA
+ │  │               → copy_to_user(req.ioaddrs, map->addrs)
+ │  │
+ │  └─ initializeController(*this, ns_id)             ctrl.h:306
+ │      └─ nvm_aq_create(&aq_ref, ctrl, aq_mem.get()) include/nvm_aq.h:92
+ │          (src/rpc.cpp 또는 src/admin.cpp)
+ │          ├─ writel(CC, 0x0)                 ← Reset (CC.EN=0)
+ │          ├─ while (readl(CSTS) & RDY) ;     ← RDY=0 폴링
+ │          ├─ writel(AQA, (CQS<<16)|SQS)      ← Admin Q size
+ │          ├─ writeq(ASQ, aq_mem->ioaddrs[0]) ← ASQ base = host IOVA
+ │          ├─ writeq(ACQ, aq_mem->ioaddrs[1]) ← ACQ base
+ │          ├─ writel(CC, EN|...)              ← CC.EN=1
+ │          └─ while (!(readl(CSTS) & RDY)) ;  ← RDY=1 폴링 (timeout=CAP.TO)
+ │
+ ├─[Phase ⑤: Identify + Negotiate + CUDA bind]──── ctrl.h:317-434
+ │  initializeController 계속:
+ │  ├─ nvm_admin_ctrl_info(aq_ref, &info, buf)        ctrl.h:318
+ │  │   → Admin opcode 0x06, CNS=0x01 (Identify Controller)
+ │  ├─ nvm_admin_ns_info(aq_ref, &ns, ns_id, buf)     ctrl.h:326
+ │  │   → Admin opcode 0x06, CNS=0x00 (Identify Namespace)
+ │  ├─ nvm_admin_get_num_queues(aq_ref, &n_cqs, &n_sqs)  ctrl.h:334
+ │  │   → Admin opcode 0x0A, FID=0x07 (Get Features NUM_QUEUES)
+ │  │
+ │  ├─ cudaHostRegisterIoMemory(                      ctrl.h:425
+ │  │      ctrl->mm_ptr, NVM_CTRL_MEM_MINSIZE,
+ │  │      cudaHostRegisterIoMemory)
+ │  │   ▶ BAR0 유저 VA를 CUDA unified space에 등록
+ │  │   ▶ GPU가 이후 같은 VA로 doorbell MMIO 접근 가능
+ │  │
+ │  └─ reserveQueues(MAX_QUEUES, MAX_QUEUES)          ctrl.h:434,530
+ │      └─ nvm_admin_request_num_queues(&n_sq, &n_cq)
+ │          → Admin opcode 0x09, FID=0x07 (Set Features NUM_QUEUES)
+ │
+ ├─[Phase ⑥: I/O Queue on GPU VRAM]──────────────── ctrl.h:442
+ │  for qp_id in 1..n_qps:
+ │    h_qps[qp_id] = new QueuePair(ctrl, aq_ref, qp_id,
+ │                                 queue_depth, cudaDevice)    queue.h:250
+ │    │
+ │    ├─ cudaSetDevice(cudaDevice)
+ │    │
+ │    ├─ sq_mem = createDma(ctrl, qs*64, cudaDevice)  ◀ GPU VRAM SQ
+ │    │   ├─ cudaMalloc(&sq_va, qs*64)
+ │    │   └─ ioctl(fd, NVM_MAP_DEVICE_MEMORY, &req={sq_va, n_pages})
+ │    │       └─ 커널: map_device_memory()            module/map.c:887
+ │    │           └─ map_gpu_memory()                 module/map.c:~740
+ │    │               ├─ nvidia_p2p_get_pages(0,0,va,sz,&pg_tbl,
+ │    │               │                         p2p_free_cb, gd)  @766
+ │    │               ├─ nvidia_p2p_dma_map_pages(pdev, pg_tbl,
+ │    │               │                            &dma_map)
+ │    │               └─ map->addrs[i] = dma_map->hw_address[i]
+ │    │                  ◀ P2P IOVA (GPU VRAM ↔ SSD 직통)
+ │    │               → copy_to_user(req.ioaddrs, map->addrs)
+ │    │
+ │    ├─ cq_mem = createDma(ctrl, qs*16, cudaDevice)  ◀ GPU VRAM CQ
+ │    │   (동일 경로)
+ │    │
+ │    ├─ nvm_admin_cq_create(aq_ref, &cq, qp_id,
+ │    │                      cq_mem.get(), /*ivec=*/0)
+ │    │   → Admin opcode 0x05 (Create I/O CQ)
+ │    │     CQ base = P2P IOVA, interrupt=0 (BaM=polling)
+ │    │
+ │    ├─ cudaHostGetDevicePointer(&cq.db,
+ │    │       ctrl->mm_ptr + (2*qp_id+1)*4*(1<<dstrd), 0)
+ │    │   ◀ GPU가 접근할 CQ doorbell VA
+ │    │
+ │    ├─ nvm_admin_sq_create(aq_ref, &sq, &cq, qp_id,
+ │    │                      sq_mem.get())
+ │    │   → Admin opcode 0x01 (Create I/O SQ)
+ │    │     SQ base = P2P IOVA, linked CQID = cq.id
+ │    │
+ │    ├─ cudaHostGetDevicePointer(&sq.db,
+ │    │       ctrl->mm_ptr + (2*qp_id)*4*(1<<dstrd), 0)
+ │    │
+ │    └─ init_gpu_specific_struct(cudaDevice)         queue.h:187
+ │        ├─ sq_tickets  = createBuffer(qs*padded, cudaDev) ◀ ticket alloc
+ │        ├─ sq_tail_mark= createBuffer(qs*padded, cudaDev)
+ │        ├─ sq_cid      = createBuffer(65536*padded, cudaDev)
+ │        ├─ cq_head_mark= createBuffer(cq.qs*padded, cudaDev)
+ │        └─ cq_pos_locks= createBuffer(cq.qs*padded, cudaDev)
+ │
+ ├─[Phase ⑦: page_cache + range_t + array_t]─────── include/page_cache.h
+ │  page_cache_t pc(page_size, n_pages, cudaDevice,
+ │                  ctrl_list, ...)
+ │  ├─ pages      = createBuffer(n_pages*page_size, cudaDev)
+ │  │              + ioctl(NVM_MAP_DEVICE_MEMORY) 로 P2P 등록
+ │  │              ◀ 데이터 풀 (SSD가 이리로 DMA write)
+ │  ├─ data_pages = createBuffer(n_pages*sizeof(data_page_t))
+ │  ├─ cache_pages= createBuffer(n_slots*sizeof(cache_page_t))
+ │  └─ prp_list   = createBuffer(n_prps*sizeof(u64))
+ │                  + P2P 등록                         ◀ >4KB 전송용
+ │
+ │  range_t<T> rng(start_lba, n_blocks, ctrl_id, dist) ◀ REPLICATE/STRIPE
+ │  array_t<T> arr(rng, ..., cudaDevice)               ◀ GPU view (bam_ptr)
+ │
+ │  cudaMalloc(&d_ctrl_ptr, sizeof(Controller))        ctrl.h:451
+ │  cudaMemcpy(d_ctrl_ptr, this,                       ctrl.h:453
+ │             sizeof(Controller), H2D)
+ │  ◀ Controller 객체 자체를 GPU VRAM에 복제
+ │
+ └─[Phase ⑧: Kernel Launch]────────────────────── benchmarks/*.cu
+    app_kernel<<<grid, block>>>(d_ctrls, d_pc, d_arr, ...)
+    │
+    └─ __device__ bam_ptr<T>::read(lba)
+        ├─ page_cache 룩업 (cache_page_t state atomic)
+        ├─ miss → sq.tickets atomicAdd → slot 예약
+        ├─ sq_cmds[tail] = SQE (VRAM store)
+        ├─ *sq.db = sq.tail   ◀ GPU → BAR0 doorbell MMIO (P2P)
+        ├─ CQ polling (cqes[cq.head].status)
+        └─ 데이터는 SSD → page_cache.pages (P2P DMA)
+```
+
+### 핵심: DMA 매핑의 "세 공간 삼중주"
+
+```
+NVMe 커널 드라이버 (§3 참고)
+──────────────────────────
+dma_alloc_coherent 두 번 (Admin Q + IO Q 모두 host DRAM)
+│
+▼
+"같은 커널 배열(dev->queues[])을 두 단계로 점진 완성"
+
+BaM (§4)
+──────────────────────────
+Phase ④: get_user_pages + dma_map_page          ← Host DRAM IOVA (Admin)
+              │
+              ▼
+          aq_mem->ioaddrs[]
+Phase ⑥: nvidia_p2p_get_pages + nvidia_p2p_dma_map_pages  ← P2P IOVA (IO Q)
+              │
+              ▼
+          sq_mem->ioaddrs[], cq_mem->ioaddrs[]
+Phase ⑦: nvidia_p2p_dma_map_pages 재사용          ← P2P IOVA (데이터 풀)
+              │
+              ▼
+          pages, prp_list
+│
+▼
+"세 공간(user-pinned host DRAM / GPU VRAM SQ·CQ / GPU VRAM 데이터 풀)이
+ 각각 다른 커널 경로로 IOVA를 얻음. NVMe처럼 '같은 배열 두 번 채움'이 아니라
+ '세 개의 별개 DMA 매핑이 각기 다른 ioctl로 생성'"
+```
+
+→ BaM 초기화의 구조적 특징은 `dma_alloc_coherent`의 **부재**. 모든 DMA 버퍼는 **이미 존재하는 유저/GPU 메모리를 핀 + 매핑**하는 방식이라, "커널이 버퍼를 만들어준다"가 아니라 "유저가 만든 버퍼에 대해 커널이 IOVA를 반환"하는 뒤집힌 모델.
+
+### 단계별 함수/객체 요약 (컴팩트 표)
+
+| Phase | 주체 | 주요 함수 | 파일:라인 | 생성 객체 / 위치 |
+|---|---|---|---|---|
+| ① Module Load | Kernel | `libnvm_helper_entry` | `module/pci.c:726` | `ctrl_list`, chrdev region, `pci_driver` |
+| ② PCI Probe | Kernel | `add_pci_dev` → `ctrl_chrdev_create` | `module/pci.c:469`, `module/ctrl.c:250` | `struct ctrl`, `/dev/libnvm0` |
+| ③ User+Mmap | User + Kernel | `Controller::Controller` → `mmap_registers` | `include/ctrl.h:401`, `module/pci.c:185` | `nvm_ctrl_t` (BAR0 유저 VA), CAP 파싱 |
+| ④ Admin Q | User + Kernel | `createDma(host)` → `map_userspace` → `nvm_aq_create` | `include/ctrl.h:422`, `module/map.c:474` | **Host DRAM**: ASQ/ACQ/data ring 3페이지 |
+| ⑤ Identify | User + GPU | `nvm_admin_*` + `cudaHostRegisterIoMemory` | `include/ctrl.h:306-434` | `info`, `ns`, CUDA BAR0 binding |
+| ⑥ I/O Q | User + Kernel + GPU | `QueuePair::QueuePair` → `map_device_memory` → `nvm_admin_cq/sq_create` | `include/queue.h:250`, `module/map.c:887` | **GPU VRAM**: SQ/CQ rings ×N + sync 구조 |
+| ⑦ page_cache | User + GPU | `page_cache_t` + `range_t` + `array_t` + `cudaMemcpy(H2D Controller)` | `include/page_cache.h`, `ctrl.h:451-453` | **GPU VRAM**: 데이터 풀, PRP list, d_ctrl |
+| ⑧ Kernel Launch | GPU | `app_kernel<<<>>>` → `bam_ptr::read` | `benchmarks/*.cu` | GPU thread가 직접 SQ write + doorbell MMIO |
 
 ## 5. Kernel NVMe vs BaM — 레인 비교 (발표 한 장에 같이 두면 좋음)
 
