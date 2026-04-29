@@ -947,9 +947,747 @@ struct plink_control {
 
 ---
 
-## 10. 부록
+## 10. 모듈별 Pseudocode
 
-### 10.1 용어
+> 의사코드 수준이지 실제 컴파일 가능한 코드는 아니다. 각 모듈의 **핵심 알고리즘과 동기화 포인트**만 노출. 실제 구현 시 BaM API, CUDA atomic intrinsic, libfuse3 콜백 시그니처 등으로 구체화한다.
+
+### 10.1 ① Queue Update Manager (GPU)
+
+```c
+__device__ struct queue_state {
+    uint32_t sq_tail_reserve;  /* 다음 SQ slot 예약 카운터 */
+    uint32_t sq_tail_publish;  /* 실제 doorbell write된 tail */
+    uint32_t cq_head;
+    uint32_t cq_phase;         /* 0/1 phase tag */
+    uint32_t depth;
+    uint32_t shadow_sq_db;     /* NVMe 1.3+ 옵션 */
+    uint32_t shadow_cq_db;
+    volatile uint32_t *sq_db_bar;  /* SSD BAR doorbell 주소 (P2P) */
+    volatile uint32_t *cq_db_bar;
+};
+
+/* SQ slot 예약 — 여러 warp 공유 시 atomic 진행 */
+__device__ uint32_t queue_acquire_sq_slot(queue_state *q) {
+    uint32_t slot = atomicAdd(&q->sq_tail_reserve, 1);
+    /* 호출자가 slot % depth로 wrap, full 검사는 cid_alloc 단계에서 */
+    return slot % q->depth;
+}
+
+/* SQE write 완료 후 doorbell 발행 — 순서 보존 */
+__device__ void queue_publish_sq(queue_state *q, uint32_t my_slot) {
+    uint32_t my_tail = (my_slot + 1) % q->depth;
+
+    /* 내 차례 올 때까지 wait — sq_tail_publish가 my_slot에 도달해야 함.
+     * 이래야 SQE write 순서가 doorbell 순서와 일치. */
+    while (atomicCAS(&q->sq_tail_publish, my_slot, my_tail) != my_slot) {
+        __nanosleep(50);
+    }
+
+    /* doorbell write — SSD BAR P2P (host 우회) */
+    *(q->sq_db_bar) = my_tail;
+
+    if (shadow_db_enabled)
+        atomicExch(&q->shadow_sq_db, my_tail);
+}
+
+/* CQ head 진행 + doorbell */
+__device__ void queue_advance_cq(queue_state *q, uint32_t new_head, uint32_t new_phase) {
+    q->cq_head = new_head;
+    q->cq_phase = new_phase;
+    *(q->cq_db_bar) = new_head;
+}
+```
+
+### 10.2 ② CID Manager (GPU)
+
+```c
+__device__ struct cid_pool {
+    uint32_t free_bitmap[N_WORDS];   /* depth 비트, 1=free 0=in-use */
+    struct {
+        uint64_t submit_tsc;
+        uint64_t lba;
+        uint16_t bs;
+        uint8_t  rw_op;
+    } tracker[QUEUE_DEPTH];
+};
+
+/* find-and-set lowest free bit, atomic */
+__device__ int cid_alloc(cid_pool *p) {
+    for (int w = 0; w < N_WORDS; w++) {
+        uint32_t old = p->free_bitmap[w];
+        while (old != 0) {
+            int bit = __ffs(old) - 1;          /* free=1, 가장 낮은 bit */
+            uint32_t mask = 1u << bit;
+            uint32_t prev = atomicCAS(&p->free_bitmap[w], old, old & ~mask);
+            if (prev == old) return w * 32 + bit;  /* 할당 성공 */
+            old = prev;                         /* 경쟁 — 재시도 */
+        }
+    }
+    return -1;  /* depth 초과 — 호출자가 inflight drain 후 재시도 */
+}
+
+__device__ void cid_free(cid_pool *p, int cid) {
+    uint32_t mask = 1u << (cid % 32);
+    atomicOr(&p->free_bitmap[cid / 32], mask);
+}
+
+__device__ void cid_record(cid_pool *p, int cid,
+                           uint64_t lba, uint16_t bs, uint8_t op) {
+    p->tracker[cid].submit_tsc = clock64();
+    p->tracker[cid].lba = lba;
+    p->tracker[cid].bs = bs;
+    p->tracker[cid].rw_op = op;
+}
+```
+
+### 10.3 ③ PRP/SGL Builder (GPU)
+
+```c
+/* PRP 빌드 — bs와 page 경계에 따라 PRP1, PRP2, (옵션) PRP list */
+__device__ int build_prp(uint64_t buf_iova, uint32_t bs, uint32_t page_size,
+                         uint64_t *prp_list_buf, uint64_t prp_list_iova,
+                         uint64_t *out_prp1, uint64_t *out_prp2) {
+    uint32_t offset = buf_iova & (page_size - 1);
+    *out_prp1 = buf_iova;
+
+    /* Case 1: 단일 페이지 내 — PRP1만 */
+    if (bs <= page_size - offset) {
+        *out_prp2 = 0;
+        return 0;
+    }
+
+    uint32_t remain = bs - (page_size - offset);
+
+    /* Case 2: 두 페이지 — PRP2가 두 번째 페이지 base */
+    if (remain <= page_size) {
+        *out_prp2 = (buf_iova + page_size - offset) & ~(uint64_t)(page_size - 1);
+        return 0;
+    }
+
+    /* Case 3: PRP list 필요 */
+    uint32_t n_pages = (remain + page_size - 1) / page_size;
+    uint64_t cur = (buf_iova + page_size - offset) & ~(uint64_t)(page_size - 1);
+    for (uint32_t i = 0; i < n_pages; i++) {
+        prp_list_buf[i] = cur;
+        cur += page_size;
+    }
+    *out_prp2 = prp_list_iova;
+    return n_pages;
+}
+```
+
+### 10.4 ④ Command Submitter (GPU)
+
+```c
+/* IO 한 개 submit — Workload Generator가 결정한 lba/op로 */
+__device__ bool submit_io(plink_workload_desc *desc,
+                         queue_state *q, cid_pool *cidp,
+                         nvme_sqe *sq_ring, void *dma_buf,
+                         uint64_t lba, uint8_t rw_op) {
+
+    /* 1. CID 할당 (inflight 한도 확인) */
+    int cid = cid_alloc(cidp);
+    if (cid < 0) return false;          /* iodepth 초과 — 호출자가 backoff */
+
+    /* 2. PRP 빌드 */
+    uint64_t prp1, prp2;
+    build_prp(virt_to_iova(dma_buf), desc->bs, desc->page_size,
+              cidp->prp_list[cid], cidp->prp_list_iova[cid],
+              &prp1, &prp2);
+
+    /* 3. SQ slot 예약 + SQE 빌드 */
+    uint32_t slot = queue_acquire_sq_slot(q);
+    nvme_sqe *sqe = &sq_ring[slot];
+
+    sqe->cdw0  = (rw_op & 0xFF) | ((cid & 0xFFFF) << 16);
+    sqe->nsid  = desc->nsid;
+    sqe->mptr  = 0;
+    sqe->prp1  = prp1;
+    sqe->prp2  = prp2;
+    sqe->cdw10 = (uint32_t)(lba & 0xFFFFFFFF);            /* SLBA lower */
+    sqe->cdw11 = (uint32_t)(lba >> 32);                    /* SLBA upper */
+    sqe->cdw12 = (desc->bs / desc->lba_size) - 1;          /* NLB 0-based */
+    sqe->cdw13 = desc->fua ? (1u << 30) : 0;
+    sqe->cdw14 = 0;
+    sqe->cdw15 = 0;
+
+    /* 4. submit_tsc 기록 (latency 측정 시작) */
+    cid_record(cidp, cid, lba, desc->bs, rw_op);
+
+    /* 5. doorbell publish — SSD BAR P2P */
+    queue_publish_sq(q, slot);
+
+    /* 6. 통계 inflight 증가 */
+    atomicAdd_system(&stats->io_inflight, 1);
+    return true;
+}
+```
+
+### 10.5 ⑤ Completion Checker (GPU)
+
+```c
+__device__ void process_completions(queue_state *q, cid_pool *cidp,
+                                    nvme_cqe *cq_ring,
+                                    plink_stats *stats) {
+    uint32_t head  = q->cq_head;
+    uint32_t phase = q->cq_phase;
+    uint32_t consumed = 0;
+
+    while (true) {
+        nvme_cqe *cqe = &cq_ring[head];
+
+        /* phase bit polling — GPU memory only, PCIe traffic 0 */
+        uint16_t status_phase = cqe->status_phase;
+        if ((status_phase & 0x1) != phase) break;     /* 새 CQE 없음 */
+        __threadfence();                              /* 다른 필드 read 보장 */
+
+        /* CQE 파싱 */
+        uint16_t cid    = cqe->cid;
+        uint16_t status = (status_phase >> 1) & 0x7FFF;
+        uint8_t  sct    = (status >> 8) & 0x7;
+        uint8_t  sc     = status & 0xFF;
+
+        /* latency 계산 */
+        uint64_t lat_ns = (clock64() - cidp->tracker[cid].submit_tsc)
+                          * NS_PER_TICK;
+
+        /* 통계 emit (host-pinned atomic write) */
+        if (sct == 0 && sc == 0) {
+            atomicAdd_system(&stats->io_completed, 1);
+            uint16_t bs = cidp->tracker[cid].bs;
+            if (cidp->tracker[cid].rw_op == NVME_OPC_READ)
+                atomicAdd_system(&stats->bytes_read, bs);
+            else
+                atomicAdd_system(&stats->bytes_written, bs);
+        } else {
+            atomicAdd_system(&stats->io_errors, 1);
+        }
+        atomicAdd_system(&stats->lat_sum_ns, lat_ns);
+        atomicMin_system(&stats->lat_min_ns, lat_ns);
+        atomicMax_system(&stats->lat_max_ns, lat_ns);
+        atomicAdd_system(&stats->lat_buckets[lat_to_bucket(lat_ns)], 1);
+        atomicSub_system(&stats->io_inflight, 1);
+
+        /* CID 해제 — 다음 submit 가능 */
+        cid_free(cidp, cid);
+
+        /* CQ head 진행, wrap 시 phase flip */
+        head = (head + 1) % q->depth;
+        if (head == 0) phase ^= 1;
+        consumed++;
+    }
+
+    /* CQ doorbell 갱신 — batching 가능 (consumed > 0일 때만) */
+    if (consumed > 0)
+        queue_advance_cq(q, head, phase);
+}
+```
+
+### 10.6 ⑥ Workload Generator (GPU)
+
+```c
+__device__ uint64_t next_lba(plink_workload_desc *desc, curandState *rng,
+                             uint64_t *seq_counter) {
+    switch (desc->rw) {
+    case READ:
+    case WRITE:
+        /* sequential */
+        uint64_t lba = desc->lba_offset
+                     + (*seq_counter * desc->bs / desc->lba_size);
+        if (lba + desc->bs / desc->lba_size
+            > desc->lba_offset + desc->lba_count)
+            *seq_counter = 0;                /* wrap */
+        else
+            (*seq_counter)++;
+        return lba;
+    case RANDREAD:
+    case RANDWRITE:
+    case RANDRW:
+        return desc->lba_offset
+             + (uint64_t)(curand_uniform(rng) * desc->lba_count);
+    }
+}
+
+__device__ uint8_t next_op(plink_workload_desc *desc, curandState *rng) {
+    if (desc->rw == RANDRW)
+        return (curand_uniform(rng) * 100 < desc->rwmixread)
+               ? NVME_OPC_READ : NVME_OPC_WRITE;
+    return (desc->rw == READ || desc->rw == RANDREAD)
+           ? NVME_OPC_READ : NVME_OPC_WRITE;
+}
+
+__device__ bool should_stop(plink_workload_desc *desc, plink_control *ctrl,
+                           plink_stats *stats, uint64_t start_tsc) {
+    /* control->stop_request — single thread + nanosleep으로 PCIe 절약 */
+    __shared__ uint8_t s_stop;
+    if (threadIdx.x == 0) {
+        s_stop = atomicLoad_system(&ctrl->stop_request);
+        __nanosleep(1000);                   /* 1μs backoff */
+    }
+    __syncthreads();
+    if (s_stop) return true;
+
+    if (desc->runtime_ns > 0
+        && (clock64() - start_tsc) * NS_PER_TICK > desc->runtime_ns)
+        return true;
+
+    if (desc->io_count_limit > 0
+        && atomicLoad_system(&stats->io_completed) >= desc->io_count_limit)
+        return true;
+
+    return false;
+}
+
+/* 메인 worker loop — 각 warp가 자기 큐를 잡고 자율 동작 */
+__device__ void worker_loop(plink_workload_desc *desc, queue_state *q,
+                           cid_pool *cidp, void *dma_buf,
+                           plink_stats *stats, plink_control *ctrl) {
+    curandState rng;
+    curand_init(desc->random_seed + warp_id(), 0, 0, &rng);
+    uint64_t seq_counter = 0;
+    uint64_t start_tsc = clock64();
+
+    while (!should_stop(desc, ctrl, stats, start_tsc)) {
+        /* submit phase */
+        while (atomicLoad(&stats->io_inflight) < desc->iodepth) {
+            uint64_t lba = next_lba(desc, &rng, &seq_counter);
+            uint8_t  op  = next_op(desc, &rng);
+            if (!submit_io(desc, q, cidp, sq_ring, dma_buf, lba, op))
+                break;                       /* CID pool 고갈 — completion 처리 우선 */
+        }
+
+        /* completion phase */
+        process_completions(q, cidp, cq_ring, stats);
+    }
+
+    /* drain — outstanding 모두 완료까지 */
+    while (atomicLoad(&stats->io_inflight) > 0)
+        process_completions(q, cidp, cq_ring, stats);
+}
+```
+
+### 10.7 ⑦ Logger (host + GPU)
+
+#### Host side
+
+```c
+/* daemon/include/plink_log.h */
+#define PLINK_LOG(level, comp, fmt, ...) do {                          \
+    if ((level) <= plink_log_get_level((comp)))                        \
+        plink_log_emit((level), (comp), __FILE__, __LINE__, (fmt),     \
+                       ##__VA_ARGS__);                                 \
+} while (0)
+
+void plink_log_emit(int level, const char *comp, const char *file,
+                   int line, const char *fmt, ...) {
+    char buf[1024];
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    int n = snprintf(buf, sizeof(buf),
+                     "[%lu.%06lu] [%s] [%s:%d] ",
+                     ts.tv_sec, ts.tv_nsec / 1000,
+                     level_str(level), comp, line);
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+
+    if (g_sink_mask & SINK_STDERR) fputs(buf, stderr);
+    if (g_sink_mask & SINK_SYSLOG) syslog(level, "%s", buf);
+    if (g_sink_mask & SINK_FILE)   write(g_log_fd, buf, strlen(buf));
+}
+```
+
+#### Device side (GPU log ring)
+
+```c
+__device__ void GPU_LOG(int level, int fmt_id,
+                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    /* 한 entry 슬롯 예약 */
+    uint64_t slot = atomicAdd_system(&g_log_ring->head, 1);
+
+    /* drop policy: ring full 시 drop (블로킹 안 함) */
+    if (slot - atomicLoad_system(&g_log_ring->tail) >= N_LOG_ENTRIES)
+        return;
+
+    gpu_log_entry *e = &g_log_ring->entries[slot % N_LOG_ENTRIES];
+    e->tsc     = clock64();
+    e->level   = level;
+    e->fmt_id  = fmt_id;
+    e->args[0] = a0; e->args[1] = a1; e->args[2] = a2; e->args[3] = a3;
+
+    __threadfence_system();
+    /* visibility marker — CPU drain은 seq[slot]==slot 확인 후 read */
+    g_log_ring->seq[slot % N_LOG_ENTRIES] = slot;
+}
+
+/* host-side drain thread */
+void *log_drain_thread(void *arg) {
+    plink_session *sess = arg;
+    while (sess->state == RUNNING) {
+        uint64_t head = atomic_load(&sess->log_ring->head);
+        while (sess->log_ring->tail < head) {
+            uint64_t i = sess->log_ring->tail % N_LOG_ENTRIES;
+            /* GPU의 visibility 확인 — entry write 완료 안 됐으면 wait */
+            if (sess->log_ring->seq[i] != sess->log_ring->tail)
+                break;
+
+            gpu_log_entry e = sess->log_ring->entries[i];
+            const char *fmt = lookup_fmt(e.fmt_id);
+            char rendered[512];
+            snprintf(rendered, sizeof(rendered), fmt,
+                    e.args[0], e.args[1], e.args[2], e.args[3]);
+            PLINK_LOG(e.level, "kernel",
+                     "[gpu tsc=%lu] %s", e.tsc, rendered);
+            sess->log_ring->tail++;
+        }
+        usleep(10000);                       /* 10ms backoff */
+    }
+    return NULL;
+}
+```
+
+### 10.8 ⑧ Control Path (CUSE thread + io_msg ring + session manager)
+
+#### CUSE ioctl 디스패처
+
+```c
+static void plink_cuse_ioctl(fuse_req_t req, int cmd, void *arg, ...) {
+    switch (cmd) {
+    /* NVMe 표준 — io_msg ring으로 위임 (admin worker가 처리) */
+    case NVME_IOCTL_ADMIN_CMD:
+    case NVME_IOCTL_ADMIN64_CMD: {
+        admin_msg *msg = malloc(sizeof(*msg));
+        msg->req = req;
+        msg->cmd = *(struct nvme_passthru_cmd *)arg;
+        if (!io_msg_enqueue(&g_admin_ring, msg)) {
+            fuse_reply_err(req, EAGAIN);     /* ring full */
+            free(msg);
+        }
+        return;                              /* admin worker가 fuse_reply */
+    }
+    case NVME_IOCTL_RESET:    handle_ctrlr_reset(req); return;
+    case NVME_IOCTL_RESCAN:   handle_ctrlr_rescan(req); return;
+
+    /* parallelink 자체 */
+    case PLINK_IOC_OPEN_SESSION:    handle_open_session(req, arg); return;
+    case PLINK_IOC_START_WORKLOAD:  handle_start_workload(req, arg); return;
+    case PLINK_IOC_STOP_WORKLOAD:   handle_stop_workload(req, arg); return;
+    case PLINK_IOC_QUERY_INVENTORY:
+    case PLINK_IOC_QUERY_SESSION:
+    case PLINK_IOC_QUERY_QUEUE_POOL:
+    case PLINK_IOC_QUERY_SMART:     handle_query(req, cmd, arg); return;
+
+    /* 거부 */
+    case NVME_IOCTL_SUBMIT_IO:
+    case NVME_IOCTL_IO_CMD:
+    case NVME_IOCTL_IO64_CMD:       fuse_reply_err(req, ENOTSUP); return;
+
+    default:                        fuse_reply_err(req, ENOTTY); return;
+    }
+}
+```
+
+#### io_msg ring (lock-free MPSC)
+
+```c
+struct io_msg_ring {
+    _Atomic uint64_t prod_head;
+    _Atomic uint64_t prod_tail;
+    _Atomic uint64_t cons_head;
+    void            *entries[RING_SIZE];
+    uint64_t         mask;                   /* RING_SIZE - 1 */
+};
+
+bool io_msg_enqueue(io_msg_ring *r, void *msg) {
+    uint64_t ph, pn, ct;
+    do {
+        ph = atomic_load(&r->prod_head);
+        ct = atomic_load(&r->cons_head);
+        if (ph - ct >= RING_SIZE) return false;     /* full */
+        pn = ph + 1;
+    } while (!atomic_compare_exchange_weak(&r->prod_head, &ph, pn));
+
+    r->entries[ph & r->mask] = msg;
+    /* 다른 producer가 prod_tail을 ph로 진행시킬 때까지 wait — order 보존 */
+    while (atomic_load(&r->prod_tail) != ph) cpu_relax();
+    atomic_store(&r->prod_tail, pn);
+    return true;
+}
+
+void *io_msg_dequeue(io_msg_ring *r) {
+    uint64_t ch = atomic_load(&r->cons_head);
+    uint64_t pt = atomic_load(&r->prod_tail);
+    if (ch == pt) return NULL;                      /* empty */
+    void *msg = r->entries[ch & r->mask];
+    atomic_store(&r->cons_head, ch + 1);
+    return msg;
+}
+```
+
+#### admin worker thread
+
+```c
+void *admin_worker_thread(void *arg) {
+    while (g_running) {
+        admin_msg *msg = io_msg_dequeue(&g_admin_ring);
+        if (!msg) { usleep(100); continue; }
+
+        /* NVMe admin SQE 빌드 */
+        nvm_admin_cmd ac;
+        ac.opcode = msg->cmd.opcode;
+        ac.nsid   = msg->cmd.nsid;
+        ac.cdw10  = msg->cmd.cdw10;
+        /* ... (cdw11~cdw15) ... */
+
+        /* DMA buffer 준비 */
+        void *dma = NULL;
+        if (msg->cmd.data_len > 0) {
+            dma = nvm_admin_alloc_dma(msg->cmd.data_len);
+            if (is_write_op(msg->cmd.opcode))
+                memcpy(dma, (void*)msg->cmd.addr, msg->cmd.data_len);
+        }
+
+        /* BaM admin queue submit + wait */
+        nvm_cpl cpl;
+        int rc = nvm_admin_submit_sync(&g_ctrlr, &ac, dma, &cpl);
+
+        /* 결과 user buffer로 복사 */
+        if (rc == 0 && dma && is_read_op(msg->cmd.opcode))
+            memcpy((void*)msg->cmd.addr, dma, msg->cmd.data_len);
+        msg->cmd.result = cpl.cdw0;
+
+        /* fuse reply */
+        fuse_reply_ioctl(msg->req, rc, &msg->cmd, sizeof(msg->cmd));
+        nvm_admin_free_dma(dma);
+        free(msg);
+    }
+    return NULL;
+}
+```
+
+#### session manager — START_WORKLOAD
+
+```c
+int handle_start_workload(fuse_req_t req, void *arg) {
+    plink_workload_start *in = arg;
+    plink_session *sess = session_alloc();
+
+    /* ① IO queue pool LEASE */
+    if (io_queue_pool_lease(in->desc.n_queues, sess->qids) < 0) {
+        fuse_reply_err(req, EAGAIN);
+        return -1;
+    }
+    sess->n_qids = in->desc.n_queues;
+
+    /* ② shared memory 생성 (host-pinned + GPU mapped) */
+    snprintf(sess->stats_path, 64, "/plink_stats_%u", sess->id);
+    snprintf(sess->ctrl_path,  64, "/plink_ctrl_%u",  sess->id);
+
+    int sfd = shm_open(sess->stats_path, O_CREAT|O_RDWR, 0660);
+    ftruncate(sfd, sizeof(plink_stats));
+    sess->stats = mmap(NULL, sizeof(plink_stats),
+                       PROT_READ|PROT_WRITE, MAP_SHARED, sfd, 0);
+    cudaHostRegister(sess->stats, sizeof(plink_stats),
+                     cudaHostRegisterMapped);
+    /* ctrl도 동일 */
+
+    /* ③ workload_desc to GPU */
+    cudaMalloc(&sess->desc_dev, sizeof(plink_workload_desc));
+    cudaMemcpy(sess->desc_dev, &in->desc, sizeof(plink_workload_desc),
+               cudaMemcpyHostToDevice);
+
+    /* ④ cudaLaunchKernel */
+    cudaStreamCreate(&sess->stream);
+    int n_blocks = sess->n_qids;
+    int threads  = WARP_SIZE * in->desc.warps_per_queue;
+    plink_kernel<<<n_blocks, threads, 0, sess->stream>>>(
+        sess->desc_dev, sess->qids, sess->n_qids,
+        sess->stats, sess->ctrl);
+
+    /* ⑤ 응답 — shm path 회신 (fio가 shm_open + mmap) */
+    in->session_id = sess->id;
+    strcpy(in->stats_shm_path,   sess->stats_path);
+    strcpy(in->control_shm_path, sess->ctrl_path);
+    memcpy(in->qids, sess->qids, sess->n_qids * sizeof(uint16_t));
+    in->qid_count = sess->n_qids;
+    fuse_reply_ioctl(req, 0, in, sizeof(*in));
+    return 0;
+}
+```
+
+#### session manager — STOP_WORKLOAD
+
+```c
+int handle_stop_workload(fuse_req_t req, void *arg) {
+    plink_workload_stop *in = arg;
+    plink_session *sess = session_lookup(in->session_id);
+    if (!sess) { fuse_reply_err(req, ENOENT); return -1; }
+
+    /* ① stop signal — kernel이 다음 polling tick에 감지 */
+    atomic_store(&sess->ctrl->stop_request, 1);
+
+    /* ② kernel exit 대기 */
+    cudaStreamSynchronize(sess->stream);
+    cudaStreamDestroy(sess->stream);
+
+    /* ③ qid pool 반납 */
+    io_queue_pool_release(sess->qids, sess->n_qids);
+
+    /* ④ shared memory 정리 */
+    cudaHostUnregister(sess->stats);
+    munmap(sess->stats, sizeof(plink_stats));
+    shm_unlink(sess->stats_path);
+    /* ctrl도 동일 */
+    cudaFree(sess->desc_dev);
+
+    /* ⑤ session_table 제거 */
+    session_free(sess);
+
+    fuse_reply_ioctl(req, 0, NULL, 0);
+    return 0;
+}
+```
+
+### 10.9 ⑨ Monitoring (ioctl handler + plink-stat)
+
+#### daemon ioctl handler
+
+```c
+int handle_query_inventory(fuse_req_t req, void *arg) {
+    plink_inventory *out = arg;
+
+    /* controller — resource cache */
+    out->ctrlr.state    = g_ctrlr_info.state;
+    out->ctrlr.capacity = g_ctrlr_info.capacity;
+    strncpy(out->ctrlr.model, g_ctrlr_info.model, sizeof(out->ctrlr.model));
+
+    /* namespaces */
+    out->n_namespaces = 0;
+    for (int i = 1; i <= g_ctrlr_info.num_ns; i++) {
+        if (g_ns_table[i].active)
+            out->namespaces[out->n_namespaces++] = (struct ns_summary){
+                .nsid     = i,
+                .blocks   = g_ns_table[i].blocks,
+                .lba_size = g_ns_table[i].lba_size,
+            };
+    }
+
+    /* IO queue pool */
+    out->qpool.total  = g_qpool.total;
+    out->qpool.idle   = atomic_load(&g_qpool.idle_count);
+    out->qpool.leased = atomic_load(&g_qpool.leased_count);
+
+    /* sessions — 각 세션의 host-pinned stats 직접 read */
+    pthread_rwlock_rdlock(&g_sessions.lock);
+    out->n_sessions = 0;
+    for (int sid = 0; sid < MAX_SESSIONS; sid++) {
+        plink_session *s = g_sessions.tbl[sid];
+        if (!s || s->state != RUNNING) continue;
+
+        plink_stats *st = s->stats;
+        out->sessions[out->n_sessions++] = (struct session_summary){
+            .sid             = s->id,
+            .pid             = s->client_pid,
+            .rw              = s->desc.rw,
+            .bs              = s->desc.bs,
+            .iodepth         = s->desc.iodepth,
+            .io_completed    = atomic_load(&st->io_completed),
+            .bytes_read      = atomic_load(&st->bytes_read),
+            .bytes_written   = atomic_load(&st->bytes_written),
+            .lat_avg_ns      = atomic_load(&st->lat_sum_ns)
+                             / max(1, atomic_load(&st->io_completed)),
+            .lat_p99_ns      = histogram_p99(st->lat_buckets),
+            .runtime_sec     = (now_ns() - s->start_tsc_ns) / 1e9,
+        };
+    }
+    pthread_rwlock_unlock(&g_sessions.lock);
+
+    /* SMART (cached) */
+    memcpy(&out->smart, &g_log_page_cache.smart, sizeof(out->smart));
+
+    fuse_reply_ioctl(req, 0, out, sizeof(*out));
+    return 0;
+}
+```
+
+#### plink-stat (외부 도구)
+
+```c
+int main(int argc, char **argv) {
+    int fd = open("/dev/plink0", O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+
+    plink_inventory inv;
+    if (ioctl(fd, PLINK_IOC_QUERY_INVENTORY, &inv) < 0) {
+        perror("ioctl"); return 1;
+    }
+    close(fd);
+
+    /* GPU 일반 정보 — NVML로 별도 조회 */
+    nvmlInit();
+    nvmlDevice_t gpu;
+    nvmlDeviceGetHandleByIndex(0, &gpu);
+    nvmlMemory_t      mem;  nvmlDeviceGetMemoryInfo(gpu, &mem);
+    nvmlUtilization_t util; nvmlDeviceGetUtilizationRates(gpu, &util);
+
+    /* 출력 */
+    printf("Controller %s — %s (%s)\n",
+           inv.ctrlr.dev_path, inv.ctrlr.model, state_str(inv.ctrlr.state));
+    printf("  Capacity: %.2f TB    Namespaces: %d\n",
+           inv.ctrlr.capacity / 1e12, inv.n_namespaces);
+
+    printf("\nIO Queue Pool (%d total)\n", inv.qpool.total);
+    printf("  IDLE: %d  LEASED: %d\n",
+           inv.qpool.idle, inv.qpool.leased);
+
+    printf("\nActive Sessions\n");
+    printf("  SID  PID    WORKLOAD                   IOPS    BW       LAT(avg/p99)\n");
+    for (int i = 0; i < inv.n_sessions; i++) {
+        struct session_summary *s = &inv.sessions[i];
+        double iops = s->io_completed / s->runtime_sec;
+        double bw   = (s->bytes_read + s->bytes_written) / s->runtime_sec;
+        printf("  %-3u  %-5d  %s bs=%u qd=%u  %.2fM   %.2f GB/s   %luμs/%luμs\n",
+               s->sid, s->pid,
+               rw_str(s->rw), s->bs, s->iodepth,
+               iops / 1e6, bw / 1e9,
+               s->lat_avg_ns / 1000, s->lat_p99_ns / 1000);
+    }
+
+    printf("\nGPU (NVML)\n");
+    printf("  device 0  SM %u%%  Mem %.1f / %.1f GB\n",
+           util.gpu, mem.used / 1e9, mem.total / 1e9);
+
+    nvmlShutdown();
+    return 0;
+}
+```
+
+### 10.10 GPU kernel 통합 진입점
+
+```c
+__global__ void plink_kernel(plink_workload_desc *desc,
+                             uint16_t *qids, uint32_t n_qids,
+                             plink_stats *stats, plink_control *ctrl) {
+    /* block 1개당 큐 1개 담당 — desc.warps_per_queue × WARP_SIZE threads */
+    uint32_t my_qid = qids[blockIdx.x % n_qids];
+    queue_state *q  = &g_queues[my_qid];
+    cid_pool    *cp = &g_cidpools[my_qid];
+
+    /* DMA buffer는 BaM이 미리 매핑한 GPU memory pool에서 per-thread 할당 */
+    void *dma_buf = bam_dma_buf_alloc(desc->bs);
+
+    /* 메인 worker loop (모듈 ⑥) */
+    worker_loop(desc, q, cp, dma_buf, stats, ctrl);
+
+    /* drain 후 자체 종료 → daemon이 cudaStreamSynchronize로 join */
+    bam_dma_buf_free(dma_buf);
+}
+```
+
+---
+
+## 11. 부록
+
+### 11.1 용어 정의
 
 | 용어 | 의미 |
 |------|------|
@@ -970,7 +1708,7 @@ struct plink_control {
 | **LEASE / IDLE** | parallelink IO queue pool 상태 |
 | **session_id (sid)** | parallelink 세션 식별자 (fio 인스턴스마다 발급) |
 
-### 10.2 약어
+### 11.2 약어
 
 - **POS**: PoseidonOS
 - **AIR**: Analytics In Real-time
@@ -985,7 +1723,7 @@ struct plink_control {
 - **TLP**: Transaction Layer Packet (PCIe)
 - **MMIO**: Memory-Mapped I/O
 
-### 10.3 관련 문서
+### 11.3 관련 문서
 
 - `parallelink/CLAUDE.md` — 도메인 지식 + 주석 작업 규칙
 - `parallelink/work.md` — 시행착오 로그 (구현 진행)
