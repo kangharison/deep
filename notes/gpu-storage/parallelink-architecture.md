@@ -552,6 +552,196 @@ nvme smart-log /dev/plink0                │                              │
 - BaM `include/queue.h` — host 측 큐 관리
 - POS `src/io_submit_interface/` — submit interface 추상화
 
+#### 5.1.1 동시성 모델 — SQ는 MPSC, CQ는 SPMC
+
+NVMe 큐는 양 끝에서 *비대칭* 동시성 패턴을 갖는다:
+
+```
+   Producer 측                          Consumer 측
+   ────────────                          ────────────
+   GPU warps (여러 개)  ─→  SQ  ─→     NVMe HW (1개)        ← MPSC
+   NVMe HW (1개)        ─→  CQ  ─→     GPU warps (여러 개)  ← SPMC
+```
+
+단순한 `atomicAdd`만으로 SQ tail을 진행하면 **doorbell이 미완성 SQE를 publish 할 위험**이 발생한다 — producer A가 slot 5 예약 후 SQE write를 끝내기 전에 producer B가 slot 6 예약·write·doorbell을 먼저 끝내면, NVMe가 slot 5의 쓰레기 SQE를 읽어간다.
+
+#### 5.1.2 두 가지 구현 옵션
+
+##### 옵션 A — Direct MPSC (rte_ring 식 이중 카운터)
+
+```c
+__device__ struct queue_state {
+    _Atomic uint32_t sq_reserve_tail;   /* 예약 tail (atomicAdd 점) */
+    _Atomic uint32_t sq_publish_tail;   /* publish tail (doorbell 대상) */
+    /* publish_tail ≤ reserve_tail 불변, doorbell은 publish_tail만 가능 */
+};
+
+/* Enqueue 4단계 */
+uint32_t ticket = atomicAdd(&q->sq_reserve_tail, 1);    /* 예약 */
+SQ[ticket % depth] = build_sqe(...);                    /* SQE write */
+__threadfence();
+while (atomicLoad(&q->sq_publish_tail) != ticket) { }   /* 자기 차례 spin */
+atomicStore(&q->sq_publish_tail, ticket + 1);           /* publish */
+if (last_in_batch) *q->sq_db_bar = ticket + 1;          /* doorbell */
+```
+
+##### 옵션 B — vSQ + Submitter (io_uring SQPOLL 패턴)
+
+MPSC 자체를 *회피*: producer 별 전용 vSQ(SPSC), 단일 submitter가 모든 vSQ를 sweep하여 real SQ로 옮김.
+
+```c
+__device__ struct vsq {              /* per-warp 전용 ring */
+    _Atomic uint32_t head;           /* submitter consumer */
+    _Atomic uint32_t tail;           /* producer */
+    struct nvme_sqe entries[VSQ_DEPTH];
+};
+__device__ struct vsq* g_vsqs[MAX_WARPS];
+
+/* producer (worker warp) — SPSC push, atomic 1회만 */
+__device__ void plink_submit(uint32_t warp_id, struct nvme_sqe sqe) {
+    struct vsq* v = g_vsqs[warp_id];
+    uint32_t t = v->tail;                              /* relaxed load */
+    while (t - v->head >= VSQ_DEPTH) /* 가득 차면 spin */;
+    v->entries[t % VSQ_DEPTH] = sqe;
+    __threadfence();
+    atomicStore_release(&v->tail, t + 1);              /* publish to submitter */
+}
+
+/* submitter — 단일 thread가 real SQ에 SPSC write */
+__device__ void submitter_loop(...) {
+    uint32_t lt = real_sq_tail;
+    for (;;) {
+        bool any = false;
+        for (int w = 0; w < num_warps; w++) {
+            uint32_t h = vsqs[w].head, t = atomicLoad(&vsqs[w].tail);
+            while (h != t) {
+                real_sq[lt % depth] = vsqs[w].entries[h % VSQ_DEPTH];
+                lt++; h++; any = true;
+            }
+            atomicStore_release(&vsqs[w].head, h);
+        }
+        if (any) {
+            __threadfence_system();
+            real_sq_tail = lt;
+            *sq_db_bar = lt % depth;                   /* doorbell 1회/sweep */
+        }
+    }
+}
+```
+
+**효과**: 모든 채널이 SPSC가 되어 atomic CAS·ABA·doorbell ordering 문제가 사라지고, doorbell이 sweep 단위로 자연 batching된다.
+
+#### 5.1.3 CPU 마이크로벤치마크 (`/tmp/sq_bench.cpp`)
+
+AMD Ryzen 5 5600G (4 cores), iters=20K/producer, SQ depth 8K, vSQ depth 64.
+
+##### 시나리오 ① UNIFORM (모든 producer 빈틈없이 enqueue)
+
+```
+prods   Direct(MOPS)   vSQ(MOPS)   vSQ/Direct
+──────────────────────────────────────────────
+1       170.6          50.9        0.30×
+2        34.0         205.9        6.06×
+4        12.6         135.6       10.73×
+6 *       0.01        171.1     13822×       ← Direct catastrophic collapse
+```
+
+*6 producers는 별도 측정 — Direct가 corecount 초과 시 lock-step starvation으로 50초 소요.*
+
+##### 시나리오 ② SKEWED (1/4 heavy + 3/4 light, 8:1)
+
+```
+prods   Direct(MOPS)   vSQ(MOPS)   vSQ/Direct
+──────────────────────────────────────────────
+2       25.3           84.3        3.34×
+4       39.1           68.7        1.76×
+```
+
+heavy producer 가 적어 contention 일부 완화 → 격차 작음. 그래도 vSQ 우위 유지.
+
+##### 시나리오 ③ BURST (32 enqueue 후 짧은 idle)
+
+```
+prods   Direct(MOPS)   vSQ(MOPS)   vSQ/Direct
+──────────────────────────────────────────────
+2       13.7           16.8        1.23×
+4       18.0           17.4        0.97×
+```
+
+burst 사이 idle이 throughput을 dominate → 차이 작음. 다만 producer-perceived latency는 vSQ가 fire-and-forget이라 응답성 우위 (throughput 측정에 안 잡힘).
+
+#### 5.1.4 핵심 발견
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ 1. Direct MPSC는 producers > cores 시 *catastrophic collapse*      │
+│    예: 1→2→4→6 producers : 170→34→12→0.01 MOPS                     │
+│    원인: predecessor publish 대기 spin이 lock-step starvation       │
+│    GPU 등가: warp 수가 SM의 atomic 처리율 한계 넘으면 동일 패턴      │
+│                                                                    │
+│ 2. vSQ+Submitter는 producer 수에 *둔감*                            │
+│    51 → 206 → 136 → 171 MOPS (변동 ±50%, 평균 plateau)             │
+│    SPSC 채널만 존재 → contention 자체가 없음                        │
+│                                                                    │
+│ 3. 단일 producer에선 vSQ가 *손해*                                   │
+│    Direct 170 vs vSQ 51 MOPS                                       │
+│    submitter copy step의 indirection 비용                           │
+│                                                                    │
+│ 4. burst·QoS 워크로드는 throughput보다 latency 측면에서 vSQ 우위     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.1.5 parallelink 적용 정책
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ workload_desc 설정              | 권장 패턴                        │
+├────────────────────────────────────────────────────────────────┤
+│ warps_per_queue == 1           | Direct (vSQ submitter overhead 회피)│
+│   (per-warp 큐, contention 0)   |                                  │
+├────────────────────────────────────────────────────────────────┤
+│ warps_per_queue 2~4            | Direct OK, contention 측정 권장   │
+├────────────────────────────────────────────────────────────────┤
+│ warps_per_queue ≥ 8            | vSQ + Submitter ★                 │
+│   (큐당 다수 warp 공유)          |                                   │
+├────────────────────────────────────────────────────────────────┤
+│ QoS · priority · rate limit 필요 | vSQ — submitter가 정책 일관 적용 │
+├────────────────────────────────────────────────────────────────┤
+│ debug · per-warp tracing 필요   | vSQ — submitter가 자연 통합 지점  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+##### parallelink kernel 내 배치
+
+`plink_kernel` 안에서 **block 0의 warp 0를 submitter로 박는다**:
+- 별도 kernel launch 불필요 (overhead 0)
+- nvme_state·queue_state·g_vsqs 가 같은 kernel context
+- supervisor (§5.1 GPU launcher) 가 cudaError 감시 시 자연스럽게 같이 잡힘
+
+```cuda
+__global__ void plink_kernel(...) {
+    if (blockIdx.x == 0 && warp_id == 0) {
+        submitter_loop(...);            /* 영속 — kernel 종료까지 sweep */
+        return;
+    }
+    /* 그 외 warps = worker = vSQ producer */
+    worker_loop(my_warp_id, ...);
+}
+```
+
+#### 5.1.6 vSQ depth 사이즈
+
+```
+   vSQ depth = 32~64 권장
+   
+   너무 작으면 (≤ 16): producer가 자주 stall (submitter 따라잡기 전 가득 참)
+   너무 크면 (≥ 256) : per-warp 메모리 비용 ↑, sweep 1회당 spike 처리량 변동 ↑
+   
+   메모리 비용:
+     vSQ entry = 64 B (NVMe SQE)
+     1024 warps × 64 entries × 64 B = 4 MiB (무시 가능)
+```
+
 ### 5.2 ② CID Manager (GPU kernel)
 
 **책임**:
@@ -818,6 +1008,129 @@ cache_pages[]·prp1[]·prp2[] 배열은 공유. 발급 메커니즘만 영역별
 - Ghemawat (2007) Google "TCMalloc: Thread-Caching Malloc"
 - Corbató (1968) "A Paging Experiment with the Multics System" (CLOCK 알고리즘 원전)
 - Qureshi et al. (2023) "BaM: GPU-Initiated On-Demand High-Throughput Storage Access", ASPLOS
+
+##### 5.3.1.9 Pool 고갈 처리 — Spill / Buddy / Lazy Carve
+
+워크로드 분포가 사이징과 어긋나면 한 class 풀이 비고 다른 class 는 남는다. 세 가지 처리 방식:
+
+```
+┌─[A] One-way upward spill (§6.3.4 의 단순 안전장치)──────────────┐
+│   class[k] 비면 class[k+1] 에서 1슬롯 사용 (메모리 일부 낭비)     │
+│   장점: 추가 atomic 0회, 코드 거의 그대로                         │
+│   단점: 8KB 요청에 16KB 슬롯 — 50% 낭비, 역방향 불가             │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─[B] 진짜 Buddy allocator (split/merge 양방향)──────────────────┐
+│   class[k] 비면 class[k+1] 1슬롯 split                           │
+│   class[k] 둘 다 free + buddy면 coalesce → class[k+1]            │
+│   장점: 메모리 100% 활용                                          │
+│   단점: GPU lock-free split/merge 매우 어려움                     │
+│         cascade 시 multi-step atomic → 사실상 spinlock 필요        │
+│         ABA 위험, 구현 라인 수 ~500+                              │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─[C] Lazy carve (★ 권장 절충)─────────────────────────────────┐
+│   하나의 backing region 에 4KB 단위 IOVA 사전 등록                │
+│   class별 free-stack 은 *시작 인덱스* 만 저장                       │
+│   고갈 시 큰 class 에서 1 슬롯 빌려와 N 개 작은 인덱스로 분할 push  │
+│   coalesce 안 함 — 단편화 누적 → fio 세션 종료 시 reset 으로 청소   │
+│   장점: B의 90% 이득, A 정도의 구현 복잡도                        │
+│   단점: 장기 실행 시 단편화 누적 (compactor 별도 필요)              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+##### 5.3.1.10 Lazy Carve 자료구조 + 코드
+
+핵심: 모든 class가 *같은 backing memory* 위의 *다른 인덱싱 스킴*. "128KB slot s" = 4KB 페이지 [s, s+31] 32개. 4KB 단위 IOVA 테이블만 있으면 어느 class 든 PRP 빌드 가능.
+
+```c
+struct buf_pool_unified_d {
+    void*     backing_base;             /* 단일 cudaMalloc */
+    uint64_t* prp1_4k;                  /* 4KB 단위 IOVA 테이블 (전역) */
+    uint32_t  n_pages_4k;
+
+    /* class별 free-stack — 시작 4KB 인덱스만 보관 */
+    struct {
+        _Atomic uint32_t top;
+        uint32_t*       indices;
+        uint32_t        capacity;
+        uint32_t        unit_4k;        /* 1=4K, 2=8K, 4=16K, 32=128K */
+    } cls[NUM_CLASSES];
+
+    int carve_donor[NUM_CLASSES];       /* 어느 class 에서 빌릴지 (보통 가장 큰) */
+};
+
+__device__ uint32_t plink_alloc_with_carve(struct buf_pool_unified_d* p, int cls)
+{
+    uint32_t idx = stack_pop(&p->cls[cls]);
+    if (idx != INVALID) return idx;                /* 정상 경로 */
+
+    /* 고갈 — donor class 에서 1 슬롯 carve */
+    int donor = p->carve_donor[cls];
+    uint32_t big = stack_pop(&p->cls[donor]);
+    if (big == INVALID) return INVALID;            /* 진짜 고갈 */
+
+    uint32_t units = p->cls[donor].unit_4k / p->cls[cls].unit_4k;  /* e.g., 32/2=16 */
+    uint32_t step  = p->cls[cls].unit_4k;
+    for (uint32_t i = 1; i < units; i++)
+        stack_push(&p->cls[cls], big + i * step);  /* 나머지 N-1 개 push */
+    return big;                                    /* 첫 번째는 그대로 사용 */
+}
+
+__device__ void plink_free_no_coalesce(struct buf_pool_unified_d* p,
+                                       int cls, uint32_t idx) {
+    stack_push(&p->cls[cls], idx);                  /* 원래 class 로 단순 push */
+    /* coalesce 시도 안 함 — atomic 0회 추가, 단순함 유지 */
+}
+```
+
+##### 5.3.1.11 단편화 처리 정책
+
+```
+   parallelink 워크로드 특성: fio 세션 단위로 시작·종료 명확
+   
+   Phase 1 (단편화 없음): 첫 fio 세션 — 모든 class 가 init 분배 그대로
+   Phase 2 (carve 발생): 워크로드 분포가 어긋난 class에서 lazy carve 발생
+   Phase 3 (단편화 누적): 큰 class 가 점차 작은 조각들의 묶음으로 변함
+   
+   대응: fio 세션 종료 시 (PLINK_IOC_STOP_WORKLOAD)
+         → 모든 class free-stack reset
+         → init 분배로 재초기화
+         → 다음 세션은 Phase 1 부터 시작
+   
+   장기 daemon (세션이 끊임없이 이어짐) 의 경우:
+         → CPU background compactor 스레드 (idle 시점에 합병)
+         → GPU lock-free buddy 보다 안전하고 단순
+```
+
+##### 5.3.1.12 carve 비용 분석
+
+```
+   정상 alloc:        atomic 1회 (BATCH refill 시만, Magazine 효과)
+   carve 이벤트:      donor pop 1회 + N-1 push 회 = atomic N회
+   
+   carve 빈도:
+     - 워크로드 분포 정확하면 거의 0
+     - 분포 어긋남 시 한 번 발생 후 *N-1 회는 정상 path*
+     - 평균적으로 (1 + N-1)/N = 1 atomic per slot — Magazine 과 동급
+```
+
+##### 5.3.1.13 단계적 적용 권장
+
+```
+   Phase 1 (MVP):       [A] one-way upward spill
+                        → 워크로드 프로파일링 → 풀 분배 결정
+                        → spill rate 카운터 노출
+
+   Phase 2 (운영):      [C] lazy carve
+                        → backing region 단일화
+                        → carve event count / class 별 모니터링
+                        → fio 세션 종료 시 reset 정책
+
+   Phase 3 (장기 daemon): [C] + CPU background compactor
+                          → idle 감지 시 free-stack 정리
+                          → GPU 측 lock-free buddy 는 검토만
+```
 
 ### 5.4 ④ Command Submitter (GPU kernel)
 
@@ -2329,9 +2642,11 @@ __global__ void plink_kernel(plink_workload_desc *desc,
 | 2026-04-29 | §5.7.1~5.7.3 Logger 상세 — host 라이브러리 후보, device-side ring buffer + CPU pull, globaltimer + ping-pong calibration |
 | 2026-04-29 | §6.3 Buffer Pool 사이징 가이드, SPDK vtophys 비교, spill 메커니즘 |
 | 2026-04-29 | §11.1 용어 보강 (CLOCK / Slab / Magazine / Size-class / globaltimer / NanoLog / affine fit), §11.4 참고문헌 추가 |
+| 2026-04-29 | §5.1.1~5.1.6 SQ 동시성 모델 (MPSC/SPMC) + Direct rte_ring vs vSQ+Submitter 비교 + CPU 마이크로벤치마크 3 시나리오(UNIFORM/SKEWED/BURST) + warps_per_queue 별 적용 정책 |
+| 2026-04-29 | §5.3.1.9~5.3.1.13 Pool 고갈 처리 — Spill/Buddy/Lazy Carve 비교, lazy carve 자료구조·코드, 단편화 처리 정책, 단계적 적용 |
 
 ---
 
 **작성일**: 2026-04-29
-**상태**: §5.3.1·§5.7.1~3·§6.3 보충 (allocator/logger/clock-sync 설계 결정 반영)
+**상태**: §5.1.1~6·§5.3.1·§5.7.1~3·§6.3 보충 (큐 동시성·allocator·logger·clock-sync·고갈처리 설계 결정 반영)
 **다음 갱신 예정**: 모듈별 구현 시작 시 각 모듈 섹션을 코드 위치로 보강
