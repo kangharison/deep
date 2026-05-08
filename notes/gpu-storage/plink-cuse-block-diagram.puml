@@ -1,0 +1,102 @@
+@startuml plink_cuse_block_diagram
+title plink_cuse 통합 — 블록 다이어그램 (구성요소와 관계)
+
+skinparam componentStyle rectangle
+skinparam linetype polyline
+
+' --- 색상 코딩 ---
+skinparam component {
+    BackgroundColor<<existing>> #E8E8E8
+    BackgroundColor<<new>>      #C8E6C9
+    BackgroundColor<<kernel>>   #FFF3CD
+    BackgroundColor<<hw>>       #F8D7DA
+    BorderColor<<new>> DarkGreen
+}
+skinparam interface {
+    BackgroundColor<<kernel>> #FFF3CD
+}
+
+' ====================================================================
+' USERSPACE
+' ====================================================================
+package "USERSPACE" {
+
+    package "Process A: 외부 도구\n(별도 프로세스)" {
+        [nvme-cli\n또는 fio passthru] as CLI    <<existing>>
+        [libnvme.so\n(linked)]        as LIBNVME <<existing>>
+        CLI --> LIBNVME
+    }
+
+    package "Process B: parallelink 호스트\n(libnvm + plink_cuse 동거)" {
+        component "parallelink.so" as PLSO <<existing>> {
+            [BaM Controller\n(libnvm 헤더 + libnvm.so)]   as CTRL    <<existing>>
+            [gpu_worker\npersistent kernel orchestrator]  as GW      <<existing>>
+            [libplink_cuse.a\nCUSE 핸들러 + worker thread] as PLCUSE  <<new>>
+        }
+        [libfuse3.so]    as LFUSE <<existing>>
+        [libcudart.so]   as LCUDA <<existing>>
+
+        CTRL ..> PLCUSE : plink_cuse_start(this)\n[BAM_USE_PLINK_CUSE 시]
+        PLCUSE --> LFUSE : cuse_lowlevel_*\nfuse_session_loop
+        PLCUSE ..> CTRL  : ctrl_ptr (void*)\nhandler 캐스팅 →\nnvm_admin_*
+        CTRL --> LCUDA   : cudaMemcpy/HostRegister
+        GW --> CTRL      : Controller* 사용
+        GW --> LCUDA     : cudaLaunchKernel
+    }
+}
+
+' ====================================================================
+' KERNEL
+' ====================================================================
+package "KERNEL (Ring 0)" {
+    [VFS]                         as VFS     <<kernel>>
+    [cuse.ko\n(Linux mainline)]   as CUSEK   <<kernel>>
+    [libnvm.ko\n(BaM 커널 모듈)]   as LIBNVMK <<kernel>>
+
+    interface "/dev/bam_ctrl0\n(char device)"  as DEVBAM    <<kernel>>
+    interface "/dev/cuse\n(FUSE 파이프)"        as DEVCUSE   <<kernel>>
+    interface "/dev/libnvm0\n(BAR 매핑용)"      as DEVLIBNVM <<kernel>>
+
+    VFS --> DEVBAM
+    DEVBAM --> CUSEK : fops dispatch
+    CUSEK <--> DEVCUSE
+    LIBNVMK --> DEVLIBNVM
+}
+
+' ====================================================================
+' HARDWARE
+' ====================================================================
+package "HARDWARE" {
+    node "NVMe SSD\n(PCIe BAR + DMA)"           as SSD <<hw>>
+    node "NVIDIA GPU\n(persistent kernel + GDR)" as GPU <<hw>>
+}
+
+' ====================================================================
+' Cross-boundary edges
+' ====================================================================
+LIBNVME --> VFS         : ioctl(NVME_IOCTL_*)
+LFUSE <--> DEVCUSE      : FUSE protocol\n(read/write on /dev/cuse fd)
+
+CTRL --> DEVLIBNVM      : open + mmap BAR
+LIBNVMK --> SSD         : PCIe register\n(stock nvme unbind →\n libnvm bind)
+
+CTRL --> SSD            : MMIO write\nSQ tail doorbell
+SSD  --> CTRL           : DMA write CQE +\nMSI-X (옵션)
+GPU  <--> SSD           : **PCIe P2P DMA**\n(BAM 핵심 — CPU 우회)
+PLSO --> GPU            : kernel launch
+GPU  --> PLSO           : completion notify
+
+' ====================================================================
+' Legend
+' ====================================================================
+legend right
+  | 색 | 의미 |
+  |<#C8E6C9>| **신규 코드** (feature/cuse) |
+  |<#E8E8E8>| 기존 코드 / upstream |
+  |<#FFF3CD>| 커널 (모듈/VFS/디바이스 노드) |
+  |<#F8D7DA>| 하드웨어 |
+  실선: 직접 호출/데이터 경로
+  점선: 옵션/조건부 (BAM_USE_PLINK_CUSE)
+endlegend
+
+@enduml
