@@ -1,0 +1,114 @@
+@startuml plink_cuse_nvme_flow
+title NVMe 명령 전달 경로: nvme-cli → /dev/bam_ctrlN → plink_cuse → libnvm → SSD
+
+skinparam sequenceMessageAlign direction
+skinparam ParticipantPadding 12
+skinparam BoxPadding 14
+
+box "Process A: 외부 도구" #LightBlue
+    participant "nvme-cli\n(또는 fio 등)" as CLI
+end box
+
+box "커널 공간" #LightYellow
+    participant "VFS\n(/dev/bam_ctrl0)" as VFS
+    participant "cuse.ko\n(char device 등록자)" as CUSE
+end box
+
+box "Process B: parallelink 호스트\n(libnvm + plink_cuse 동거)" #LightGreen
+    participant "FUSE 채널\n(/dev/cuse 위)" as FCH
+    participant "plink_cuse\nworker thread" as WK
+    participant "libnvm\n(BaM Controller)" as NVM
+end box
+
+participant "NVMe SSD\n(BAR0 + DMA)" as SSD
+
+== 1. 요청 발행 (사용자) ==
+
+CLI -> CLI : fd = open("/dev/bam_ctrl0")
+note left of CLI
+  cmd = struct nvme_passthru_cmd {
+    .opcode  = 0x06   // Identify
+    .nsid    = 0
+    .cdw10   = 1      // CNS = 1 (Controller)
+    .addr    = buf    // 4 KiB user buffer
+    .data_len= 4096
+  }
+end note
+CLI -> VFS : **ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd)**
+
+== 2. 커널이 cuse로 라우팅 ==
+
+VFS -> CUSE : char device fops dispatch\n(major/minor가 cuse 소속)
+CUSE -> FCH : FUSE_IOCTL 패킷 작성\n(cmd_no, in_buf=cmd 72B, out_bufsz=4096)
+note right of CUSE
+  cuse.ko는 단지
+  "/dev/cuse 파이프로
+   요청을 forward"하는 역할.
+  실제 의미 해석은 안 함.
+end note
+
+== 3. plink_cuse가 ioctl 핸들러 깨움 ==
+
+FCH -> WK : fuse_session_loop()의\nread()가 반환됨
+WK -> WK : cuse_lowlevel dispatch →\n**plink_cuse_ioctl(req, cmd_no, arg,\n                  fi, flags,\n                  in_buf, in_bufsz, out_bufsz)**
+WK -> WK : ctrl = (Controller*)\n    fuse_req_userdata(req)
+note right of WK
+  cmd_no == NVME_IOCTL_ADMIN_CMD ?
+    → admin path
+  cmd_no == NVME_IOCTL_IO_CMD ?
+    → I/O path
+  그 외 → fuse_reply_err(ENOTTY)
+end note
+
+== 4. libnvm으로 NVMe 명령 제출 ==
+
+WK -> NVM : nvm_admin_ctrl_info(\n    ctrl->aq_ref, &info,\n    prp1_va, prp1_ioaddr)
+NVM -> NVM : Admin SQ에 SQE 작성\n(opcode, PRP1, CID 할당)
+NVM -> SSD : **MMIO write**: SQ tail doorbell\n(BAR0 + 0x1000 + 2·sqid·stride)
+SSD -> SSD : Identify Controller 처리\n(컨트롤러 메타데이터 조립)
+
+== 5. SSD가 완료 통지 ==
+
+SSD -> NVM : **DMA write**: CQE → Admin CQ\n(+ optional MSI-X)
+NVM -> NVM : CQ poll 또는 IRQ 대기 →\nCID 매칭 → 결과 추출
+NVM -> SSD : MMIO write: CQ head doorbell
+NVM --> WK : return 0,\n*info 채워짐
+
+== 6. 응답이 사용자까지 거슬러 올라감 ==
+
+WK -> FCH : **fuse_reply_ioctl(req, 0,\n                  &info, sizeof(info))**
+FCH -> CUSE : FUSE_IOCTL_OUT 패킷
+CUSE -> VFS : ioctl 반환 (rc=0)\n+ out 버퍼를 사용자 메모리에 복사
+VFS --> CLI : ioctl returns 0\nbuf에 4 KiB Identify 데이터 적힘\ncmd.result = CQE dword0
+CLI -> CLI : nvme_show_id_ctrl(buf)\n→ stdout 출력
+
+== 에러 경로 (참고) ==
+
+note across
+  - cmd 미지원: plink_cuse_ioctl이 fuse_reply_err(ENOSYS) → ioctl이 -1/ENOSYS 반환
+  - libnvm 실패: NVM이 NVMe status code 반환 → handler가 cmd.result에 dword0 채우고 errno-style rc 회신
+  - cuse.ko 미로드: open("/dev/bam_ctrl0") 자체가 ENOENT (디바이스 자체가 없음)
+end note
+
+' --------------------------------------------------------------------
+' 핵심 포인트
+' --------------------------------------------------------------------
+' 1) cuse.ko는 메시지 운반자만 함 — NVMe를 모름. char device fops를
+'    받아 /dev/cuse 파이프로 FUSE 패킷 forward만 수행. 의미 해석은
+'    plink_cuse가 함.
+' 2) "in-process 통신처럼 보이는 IPC" — nvme-cli와 plink_cuse는
+'    별도 프로세스인데 사용자 입장에선 동기 ioctl처럼 보임. 사이에
+'    커널 + FUSE 큐가 있다는 점이 SPDK 스타일 cuse 디자인의 핵심.
+' 3) plink_cuse 핸들러는 ctrl_ptr만 가지고 있음 — Controller*를 void*로
+'    들고 있다가 핸들러에서 캐스팅. 자료형 의존성 0을 유지하면서
+'    backend와 연결되는 트릭 (libplink_cuse가 libnvm을 모름).
+' 4) MMIO와 DMA 방향 — SQ tail doorbell은 host→device MMIO write,
+'    CQE는 device→host DMA write. 각각 PCIe TLP 종류가 다름.
+' 5) FUSE_IOCTL_RETRY 협상 — 실제 구현 시 in_bufsz/out_bufsz가 0으로
+'    들어와서 1차 요청이 옴. NVMe cmd 구조체를 보고 필요한 크기를
+'    계산해 fuse_reply_ioctl_retry()로 재요청을 받는 단계가 추가됨.
+' 6) CQE dword 0 → cmd.result — NVMe completion의 dword0은 명령별
+'    의미(예: Get Features의 값). nvme-cli는 cmd.result에서 읽으므로
+'    핸들러가 채워줘야 함.
+
+@enduml
