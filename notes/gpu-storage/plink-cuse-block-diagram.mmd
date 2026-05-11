@@ -1,0 +1,91 @@
+%% plink_cuse 통합 — 블록 다이어그램 (구성요소와 관계)
+%% PUML → Mermaid 변환본 (원본: plink-cuse-block-diagram.puml)
+
+flowchart TB
+    %% =====================================================
+    %% USERSPACE
+    %% =====================================================
+    subgraph USERSPACE["USERSPACE"]
+        subgraph ProcA["Process A: 외부 도구 (별도 프로세스)"]
+            CLI["nvme-cli<br/>또는 fio passthru"]
+            LIBNVME["libnvme.so<br/>(linked)"]
+            CLI --> LIBNVME
+        end
+
+        subgraph ProcB["Process B: parallelink 호스트 (libnvm + plink_cuse 동거)"]
+            subgraph PLSO["parallelink.so"]
+                CTRL["BaM Controller<br/>(libnvm 헤더 + libnvm.so)"]
+                GW["gpu_worker<br/>persistent kernel orchestrator"]
+                PLCUSE["libplink_cuse.a<br/>CUSE 핸들러 + worker thread"]
+            end
+            LFUSE["libfuse3.so"]
+            LCUDA["libcudart.so"]
+
+            CTRL -. "plink_cuse_start(this)<br/>[BAM_USE_PLINK_CUSE 시]" .-> PLCUSE
+            PLCUSE -->|"cuse_lowlevel_xxx<br/>fuse_session_loop"| LFUSE
+            PLCUSE -. "ctrl_ptr (void)<br/>handler 캐스팅 →<br/>nvm_admin_xxx" .-> CTRL
+            CTRL -->|"cudaMemcpy/HostRegister"| LCUDA
+            GW -->|"Controller 사용"| CTRL
+            GW -->|"cudaLaunchKernel"| LCUDA
+        end
+    end
+
+    %% =====================================================
+    %% KERNEL (Ring 0)
+    %% =====================================================
+    subgraph KERNEL["KERNEL (Ring 0)"]
+        VFS["VFS"]
+        CUSEK["cuse.ko<br/>(Linux mainline)"]
+        LIBNVMK["libnvm.ko<br/>(BaM 커널 모듈)"]
+        DEVBAM(["/dev/bam_ctrl0<br/>(char device)"])
+        DEVCUSE(["/dev/cuse<br/>(FUSE 파이프)"])
+        DEVLIBNVM(["/dev/libnvm0<br/>(BAR 매핑용)"])
+
+        VFS --> DEVBAM
+        DEVBAM -->|"fops dispatch"| CUSEK
+        CUSEK <--> DEVCUSE
+        LIBNVMK --> DEVLIBNVM
+    end
+
+    %% =====================================================
+    %% HARDWARE
+    %% =====================================================
+    subgraph HARDWARE["HARDWARE"]
+        SSD["NVMe SSD<br/>(PCIe BAR + DMA)"]
+        GPU["NVIDIA GPU<br/>(persistent kernel + GDR)"]
+    end
+
+    %% =====================================================
+    %% Cross-boundary edges
+    %% =====================================================
+    LIBNVME -->|"ioctl(NVME_IOCTL_xxx)"| VFS
+    LFUSE <-->|"FUSE protocol<br/>(read/write on /dev/cuse fd)"| DEVCUSE
+
+    CTRL -->|"open + mmap BAR"| DEVLIBNVM
+    LIBNVMK -->|"PCIe register<br/>(stock nvme unbind →<br/>libnvm bind)"| SSD
+
+    CTRL -->|"MMIO write<br/>SQ tail doorbell"| SSD
+    SSD  -->|"DMA write CQE +<br/>MSI-X (옵션)"| CTRL
+    GPU  <==>|"PCIe P2P DMA<br/>(BAM 핵심 — CPU 우회)"| SSD
+    PLSO -->|"kernel launch"| GPU
+    GPU  -->|"completion notify"| PLSO
+
+    %% =====================================================
+    %% 색상 코딩 (Legend는 아래 클래스 정의로 대체)
+    %% 신규 코드 (feature/cuse) : 초록  #C8E6C9
+    %% 기존 코드 / upstream     : 회색  #E8E8E8
+    %% 커널 (모듈/VFS/디바이스) : 노랑  #FFF3CD
+    %% 하드웨어                 : 빨강  #F8D7DA
+    %% 실선: 직접 호출/데이터 경로
+    %% 점선: 옵션/조건부 (BAM_USE_PLINK_CUSE)
+    %% 굵은선(==): PCIe P2P DMA (BaM 핵심)
+    %% =====================================================
+    classDef existing fill:#E8E8E8,stroke:#666,color:#000
+    classDef new      fill:#C8E6C9,stroke:#1B5E20,stroke-width:2px,color:#000
+    classDef kernel   fill:#FFF3CD,stroke:#856404,color:#000
+    classDef hw       fill:#F8D7DA,stroke:#721C24,color:#000
+
+    class CLI,LIBNVME,CTRL,GW,LFUSE,LCUDA existing
+    class PLCUSE new
+    class VFS,CUSEK,LIBNVMK,DEVBAM,DEVCUSE,DEVLIBNVM kernel
+    class SSD,GPU hw
