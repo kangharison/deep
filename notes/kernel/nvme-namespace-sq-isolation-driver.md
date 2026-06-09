@@ -365,7 +365,26 @@ blk_mq_alloc_disk(ts, &lim, ns);
 
 ## 13. provisioning 순서 & 왕복 시나리오 (queue-first)
 
-**채택: queue-first** — IO 큐(그룹 tagset)를 먼저, ns 를 나중에. mainline 자연 순서(`ctrl->tagset` 먼저 → ns 스캔)를 tagset N개로 일반화. ns 스캔 시 tagset 준비됨 → 바인딩 즉시, deferred add_disk 불필요.
+### 13.0 디바이스 namespace vs block-layer gendisk (scan = mirror)
+**둘은 별개 객체이고 순서가 있다 — 디바이스가 먼저, block layer 가 그 미러.**
+
+| | 디바이스 namespace | block-layer gendisk |
+|--|-------------------|---------------------|
+| 정체 | 컨트롤러의 namespace(NSID) | `/dev/nvme0nX` = gendisk + request_queue |
+| 생성 주체 | orchestration (Admin 명령) | 커널 드라이버 (AEN 반응) |
+| 수단 | Namespace Mgmt Create(0x0D)+Attach(0x15) | `nvme_alloc_ns`→`blk_mq_alloc_disk`→`device_add_disk` |
+
+```
+① 디바이스: ns create&attach (Admin, orchestration)
+② AEN "NS Attribute Changed" → nvme_handle_aen_notice(core.c:4781)
+     → nvme_queue_scan(core.c:158) → queue_work(scan_work)   [비동기]
+③ nvme_scan_work(core.c:4519): 가드 state==LIVE && ctrl->tagset 있어야 진행
+     → nvme_scan_ns_list(CNS 0x02) → nvme_scan_ns → nvme_alloc_ns(core.c:4135)
+④ block layer: Identify Namespace(NVMSETID 읽음) → blk_mq_alloc_disk(tagset) → device_add_disk
+```
+- **비동기 디커플링**: ①과 ④는 원자적 아님(워크큐). 디바이스 ns 존재 후 gendisk 가 잠시 뒤 등장.
+- **scan = reactive mirror(양방향 reconciliation)**: 디바이스에 새 ns→gendisk 생성, 사라진 ns→gendisk 제거.
+- **우리 설계 연결**: tagset 바인딩(selector, core.c:4153)은 ④ block-layer 단계에서 일어나며 **디바이스가 준 NVMSETID** 를 읽어 그룹을 정한다. `nvme_scan_work` 가 `!ctrl->tagset` 이면 return 하므로 **queue-first 가 전제**(per-set SQ/tagset 선행).
 
 ### 정방향 (NVM Set 분할)
 ```
