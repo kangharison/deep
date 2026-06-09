@@ -182,10 +182,40 @@ ioctl(fd, CSQ_CREATE, {nvmset_id, qsize, qprio})
 
 > **QPRIO 주의**: WRR 은 `CAP.AMS` 광고 + `CC.AMS` 활성화 시에만 유효. 미지원 시 Round Robin 폴백.
 
-### 8.3 tagset 매핑 콜백
-- 그룹 전용 `.map_queues` 는 **그 Set 의 SQ들만**으로 CPU→hctx 맵 생성 → 다른 Set SQ 로 누수 없음.
-- `.init_hctx` 에서 `hctx->driver_data = group.sqs[hctx_idx]` 로 hctx↔SQ 결선.
-- `nr_hw_queues > 온라인 CPU` → 일부 hctx 유휴 또는 poll 용.
+### 8.3 tagset 매핑 콜백 — `.map_queues` / `.init_hctx` (한 쌍)
+
+둘은 제출 경로의 한 쌍이다. **같은 로컬 인덱스 j → `group->sqs[j]` 규약을 공유**해야 제출↔완료가 정합한다.
+```
+제출: CPU c → mq_map[c]=j → hctx j → group->sqs[j] → SQ write
+완료: 그 SQ → nvmeq->tags (§15)
+```
+- `set->driver_data = group` 으로 둬 두 콜백이 그룹에 접근. `set->nr_maps = 1`(phase1, DEFAULT만).
+- `.init_hctx`(§15): 로컬 j → `group->sqs[j]`, `hctx->driver_data=nvmeq`, `nvmeq->tags=hctx->tags`.
+
+**`.map_queues` 함정 — affinity 타일링 깨짐**: 그룹 SQ 는 전역 벡터의 부분집합(비연속 가능)이라, mainline 의 affinity 기반 `blk_mq_map_hw_queues` 를 그대로 쓰면 **그룹 벡터들의 affinity 가 전 CPU 를 못 덮어 일부 CPU 가 미매핑** → 그 CPU 가 ns 에 제출 불가(조용한 버그). mainline 단일 tagset 은 전 큐가 전 CPU 를 타일링하므로 빈틈이 없지만, 그룹 부분집합은 보장 못 함.
+
+**Phase 1 — 라운드로빈으로 전 CPU 커버 보장** (affinity 의존 제거):
+```c
+static void nvmset_map_queues(struct blk_mq_tag_set *set) {
+    struct nvmset_group *g = set->driver_data;
+    struct blk_mq_queue_map *map = &set->map[HCTX_TYPE_DEFAULT];
+    map->nr_queues    = g->nr_sqs;
+    map->queue_offset = 0;
+    blk_mq_map_queues(map);   /* CPU 0..nr_sqs-1 라운드로빈 → 전 CPU 커버, affinity 무관 */
+}
+```
+→ 모든 online CPU 가 그룹 SQ 에 매핑됨(§11 "격리 자동" 유지). 비용: 제출-완료 지역성 약화(완료 IRQ 는 SQ 벡터 effective-affinity CPU 에 떨어지고 blk-mq `SAME_COMP` 가 IPI 로 제출 CPU 에 되돌림).
+
+**Phase 2 최적화(후속)**: 그룹 벡터 affinity 를 전 CPU 타일링되게 배정(`group_cpus_evenly(g->nr_sqs)`) 후 affinity 기반 매핑 → 지역성 확보. per-group 벡터 affinity 배정 복잡도로 1단계 미포함.
+
+| | Phase1 라운드로빈 | Phase2 affinity |
+|--|------------------|-----------------|
+| 전 CPU 커버 | ✅ 보장 | 타일링 배정 필요 |
+| 제출-완료 지역성 | 약(IPI) | 강 |
+| 복잡도 | 낮음(한 줄) | 높음 |
+
+- **reset(P→D)**: per-set tagset 소멸 → ctrl->tagset 은 mainline `nvme_pci_map_queues` 그대로. per-set `.map_queues` 호출 안 됨.
+- **CPU hotplug / grow·shrink**: blk-mq 가 `.map_queues` 재호출(또는 `blk_mq_update_nr_hw_queues`) → 라운드로빈 재계산. affinity 비의존이라 견고.
 
 ---
 
@@ -464,7 +494,7 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq) {
 **착수 항목**
 1. 타깃 컨트롤러 capability: NVM Set 지원, `CAP.AMS`(WRR), 최대 IO 큐/MSI-X 벡터 수, "ns 0개 set 에 Create I/O SQ" 허용 여부.
 2. 큐 예산 분배 정책(균등/가중치) 택일.
-3. 1단계 상세: `nvmset_group` 필드 확정, ioctl 인터페이스, 그룹 전용 `.map_queues`/`.init_hctx`, `nvme_queue_tagset()` 재작성.
+3. 1단계 상세: `nvmset_group` 필드 확정, **private ioctl 인터페이스(`CSQ_CREATE/DELETE`)**, 그룹 전용 `.map_queues`(§8.3, 라운드로빈)/`.init_hctx`(§15)/`nvme_queue_tagset()`(§15) — 매핑·디먹스는 설계 완료, 남은 건 ioctl 인터페이스·자료구조 확정·벡터 예산.
 
 ---
 
