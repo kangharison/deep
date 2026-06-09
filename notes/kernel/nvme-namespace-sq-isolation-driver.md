@@ -250,7 +250,40 @@ thread 격리(후속): `cpuset` 으로 thread 그룹을 해당 set SQ 가 매핑
 [D] 그룹 삭제 : 소속 ns 전부 del_gendisk → free_tag_set → SQ/CQ 삭제 → 그룹 free
 ```
 
-**지킬 규칙**: ① Delete 는 **SQ→CQ 순** + in-flight drain 선행 ② tagset 해제는 묶인 gendisk 전부 제거 후 ③ MSI-X 벡터 회계 ④ **컨트롤러 reset(`nvme_reset_work`) 시 groups[] 보존 + SQ 를 NVMSETID 와 함께 재발행** ⑤ 생성/삭제 직렬화(control mutex) + `nvme_scan_work`/reset 조율.
+**지킬 규칙**: ① Delete 는 **SQ→CQ 순** + in-flight drain 선행 ② tagset 해제는 묶인 gendisk 전부 제거 후 ③ MSI-X 벡터 회계 ④ **컨트롤러 reset 정책은 아래 §12.1(Option B)** ⑤ 생성/삭제 직렬화(control mutex) + `nvme_scan_work`/reset 조율.
+
+### 12.1 컨트롤러 reset 정책 — Option B: baseline(ctrl->tagset) 복귀
+
+**전제 정정**: `nvme_dev_disable` 가 지우는 것은 **하드웨어 큐(nvme_queue)+MSI-X 벡터**뿐. `blk_mq_tag_set` 객체와 gendisk/request_queue 는 소프트웨어라 **살아남는다**(mainline 도 `ctrl->tagset` 을 free 하지 않고 `blk_mq_update_nr_hw_queues` 로 재매핑, `pci.c:3133-3151`). 따라서 "ctrl->tagset 으로 되돌린다"는 **강제가 아니라 정책 선택**이다.
+
+**채택 = Option B**: reset 은 per-set 오버레이를 걷어내고 baseline 으로 복귀한다. reset 복구가 **검증된 mainline default 경로**를 그대로 타므로 안전하고, 분할은 orchestration 이 `CSQ_CREATE` 로 재적용한다.
+
+**하드 제약**: blk-mq 는 살아있는 request_queue 를 다른 tagset 으로 **re-home 불가**. 따라서 ns 를 per-set→ctrl->tagset 으로 옮기려면 **`del_gendisk` 후 ctrl->tagset 위에 재생성**해야 한다(→ per-set device 노드 블링크 발생, 수용).
+
+두 케이스는 **하나의 경로로 통합**된다 — "per-set 오버레이가 있으면 걷어내고, 나머지는 mainline native":
+
+```
+nvme_reset_work:
+ [Case 1] ctrl->tagset 만 사용 중  → per-set 오버레이 없음 → 그대로 mainline native reset
+ [Case 2] per-set tagset 사용 중   → disable 단계에서 오버레이 해체:
+     1) per-set namespace 들 nvme_ns_remove (del_gendisk)         ← re-home 위해
+     2) per-set tagset 전부 blk_mq_free_tag_set + nvmset_group[] clear
+   ── 재가동(공통) ──
+     3) default IO 큐 재생성 (NVMSETID 없이, mainline) → ctrl->tagset blk_mq_update_nr_hw_queues
+     4) nvme_scan_work 재스캔 → nvme_alloc_ns:
+          selector 가 group 없음 확인 → ctrl->tagset 에 재바인딩 (자동 fallback)
+```
+
+**selector 가 fallback 을 흡수**한다(§5). group 을 clear 하면 ns 가 NVMSETID=k 를 보고해도 `find_group(k)==NULL` → ctrl->tagset:
+```c
+struct nvmset_group *g = find_group(ns->nvmset_id);          /* clear 후 NULL */
+struct blk_mq_tag_set *ts = (g && g->tagset_ready) ? &g->tagset : ctrl->tagset;
+blk_mq_alloc_disk(ts, &lim, ns);
+```
+→ 별도 "되돌리기 코드" 거의 불필요. group clear + per-set ns 재스캔이면 자동으로 baseline.
+
+> 주의: reset 후 제거된 per-set namespace 를 다시 올리려면 **reset 경로가 rescan 을 트리거**해야 함(mainline 은 reset 시 ns 를 제거하지 않으므로, 이 제거+재추가는 우리 추가 로직).
+> **Option A(분할 보존)** 대안: per-set tagset 유지 + 하드웨어 SQ 를 NVMSETID 로 재발행 + `blk_mq_update_nr_hw_queues` 재바인딩 → device 블링크 없으나 복구 경로 복잡. 본 설계는 단순·안전 우선으로 B 채택.
 
 ---
 
@@ -302,7 +335,7 @@ thread 격리(후속): `cpuset` 으로 thread 그룹을 해당 set SQ 가 매핑
 
 ### 처리할 갭 (누수 아님 — 예외/생애주기)
 - **G2 (NVM Set 미지원 컨트롤러)**: NVMSETID 무시 → 단일 그룹 degrade(=mainline) 또는 SW 라우팅만(하드웨어 미디어 격리 없음). 폴백 필수.
-- **G3 (reset/recovery)**: `nvme_create_io_queues`(`pci.c:2378`) 재생성 시 그룹 SQ 를 NVMSETID 와 함께 재발행.
+- **G3 (reset/recovery)**: Option B — reset 시 per-set 오버레이 해체 후 ctrl->tagset baseline 복귀(§12.1). per-set ns 는 del_gendisk→재스캔으로 ctrl->tagset 재생성.
 - **G5 (multipath/다중 컨트롤러 공유 ns)**: 같은 ns 가 각 컨트롤러에서 동일 NVM Set 그룹에 일관되게 매핑돼야 path 전환 시 격리 유지.
 - **G6 (설정 규율)**: 그룹 tagset 간 공유 태그(`BLK_MQ_F_TAG_HCTX_SHARED`) 금지.
 - **G7 (poll 예산)**: HIPRI 사용 시 그룹마다 poll 큐 별도 provision.
@@ -318,7 +351,7 @@ thread 격리(후속): `cpuset` 으로 thread 그룹을 해당 set SQ 가 매핑
 | **신규** ioctl 핸들러 `CSQ_CREATE/DELETE` | — | Create/Delete I/O SQ 발행 + group SQ 누적 + 매핑(§8) |
 | `pci.c:1524-1528` `nvme_queue_tagset()` | 완료를 `dev->tagset.tags[qid-1]` 단일 디먹스 | **qid→group→그룹 tagset** 해석 (G4, 1단계 핵심) |
 | teardown(큐 삭제) | reset 시 큐만 | **그룹 `free_tag_set` + qid 맵 리셋**(§13 조건 1·2) |
-| `nvme_reset_work` 복구 | dev->tagset 재매핑 | **groups[] 보존 + SQ NVMSETID 재발행**(§12 규칙 ④) |
+| `nvme_reset_work` 복구 | dev->tagset 재매핑 | **Option B: per-set 오버레이 해체 → ctrl->tagset baseline 복귀**(§12.1). Case2 는 per-set ns del_gendisk→재스캔 |
 
 > **1단계 핵심 난점 = G4 완료 디먹스**: per-set SQ 들의 완료를 올바른 그룹 tagset 으로 역매핑. `nvme_queue_tagset()` 가 qid 로 그룹을 찾도록 재작성해야 함.
 
@@ -341,7 +374,7 @@ thread 격리(후속): `cpuset` 으로 thread 그룹을 해당 set SQ 가 매핑
        - nvmset_group 도입, ioctl(CSQ_CREATE) + Create I/O SQ(NVMSETID)
        - core.c:4153 selector + lazy tagset 생성
        - ★ nvme_queue_tagset() qid→group 완료 디먹스 재작성 (핵심 난점)
-2단계: ns↔Set 자동 바인딩 + 동적 attach/teardown + reset 재발행
+2단계: ns↔Set 자동 바인딩 + 동적 attach/teardown + reset=baseline 복귀(§12.1 Option B)
 3단계: thread 격리 (cpuset cgroup)
 ```
 
