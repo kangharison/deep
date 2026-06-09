@@ -11,10 +11,26 @@
 ## 1. 목표와 범위
 
 - **목표**: namespace 별로 IO 큐(SQ)를 분리하고 tagset/driver SQ 를 모두 분리 → noisy-neighbor 격리. 추후 application thread 를 특정 namespace 큐에만 접근시키는 QoS 격리.
-- **구현 형태**: 커널 측 커스텀 드라이버(mainline `nvme-pci` fork/확장). `create io queue` 등은 **ioctl 로 전달**.
+- **구현 형태**: 커널 측 커스텀 드라이버(mainline `nvme-pci` fork/확장).
+- **제어 경로 = private path ioctl**: `create io queue` / `delete io queue` 는 **드라이버 전용(private) ioctl 인터페이스**로 전달(표준 nvme passthrough 가 아님). create 시 **NVMSETID 사용 여부를 인자로** 받음.
+- **★ NVMSETID all-or-nothing(이진 상태)**: create io queue 는 NVMSETID 를 쓰거나 안 쓰거나 둘 중 하나인데, **쓰기로 했으면 모든 IO 큐가 NVMSETID 를 쓴다(혼용 없음)**. 따라서 시스템은 두 상태 중 하나다:
+  - **State D(default)**: NVMSETID 없이 생성 → 모든 ns 가 `ctrl->tagset`(mainline 등가).
+  - **State P(partitioned)**: 전부 NVMSETID 로 생성 → 모든 ns 가 자기 set 의 `ns->tagset`. `ctrl->tagset` 은 dormant(ns 0).
 - **분할 키**: namespace 직접이 아니라 **NVM Set ID**. namespace 는 NVM Set 에 소속(`Identify Namespace` 의 NVMSETID).
-- **데이터패스**: blk-mq 제출/완료 경로 100% 재사용. 신규 작업은 "tagset 다중화 + 그룹별 매핑 + ns 바인딩 + ioctl 제어면"뿐.
+- **데이터패스**: blk-mq 제출/완료 경로 100% 재사용. 신규 작업은 "tagset 다중화 + 그룹별 매핑 + ns 바인딩 + private ioctl 제어면"뿐.
 - **범위 밖**: 유저스페이스(SPDK/VFIO) poll-mode.
+
+### 상태 전이 (이진)
+```
+State D (default)                       State P (partitioned)
+ 모든 ns → ctrl->tagset                  모든 ns → ns->tagset(group[k])
+ (mainline 등가)                         ctrl->tagset = dormant
+
+  ──[private ioctl: NVMSETID로 io queue 생성 + ns rescan]──►  (D→P)
+  ◄──[nvme_reset_work: device disable → NVMSETID 없이 재생성]── (P→D, §12.1 Option B)
+```
+- **D→P**: private ioctl 로 NVMSETID io 큐 생성 → **ns rescan 이 `ctrl->tagset` 이 아니라 `ns->tagset` 으로 바인딩**.
+- **P→D**: `nvme_reset_work` 의 device disable 초기화는 **NVMSETID 없는 io 큐 생성**이므로, 기존 `ns->tagset` 은 삭제되고 **`ctrl->tagset` 으로 복귀**.
 
 ---
 
@@ -61,7 +77,7 @@ nvme_dev (PCIe 컨트롤러 1개)
 | # | 결정 | 이유 |
 |---|------|------|
 | 1 | **모델 A**: NVM Set별 tagset, ns 1:(1\|N) 바인딩 | "tagset/SQ 모두 분리" 목표에 정확히 부합 |
-| 2 | **공용 overflow 없음**: ns 는 한 그룹에만 전속(전용 ∪ 기본 중 하나) | CID 충돌·커스텀 엔진·정합성 모호성 제거 |
+| 2 | **NVMSETID all-or-nothing(이진 상태 D/P)**: 혼용 없음. 공용 overflow 없음 | CID 충돌·커스텀 엔진·정합성 모호성 제거 (§1 상태 전이) |
 | 3 | **blk-mq 데이터패스 재사용** | `nvme_queue_rq` 무수정, tagset 다중화만 추가 |
 | 4 | **tagset 소유 = 영속 default + 일시 per-set** | probe 의 `ctrl->tagset` 을 기본 그룹으로 재활용, 침습 최소 |
 | 5 | **provisioning = queue-first** | tagset 이 ns 스캔 전에 준비 → 바인딩 즉시(mainline 동일 패턴) |
@@ -73,11 +89,12 @@ nvme_dev (PCIe 컨트롤러 1개)
 ```
 nvme_dev
  ├─ admin queue (qid 0)
- ├─ ctrl->tagset  ............... 기본 그룹(NVMSETID 0). 영속. probe 생성.
- ├─ group[1].tagset (NVMSETID 1)  per-set. 일시. ioctl 로 생성.
+ ├─ ctrl->tagset  ............... 기본 tagset. 영속(probe 생성). State D 에서 active / State P 에서 dormant.
+ ├─ group[1].tagset (NVMSETID 1)  per-set. 일시(private ioctl 로 생성, reset 시 소멸).
  └─ group[2].tagset (NVMSETID 2)  per-set. 일시.
 
- ns(NVMSETID 0) → ctrl->tagset      |  ns(NVMSETID k) → group[k].tagset
+ State D: 모든 ns → ctrl->tagset            (NVMSETID 미사용)
+ State P: 모든 ns → group[k].tagset         (NVMSETID 전면 사용, ctrl->tagset dormant)
 ```
 
 ---
@@ -137,7 +154,12 @@ struct nvme_dev {                     /* 확장 */
 
 ---
 
-## 8. 제어 경로 — ioctl + Create I/O SQ (NVMSETID)
+## 8. 제어 경로 — private ioctl + Create I/O SQ (NVMSETID)
+
+제어면은 **드라이버 전용(private) ioctl** 이다(표준 nvme passthrough 아님). 최소 동작:
+- `CSQ_CREATE {nvmset_id(opt), qsize, qprio}` — io 큐 생성. **nvmset_id 미지정이면 State D(ctrl->tagset), 지정이면 State P(per-set)**. all-or-nothing 이므로 한 세션 내 혼용 금지(드라이버가 거부).
+- `CSQ_DELETE {qid|nvmset_id}` — io 큐/그룹 삭제.
+- 큐 생애주기는 **반드시 이 private ioctl 경유**(§13 조건 3) — Create/Delete I/O SQ 발행과 tagset 생성/바인딩을 한 트랜잭션으로 묶어 bookkeeping 일관 보장.
 
 ### 8.1 큐 예산
 - 부팅 시 `nvme_set_queue_count()` 로 IO 큐 총량 N·MSI-X 벡터 수 확인.
