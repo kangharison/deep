@@ -20,17 +20,39 @@
 - **데이터패스**: blk-mq 제출/완료 경로 100% 재사용. 신규 작업은 "tagset 다중화 + 그룹별 매핑 + ns 바인딩 + private ioctl 제어면"뿐.
 - **범위 밖**: 유저스페이스(SPDK/VFIO) poll-mode.
 
-### 상태 전이 (이진)
+### 상태 전이 (이진) — 4전이 전체
+
 ```
 State D (default)                       State P (partitioned)
  모든 ns → ctrl->tagset                  모든 ns → ns->tagset(group[k])
- (mainline 등가)                         ctrl->tagset = dormant
+ (mainline 등가)                         ctrl->tagset = dormant(SQ 0)
 
-  ──[private ioctl: NVMSETID로 io queue 생성 + ns rescan]──►  (D→P)
-  ◄──[nvme_reset_work: device disable → NVMSETID 없이 재생성]── (P→D, §12.1 Option B)
+  ──[private ioctl: NVMSETID io 큐 생성 + ns rescan]──►  (D→P)
+  ◄──[nvme_reset_work: device disable → NVMSETID 없이 재생성]── (P→D)
+   ⟳ D→D (자기)                              ⟳ P→P (자기)
 ```
-- **D→P**: private ioctl 로 NVMSETID io 큐 생성 → **ns rescan 이 `ctrl->tagset` 이 아니라 `ns->tagset` 으로 바인딩**.
-- **P→D**: `nvme_reset_work` 의 device disable 초기화는 **NVMSETID 없는 io 큐 생성**이므로, 기존 `ns->tagset` 은 삭제되고 **`ctrl->tagset` 으로 복귀**.
+
+**상태 판정 기준**: "NVMSETID 로 만든 활성 그룹(per-set 큐)이 하나라도 있는가" → 있으면 **P**, 없으면 **D**.
+
+| 전이 | 트리거 | 동작 | 결과 |
+|------|--------|------|------|
+| **D→D** | (a) NVMSETID 없는 io 큐 create/delete (b) `nvme_reset_work` | (a) `ctrl->tagset` `blk_mq_update_nr_hw_queues`(mainline 큐 리사이즈) (b) mainline native reset(§12.1 Case1) | D 유지 |
+| **D→P** | NVMSETID io 큐 첫 생성 + ns rescan | per-set tagset 생성, ns→`ns->tagset` | P |
+| **P→P** | (a) 새 NVMSETID 그룹 신설 (b) 기존 그룹 grow/shrink (c) 그룹 삭제(≥1 잔존) | §12 lifecycle [A]/[B]/[C]/[D]. **모두 NVMSETID 사용** | P 유지 |
+| **P→D** | (a) `nvme_reset_work` (b) 명시적 전체 teardown 후 비-NVMSETID 재생성 | (a) §12.1 Option B (b) §13 역방향 | D |
+
+**자기 전이(D→D / P→P)에서 지켜야 할 고려사항**:
+1. **reset 은 항상 D 로 귀결** — State P 에서 `nvme_reset_work` 가 일어나면 **P→D**(P→P 아님). reset 은 분할을 보존하지 않는다(Option B). 즉 **P→P 트리거에 reset 은 없다**.
+2. **all-or-nothing 불변식 유지** — State P 안에서 **비-NVMSETID 큐 생성 시도는 드라이버가 거부**(P→mixed 불가). State D 안에서 NVMSETID 큐를 섞어 만들면 그건 D→P 진입이지 D→D 아님.
+3. **★ State P 의 selector fallback 금지(엣지)** — P 에서 `ctrl->tagset` 은 **dormant(SQ 0)**. 그런데 NVMSETID=k 인 ns 가 붙는데 group[k] 가 아직 없으면, selector 의 "fallback → ctrl->tagset" 이 **dormant tagset 에 바인딩 → IO 불가**가 된다. 따라서 **State P 에서는 fallback 을 ctrl->tagset 으로 보내지 말고 pending(rendezvous, 그룹 생성까지 대기)** 해야 한다. 판정식은 "ctrl->tagset 이 active(SQ>0)인가"로 통일:
+   ```c
+   g = find_group(ns->nvmset_id);
+   if (g && g->tagset_ready)        ts = &g->tagset;        /* per-set */
+   else if (ctrl_tagset_active())   ts = ctrl->tagset;      /* State D fallback (valid) */
+   else                             defer_ns(ns);           /* State P: 그룹 대기 (pending) */
+   ```
+4. **마지막 그룹 삭제(P)** — 활성 그룹이 0 이 되면 무큐 중간상태. 다음 create 가 NVMSETID 유무로 D/P 를 다시 결정. (reset 없이 P→D 로 가는 경로 = §13 역방향.)
+5. **D→D 큐 리사이즈** — State D 에서 NVMSETID 없는 큐 add/remove 는 mainline `nvme_pci_update_nr_queues` 그대로(ctrl->tagset 재매핑). 분할 로직 개입 없음.
 
 ---
 
@@ -106,12 +128,14 @@ nvme_dev
 - **`ns->tagset` 은 실체 소유가 아니라 selector** — `nvmset_id ? group[id].tagset : ctrl->tagset`.
 
 ```c
-/* nvme_alloc_ns, core.c:4153 (변경점) */
-struct blk_mq_tag_set *ts =
-        ns->nvmset_id ? &group[ns->nvmset_id].tagset   /* per-set (일시) */
-                      : ctrl->tagset;                    /* default (영속) */
+/* nvme_alloc_ns, core.c:4153 (변경점) — 상태 인지 selector (§1 자기전이 #3) */
+struct nvmset_group *g = find_group(ns->nvmset_id);
+if (g && g->tagset_ready)            ts = &g->tagset;     /* per-set (일시) */
+else if (ctrl_tagset_active())       ts = ctrl->tagset;  /* State D: 유효한 fallback */
+else                                 { defer_ns(ns); return; } /* State P: 그룹 대기(pending) */
 disk = blk_mq_alloc_disk(ts, &lim, ns);
 ```
+> 단순화하면 `nvmset_id ? group : ctrl->tagset` 이나, **State P 에서 group 미존재 시 dormant ctrl->tagset 로 떨어지면 IO 불가**(§1 자기전이 #3) → "ctrl->tagset active 여부"로 분기해 pending 처리.
 
 **dormant 주의**: 분할 상태(State1)에서 `ctrl->tagset` 은 활성 ns 0 + SQ 0 으로 dormant 가 된다. 구조체는 살리되 **hctx→nvme_queue 가 삭제된 SQ 를 가리키지 않게 quiesce/정리**한다. 이는 mainline reset 흐름(`nvme_dev_disable` 가 tagset 유지·SQ 만 재생성 후 `blk_mq_update_nr_hw_queues`)과 동일 패턴이라 검증된 길.
 
