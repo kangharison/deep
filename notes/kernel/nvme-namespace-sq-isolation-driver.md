@@ -342,22 +342,83 @@ blk_mq_alloc_disk(ts, &lim, ns);
 
 ---
 
-## 15. 코드 변경 지점 요약 (file:line)
+## 15. 완료 디먹스(completion demux) 상세 설계 — 1단계 핵심
+
+### 디먹스란
+CQ 에 올라온 완료(CQE)는 `command_id`(CID)만 담는다. 드라이버는 CID 로 **원래 `struct request` 를 역매핑**해 완료시킨다(= demultiplexing). 2단계:
+```
+CQE(qid, CID) ─① nvme_queue_tagset() (qid→tag 풀) ─② nvme_find_rq()=blk_mq_tag_to_rq() (CID→request)
+```
+CID 포맷(`nvme.h:650-657`): **`genctr(4b) | tag(12b)`**. tag=blk-mq tag(풀 내 유일), genctr=stale 탐지.
+
+### mainline 이 깨지는 이유
+`nvme_queue_tagset()`(`pci.c:1524-1528`): `return dev->tagset.tags[qid-1];` — **단일 tagset 가정**. 다중 tagset 에선 qid 는 전역, 각 그룹 `tags[]` 는 로컬 인덱스라 **엉뚱한 풀** 조회 → 다른 request 완료(정합성 붕괴) 또는 NULL(완료 유실/행). 조용히 깨지는 critical bug.
+
+### 설계: `hctx->tags` 를 nvme_queue 에 캐시
+핵심 통찰 — mainline `nvme_init_hctx_common`(`pci.c:638`)에 `WARN_ON(tags != hctx->tags)` 가 있다. 즉 **`hctx->tags` 가 그 hctx 의 올바른 풀**이고 blk-mq 가 init_hctx 전에 채워준다. 다중 tagset 에선 qid 공식은 틀리고 **`hctx->tags` 만 항상 옳다.** → **바인딩 시점에 캐시하고 완료 때 그대로 쓴다**(qid 역산 제거).
+
+```c
+/* 1) struct nvme_queue 에 캐시 필드 */
+struct blk_mq_tags *tags;   /* set: init_hctx, get: 완료 디먹스. 값=hctx->tags. reset 시 갱신 */
+
+/* 2) per-set 그룹 .init_hctx — 로컬 idx→그룹 SQ + tags 캐시 (set->driver_data=group) */
+static int nvmset_init_hctx(struct blk_mq_hw_ctx *hctx, void *data, unsigned int hctx_idx) {
+    struct nvmset_group *g = data;
+    struct nvme_queue *nvmeq = g->sqs[hctx_idx];   /* 전역 qid 아님 — 그룹 로컬 인덱스 */
+    nvmeq->tags = hctx->tags;                      /* ★ 디먹스용 정답 풀 캐시 */
+    hctx->driver_data = nvmeq;
+    return 0;
+}
+
+/* 3) nvme_queue_tagset 재작성 */
+static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq) {
+    if (!nvmeq->qid) return nvmeq->dev->admin_tagset.tags[0];
+    return nvmeq->tags;                            /* qid 산술 제거 */
+}
+/* 4) 기본 그룹(ctrl->tagset) init_hctx_common 도 nvmeq->tags=hctx->tags 로 통일 */
+```
+
+### 제출 ↔ 완료 정합
+```
+제출 group[k].hctx_j : tag←group[k].tagset.tags[j],  CID=genctr|tag,  SQ write
+                       ※ nvmeq->tags == group[k].tagset.tags[j] (init_hctx 캐시)
+완료 nvmeq.CQ        : tags=nvme_queue_tagset(nvmeq)=nvmeq->tags  → nvme_find_rq(tags,CID)
+```
+제출에서 tag 꺼낸 풀 = 완료에서 조회하는 풀 = 동일 `nvmeq->tags` → 항상 정확.
+
+### 캐시 방식 vs qid→group 룩업 테이블
+| | 캐시(권장) | 룩업 테이블 |
+|--|----------|-----------|
+| 완료 비용 | O(1) 역참조 | 매 완료 조회 |
+| 상태 동기화 | hctx->tags 재사용, 추가 0 | reset/teardown 마다 갱신 |
+| reset 복구 | init_hctx 재실행 시 자동 | 별도 재구축 |
+
+### 엣지
+- **admin(qid 0)**: `admin_tagset.tags[0]` 분기 유지.
+- **reset(Option B)**: 재바인딩 시 init_hctx 재실행 → tags 자동 갱신(자가복구). 큐 suspend 시 `nvmeq->tags=NULL` 클리어로 stale 방지.
+- **poll/HIPRI**: `nvme_poll_cq→nvme_handle_cqe→nvme_queue_tagset` 동일 경로.
+- **teardown 순서**: 큐 정지(Delete SQ/CQ) → free_tag_set. 순서 지키면 stale 접근 없음.
+- **genctr/CID 포맷 불변** — `nvme_find_rq` stale 탐지 유지.
+- **forward 전제**: init_hctx 가 `g->sqs[hctx_idx]` 읽음 → tagset 할당 전 그룹 SQ 존재(queue-first 보장, §9).
+
+---
+
+## 16. 코드 변경 지점 요약 (file:line)
 
 | 위치 | 현재 | 변경 |
 |------|------|------|
 | `pci.c:3136/3777` `nvme_alloc_io_tag_set` | `dev->tagset` 1개 할당(=기본 그룹) | **유지**(기본 그룹으로 재활용) |
 | `core.c:4153` `nvme_alloc_ns` `blk_mq_alloc_disk(ctrl->tagset)` | 모든 ns 가 ctrl->tagset | **selector 로 분기** + per-set tagset **lazy 생성**(§9) |
 | **신규** ioctl 핸들러 `CSQ_CREATE/DELETE` | — | Create/Delete I/O SQ 발행 + group SQ 누적 + 매핑(§8) |
-| `pci.c:1524-1528` `nvme_queue_tagset()` | 완료를 `dev->tagset.tags[qid-1]` 단일 디먹스 | **qid→group→그룹 tagset** 해석 (G4, 1단계 핵심) |
+| `pci.c:1524-1528` `nvme_queue_tagset()` + `pci.c:629` `init_hctx` | 완료를 `dev->tagset.tags[qid-1]` 단일 디먹스 | **init_hctx 에서 `nvmeq->tags=hctx->tags` 캐시 → 완료는 캐시 반환** (상세 §15, 1단계 핵심) |
 | teardown(큐 삭제) | reset 시 큐만 | **그룹 `free_tag_set` + qid 맵 리셋**(§13 조건 1·2) |
 | `nvme_reset_work` 복구 | dev->tagset 재매핑 | **Option B: per-set 오버레이 해체 → ctrl->tagset baseline 복귀**(§12.1). Case2 는 per-set ns del_gendisk→재스캔 |
 
-> **1단계 핵심 난점 = G4 완료 디먹스**: per-set SQ 들의 완료를 올바른 그룹 tagset 으로 역매핑. `nvme_queue_tagset()` 가 qid 로 그룹을 찾도록 재작성해야 함.
+> **1단계 핵심 난점 = 완료 디먹스(§15)**: per-set SQ 완료를 올바른 그룹 tag 풀로 역매핑. qid 산술을 버리고 init_hctx 에서 `hctx->tags` 를 nvme_queue 에 캐시하는 방식으로 재작성.
 
 ---
 
-## 16. 엣지/폴백 · 리스크
+## 17. 엣지/폴백 · 리스크
 
 - **MSI-X 벡터 한계** — 그룹을 잘게 쪼갤수록 그룹당 SQ 빈약(벡터가 상한).
 - **CPU > SQ** — 그룹 SQ 가 CPU 보다 적으면 `sq_lock` 경합 → 격리 부분화.
@@ -367,13 +428,13 @@ blk_mq_alloc_disk(ts, &lim, ns);
 
 ---
 
-## 17. 구현 로드맵 / 다음 단계
+## 18. 구현 로드맵 / 다음 단계
 
 ```
 1단계: NVM Set별 tagset + SQ 파티셔닝
        - nvmset_group 도입, ioctl(CSQ_CREATE) + Create I/O SQ(NVMSETID)
        - core.c:4153 selector + lazy tagset 생성
-       - ★ nvme_queue_tagset() qid→group 완료 디먹스 재작성 (핵심 난점)
+       - ★ 완료 디먹스 재작성: init_hctx 에서 nvmeq->tags=hctx->tags 캐시 (§15, 핵심 난점)
 2단계: ns↔Set 자동 바인딩 + 동적 attach/teardown + reset=baseline 복귀(§12.1 Option B)
 3단계: thread 격리 (cpuset cgroup)
 ```
