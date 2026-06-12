@@ -467,3 +467,236 @@ command_id(16비트) = | genctr(4비트) | tag(12비트) |
 ### 3.7 Phase 2 요약
 
 > `blk_mq_alloc_tag_set()`은 (a) 드라이버 요청값을 **검증이 아니라 보정**하고(절삭·반감), (b) IRQ affinity를 **복사**해 CPU→hctx 변환표를 만들고(`mq_map`), (c) hctx별 태그풀(sbitmap)과 request+iod 덩어리 풀을 **NUMA-로컬로 사전 할당**한다. hctx라는 객체는 하나도 만들지 않는다 — Phase 3가 NS마다 이 설계도를 실체화한다.
+
+---
+
+## 4. Phase 3 심화 — NS 스캔에서 request_queue·ctx·hctx 완성까지
+
+Phase 3는 두 세계에 걸쳐 있다: **NVMe 측**(스캔으로 NSID를 발견하고 NS 객체를 만드는 core.c)과 **blk-mq 측**(그 NS의 request_queue/ctx/hctx를 조립하는 blk-mq.c). 순서대로 따라간다.
+
+### 4.0 진입 — 누가 Phase 3를 트리거하는가 (스캔 경로)
+
+```
+nvme_start_ctrl() (core.c:5012)                    // probe 마지막 단계
+  └─ nvme_queue_scan(ctrl)
+       └─ if (state == LIVE && ctrl->tagset)        // core.c:163 ★ tagset 존재가 선행 조건
+            queue_work(nvme_wq, &ctrl->scan_work)   // core.c:164
+
+nvme_scan_work() (core.c:4519)                      // nvme_wq 워크 — 프로세스 컨텍스트, sleep 가능
+  └─ nvme_scan_ns_list() (core.c:4427)              // Identify(CNS 0x02) Active NSID List 순회
+       └─ NSID마다 nvme_scan_ns() (core.c:4332)
+            ├─ 이미 있는 NS → revalidate (크기/포맷 변경 반영)
+            └─ 새 NSID → nvme_alloc_ns() (core.c:4135)   ★ Phase 3 본체
+```
+
+두 가지 함의:
+- **Phase 2 → Phase 3 순서는 core.c:163의 `ctrl->tagset` 검사로 강제**된다. tagset 없이는 스캔 자체가 큐잉되지 않는다.
+- AEN(Namespace Attribute Changed)도 같은 `scan_work`를 큐잉한다 → **런타임 attach/detach도 부팅 스캔과 완전히 같은 경로**를 탄다. `nvme attach-ns`로 NS를 붙이면 그 순간 아래 전체 조립이 실행된다.
+
+### 4.1 NVMe 측 — `nvme_alloc_ns()` (core.c:4135) 단계별
+
+```
+nvme_alloc_ns(ctrl, info)
+  ├─ ① ns = kzalloc_node(..., ctrl->numa_node)              // 4143 NS 객체
+  ├─ ② disk = blk_mq_alloc_disk(ctrl->tagset, &lim, ns)     // 4153 ★ blk-mq 조립 (→ §4.2)
+  │       실패 시 ns만 해제하고 조용히 return — NS 하나의 실패가
+  │       컨트롤러 전체를 죽이지 않는다 (에러 격리)
+  ├─ ③ disk->fops = &nvme_bdev_ops; ns->queue = disk->queue // 4156~4160
+  ├─ ④ nvme_init_ns_head(ns, info)                          // 4164
+  │       NGUID/EUI64/UUID로 subsystem 전역에서 ns_head 탐색/생성
+  │       (멀티패스: 같은 NS를 보는 여러 ctrl 경로가 head 하나를 공유)
+  ├─ ⑤ disk_name 결정                                        // 4178~4188
+  │       멀티패스 멤버: "nvme0c0n1" + GENHD_FL_HIDDEN (head 디스크 뒤로 숨음)
+  │       일반:        "nvme0n1" (ctrl->instance + head->instance)
+  ├─ ⑥ nvme_update_ns_info(ns, info)                        // 4190
+  │       Identify NS 결과 → capacity, LBA 크기, queue_limits 적용
+  ├─ ⑦ ctrl->namespaces 리스트 등록                          // 4193~4204
+  │       namespaces_lock + NVME_CTRL_FROZEN 검사(4198):
+  │       리셋이 큐를 freeze한 뒤에는 새 NS 등록 거부 → 스캔↔리셋 데드락 회피
+  │       list 등록 후 synchronize_srcu(4204) — srcu 리더(설계 문서 §9.1)와의 정합
+  ├─ ⑧ device_add_disk()                                    // 4207
+  │       ★ /dev/nvme0n1 이 유저스페이스에 노출되는 순간 (udev 이벤트, 파티션 스캔)
+  └─ ⑨ nvme_add_ns_cdev(ns)                                 // 4211
+          /dev/ng0n1 캐릭터 디바이스 — io_uring passthrough 진입점 (ioctl.c:673)
+```
+
+실패 시 `out_*` 라벨 체인이 **등록의 정확한 역순**으로 해제한다 (4218~4247) — list_del_rcu + synchronize_srcu → ns_head 참조 반납 → put_disk → kfree.
+
+### 4.2 `blk_mq_alloc_disk` → `blk_mq_alloc_queue` (blk-mq.c:4437)
+
+```c
+lim->features |= BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;       // 4446
+if (set->nr_maps > HCTX_TYPE_POLL)                          // 4447 — poll 맵이 있으면
+        lim->features |= BLK_FEAT_POLL;                     //   이 NS는 IOPOLL 지원으로 표시
+q = blk_alloc_queue(lim, set->numa_node);                   // 4450 — q 골격 + q_usage_counter
+q->queuedata = queuedata;                                   // 4453 — ns 포인터 (완료 경로에서 회수)
+ret = blk_mq_init_allocated_queue(set, q);                  // 4454 ★ 조립 본체 (§4.3)
+```
+
+- Phase 2의 `nr_maps`(=poll 큐 유무)가 **NS의 기능 플래그(`BLK_FEAT_POLL`)로 전파**되는 지점. `poll_queues=0`이면 모든 NS에서 io_uring IOPOLL이 불가능해지는 인과가 여기다.
+- `blk_alloc_queue`가 만드는 `q_usage_counter`(percpu_ref)가 §5.7 freeze 게이트의 그 카운터다 — request_queue가 생기는 순간부터 freeze 가능.
+- `__blk_mq_alloc_disk`(4490)는 q 위에 gendisk 껍데기(`__alloc_disk_node`, 4501)를 씌울 뿐이다.
+
+### 4.3 `blk_mq_init_allocated_queue` (blk-mq.c:4651) — 5개 서브스텝 내부
+
+#### ⓐ `blk_mq_alloc_ctxs` (4381) — per-CPU SW큐 생성
+
+```c
+ctxs->queue_ctx = alloc_percpu(struct blk_mq_ctx);          // 4390 — CPU마다 1개, 캐시라인 정렬
+```
+
+`struct blk_mq_ctx`(block/blk-mq.h:19)의 실체:
+
+```c
+struct blk_mq_ctx {
+        struct {
+                spinlock_t       lock;
+                struct list_head rq_lists[HCTX_MAX_TYPES];  // ★ 타입별(DEFAULT/READ/POLL) 적재 리스트
+        } ____cacheline_aligned_in_smp;
+        unsigned int     cpu;                               // 소속 CPU 번호
+        unsigned short   index_hw[HCTX_MAX_TYPES];          // hctx->ctxs[] 안에서 내 위치 (역참조)
+        struct blk_mq_hw_ctx *hctxs[HCTX_MAX_TYPES];        // ★ 타입별 담당 hctx — 제출 fast path가 읽는 곳
+        struct request_queue *queue;
+};
+```
+
+`rq_lists`가 **타입별 3개**인 이유: 같은 CPU에서 나온 IO라도 read/poll 여부에 따라 다른 hctx로 가므로, 적재 단계부터 분리해야 dispatch 시 섞이지 않는다. per-CPU 구조라 제출 적재에 CPU 간 락 경합이 없다.
+
+#### ⓑ `blk_mq_realloc_hw_ctxs` (4639 → 4569) — hctx 실체화
+
+```c
+/* (1) q->queue_hw_ctx 포인터 배열 확보 — RCU 교체 (4578~4592) */
+new_hctxs = kcalloc_node(set->nr_hw_queues, ...);
+rcu_assign_pointer(q->queue_hw_ctx, new_hctxs);
+kfree_rcu_mightsleep(hctxs);     // 옛 배열을 읽는 중인 컨텍스트의 UAF 방지
+                                 // (첫 생성 때는 NULL이라 그냥 새 배열)
+
+/* (2) hctx_idx = 0..nr_hw_queues-1 마다 (4595~4615) */
+int node = blk_mq_get_hctx_node(set, i);      // ★ mq_map 역조회 — hctx 메모리도
+                                              //   "그 큐를 쓸 CPU의 NUMA 노드"에 배치 (Phase 2와 동일 원리)
+hctxs[i] = blk_mq_alloc_and_init_hctx(set, q, i, node);   // 4535
+```
+
+`blk_mq_alloc_and_init_hctx`(4535)는 2단 구성:
+
+**1단 — 객체 확보**: 먼저 `q->unused_hctx_list`에서 같은 노드의 죽은 hctx 재사용 시도(4542~4551 — `update_nr_hw_queues` 반복 시 할당 비용 절감), 없으면 `blk_mq_alloc_hctx`(4048)로 신규 할당:
+
+| 필드 (4048~4094) | 역할 |
+|------|------|
+| `cpumask` | 이 hctx를 쓰는 CPU 집합 (ⓓ에서 채움) |
+| `run_work` | 비동기 dispatch 워커 (`blk_mq_run_work_fn`) |
+| `dispatch` + `lock` | 디스패치 실패분 보관 리스트 (BLK_STS_RESOURCE 재시도용) |
+| `ctxs[]` | 매핑된 ctx 역참조 배열 — **nr_cpu_ids 크기로 선할당**(4080, 런타임 재할당 회피) |
+| `ctx_map` (sbitmap) | "어느 ctx에 일감이 쌓였나" 비트맵(4085) — dispatch가 빈 ctx를 안 뒤지게 |
+| `dispatch_wait` | 태그 고갈 시 잠들 대기 엔트리(4091) |
+
+**2단 — `blk_mq_init_hctx`(4013)**: 자원 연결 3종.
+
+```c
+hctx->fq = blk_alloc_flush_queue(hctx->numa_node, set->cmd_size, gfp);  // 4019
+/* ★ flush/FUA 전용 request가 hctx마다 1개 별도 존재. cmd_size 포함이므로
+ *   flush_rq에도 nvme_iod가 붙는다. 일반 태그풀 밖의 예약 request —
+ *   태그 고갈 상태에서도 flush는 진행 가능해야 하므로 */
+hctx->tags = set->tags[hctx_idx];                                       // 4025 ★ Phase 2 태그풀 연결
+set->ops->init_hctx(hctx, set->driver_data, hctx_idx);                  // 4027 → nvme_init_hctx
+blk_mq_init_request(set, hctx->fq->flush_rq, hctx_idx, ...);            // 4031 flush_rq도 iod 초기화
+```
+
+NVMe 콜백 `nvme_init_hctx`(pci.c:655) → `nvme_init_hctx_common`(pci.c:629):
+
+```c
+struct nvme_queue *nvmeq = &dev->queues[qid];        // pci.c:633  qid = hctx_idx + 1 (선형 가정)
+tags = qid ? dev->tagset.tags[qid - 1] : ...;        // pci.c:637
+WARN_ON(tags != hctx->tags);                         // pci.c:638  선형 가정 정합성 자가검증
+pools = nvme_setup_descriptor_pools(dev, hctx->numa_node);  // pci.c:639 PRP/SGL dma_pool
+hctx->driver_data = nvmeq;                           // pci.c:644 ★★★ 두 세계의 결합점
+```
+
+**실패 시 폴백 사다리**(4606~4626): 새 노드 할당 실패 → 옛 노드로 재시도(4611) → 그래도 실패면 만들어진 데까지만 `q->nr_hw_queues`로 유지(4620~4626). hctx 생성 실패는 치명상이 아니라 **축소 운영**으로 흡수된다. 마지막으로 cpuhp(CPU hotplug) 콜백 등록(4644~4648) — CPU가 꺼질 때 그 hctx의 잔여 작업을 다른 CPU로 옮기는 핸들러.
+
+#### ⓒ `blk_mq_init_cpu_queues` (4108) — ctx 초기화 + hctx 노드 보정
+
+```c
+for_each_possible_cpu(i) {
+        __ctx->cpu = i;  rq_lists 초기화;  __ctx->queue = q;     // 4119~4124
+        for (j = 0; j < set->nr_maps; j++) {                     // 4130~4134
+                hctx = blk_mq_map_queue_type(q, j, i);
+                if (nr_hw_queues > 1 && hctx->numa_node == NUMA_NO_NODE)
+                        hctx->numa_node = cpu_to_node(i);        // 첫 매핑 CPU의 노드로 보정
+        }
+}
+```
+
+#### ⓓ `blk_mq_map_swqueue` (4192) — mq_map "사본 배포" (3라운드)
+
+**R1 — 리셋**(4200~4204): 전 hctx의 `cpumask`/`nr_ctx` 클리어. 재진입(remap) 대비 멱등성 확보.
+
+**R2 — 정방향+역방향 배선**(4211~4258): `for_each_possible_cpu × nr_maps`:
+
+```c
+hctx_idx = set->map[j].mq_map[i];                    // 4220 Phase 2 변환표 조회
+ctx->hctxs[j] = blk_mq_map_queue_type(q, j, i);      // 4234 ★ 정방향 — 제출 경로가 읽는 포인터
+cpumask_set_cpu(i, hctx->cpumask);                   // 4243 역방향 ① 이 hctx의 CPU 집합
+ctx->index_hw[hctx->type] = hctx->nr_ctx;            // 4245 역방향 ② ctx_map 비트 위치
+hctx->ctxs[hctx->nr_ctx++] = ctx;                    // 4246 역방향 ③ dispatch 순회용
+```
+
+엣지 케이스 두 개가 중요하다:
+- `map[j].nr_queues == 0`이면 그 타입은 **DEFAULT hctx로 폴백**(4215~4218) — read 맵이 비면 read IO도 default 큐로 간다.
+- 태그 없는 hctx를 만나면 lazy 할당 시도, 실패 시 `mq_map[i] = 0`으로 **hctx 0에 강제 폴백**(4222~4231). 그래서 hctx 0의 태그는 절대 회수하지 않는다(4268~4271 주석 "Never unmap queue 0").
+
+**R3 — 마무리**(4260~4307): `nr_ctx == 0`인 hctx(매핑된 CPU가 없음)는 태그 반납 후 비활성(4267~4277), `sbitmap_resize(&hctx->ctx_map, nr_ctx)`(4287 — 매핑 수만큼만), isolated CPU를 cpumask에서 제거(4295~4300, nohz_full 환경 보호), 라운드로빈 시작점 `next_cpu` 초기화(4305).
+
+#### ⓔ `blk_mq_add_queue_tag_set` (4359) — tagset 가입과 **shared 전환**
+
+```c
+if (!list_empty(&set->tag_list) &&                   // 4367 ★ 이미 다른 NS가 등록돼 있으면
+    !(set->flags & BLK_MQ_F_TAG_QUEUE_SHARED)) {
+        set->flags |= BLK_MQ_F_TAG_QUEUE_SHARED;     // "태그 공유 모드" 진입
+        blk_mq_update_tag_set_shared(set, true);     // 기존 NS들의 hctx에도 소급 적용
+}
+list_add_tail_rcu(&q->tag_set_list, &set->tag_list); // 4375 tagset의 NS 목록에 합류
+```
+
+**두 번째 NS가 등록되는 순간이 분수령**이다. `TAG_QUEUE_SHARED`가 켜지면 태그 할당이 `active_queues` 기반 공정 분배 모드로 바뀐다 — hctx당 태그를 통째로 쓰지 못하고 활성 큐 수로 나눈 몫(`hctx_may_queue`)까지만 가져간다. 즉:
+- NS 1개: 태그 1023개를 혼자 씀 (검사 오버헤드도 없음)
+- NS 2개 (둘 다 활성): 각자 ~511개 상한 — **NS를 붙이기만 해도 기존 NS의 실효 depth가 줄 수 있다.**
+이것이 공유 tagset 모델에서 NS 간 간섭의 공식 메커니즘이고, [[nvme-queue-mgmt-design]] §9.6 per-NS tagset 분리가 해소하는 대상 중 하나다.
+
+### 4.4 타임라인 요약 — NS 1개가 온라인되기까지
+
+```
+scan_work(프로세스 컨텍스트)
+   │ Identify NSID List → 새 NSID 발견
+   ▼
+nvme_alloc_ns ──② blk_mq_alloc_disk ──> blk_mq_init_allocated_queue
+   │                                       ├ ⓐ ctx percpu 할당      (그릇)
+   │                                       ├ ⓑ hctx 할당 + init_hctx (★ nvmeq 결합)
+   │                                       ├ ⓒ ctx 초기화/노드 보정
+   │                                       ├ ⓓ mq_map → ctx->hctxs 배선 (★ 사본 배포)
+   │                                       └ ⓔ tag_list 가입        (★ shared 전환 판정)
+   ├─④ ns_head 연결(멀티패스 정체성)
+   ├─⑥ Identify NS → capacity/limits
+   ├─⑦ ctrl->namespaces 등록 (srcu)
+   ├─⑧ device_add_disk  ──→ /dev/nvme0n1 노출, udev, 파티션 스캔
+   └─⑨ cdev 등록        ──→ /dev/ng0n1 (uring passthrough)
+```
+
+이 순서의 의미: **blk-mq 배선(ⓐ~ⓔ)이 끝난 뒤에야 디스크가 노출**되므로, 유저스페이스의 첫 IO가 도착하는 시점에는 ctx→hctx→nvmeq 경로가 항상 완성돼 있다. 반쯤 조립된 큐로 IO가 들어올 창이 구조적으로 없다.
+
+### 4.5 Phase 3 종료 시점의 불변식 (invariants)
+
+| 불변식 | 성립 근거 | 깨지는 조건 |
+|--------|----------|------------|
+| 모든 NS의 hctx_i ↔ `dev->queues[i+1]` 동일 결합 | `nvme_init_hctx`의 `hctx_idx+1` (pci.c:658) | 설계 문서 §5.6 indirection 도입 시 |
+| `q->nr_requests == set->queue_depth` (전 NS 동일) | blk-mq.c:4686 | tagset 재할당 없이는 불변 |
+| NS ≥ 2 → `TAG_QUEUE_SHARED` (태그 공정 분배) | blk-mq.c:4367~4374 | NS가 1개로 줄어도 해제됨 |
+| hctx마다 flush_rq 1개 (태그풀 밖, iod 포함) | blk-mq.c:4019/4031 | — |
+| hctx 0은 항상 태그 보유 (폴백 보장) | blk-mq.c:4268~4273 | — |
+| ctx의 `hctxs[]`는 mq_map의 사본 | blk-mq.c:4234 | remap(ⓑ~ⓓ 재실행) 전까지 |
+
+`blk_mq_update_nr_hw_queues`(설계 문서 §5.3)가 하는 "재매핑"의 정체가 이제 정확해진다: **freeze 하에서 tag_list의 모든 NS에 대해 ⓑ(realloc_hw_ctxs)~ⓓ(map_swqueue)를 다시 실행해 위 사본들을 새 토폴로지로 갱신하는 것**이다.
+
+### 4.6 Phase 3 요약
+
+> Phase 3는 스캔이 NSID를 발견할 때마다 (a) NVMe 측에서 NS 객체·ns_head·디바이스 노드를 만들고, (b) blk-mq 측에서 tagset 설계도를 실체화한다 — per-CPU ctx를 깔고, hctx를 NUMA-로컬로 만들어 `init_hctx`로 `nvme_queue`에 결합하고, mq_map을 ctx에 사본 배포하고, tag_list에 가입시킨다. **두 번째 NS부터는 태그 공유 모드가 켜져 NS 간 태그 경쟁이 시작**되며, 모든 NS가 같은 hctx_idx→qid 선형 결합을 복제하므로 NS와 SQ의 분리는 이 구조 안에서는 발생할 수 없다.
