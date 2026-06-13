@@ -49,16 +49,24 @@ gids/
 └── bam/                        ← BaM 서브모듈 (외부 의존성)
 ```
 
-## 분석 문서 목록
-| 번호 | 문서 | 내용 |
-|------|------|------|
-| 00 | [comprehensive-architecture.md](00-comprehensive-architecture.md) | 전체 아키텍처 A-Z |
-| 01 | [initialization-flow.md](01-initialization-flow.md) | 초기화: Controller → PageCache → Array |
-| 02 | [feature-read-flow.md](02-feature-read-flow.md) | GPU Feature Read 전체 경로 |
-| 03 | [cache-and-cpu-buffer.md](03-cache-and-cpu-buffer.md) | Page Cache + CPU Backing Buffer |
-| 04 | [window-buffering-and-accumulator.md](04-window-buffering-and-accumulator.md) | Window Buffering & Storage Accumulator |
-| 05 | [dgl-integration.md](05-dgl-integration.md) | DGL DataLoader 통합 구조 |
-| 06 | [heterogeneous-graph-support.md](06-heterogeneous-graph-support.md) | 이종 그래프 지원 |
-| 07 | [bam-vs-gids-comparison.md](07-bam-vs-gids-comparison.md) | BaM 원본 vs GIDS 차이 분석 |
-| 08 | [training-pipeline-e2e.md](08-training-pipeline-e2e.md) | 학습 파이프라인 End-to-End |
-| 09 | [api-reference.md](09-api-reference.md) | Python/CUDA API 레퍼런스 |
+## 분석 문서
+
+| 문서 | 내용 |
+|------|------|
+| [gids-complete-architecture.md](gids-complete-architecture.md) | **완전 아키텍처 통합 문서** — 이 파일 하나로 전체 이해 (1,170줄) |
+
+### 문서 구성 (14개 섹션)
+1. 문제 정의 (기존 병목 vs GIDS 해결)
+2. 전체 시스템 레이어 (Python → C++/CUDA → BaM → 하드웨어)
+3. 핵심 자료구조 관계도
+4. 초기화 플로우 (Controller → PageCache → Range → Array → CPU 버퍼)
+5. 학습 1 Iteration 완전 호출 체인 + Sequence 다이어그램
+6. 3가지 Feature Read 경로 (BaM 직접 / CPU 버퍼 hybrid / Window Buffering)
+7. GPU 커널 내부 (Block/Warp 매핑, bam_ptr.read 동작)
+8. BaM I/O 경로 (SQE 구조, doorbell, P2P DMA, STRIPE LBA)
+9. Window Buffering & Storage Access Accumulator
+10. 이종 그래프 지원 (key_offset 매핑, 다중 스트림 병렬 처리)
+11. Feature 쓰기 플로우 (SSD 사전 기록)
+12. pybind11 바인딩 계층
+13. 핵심 파라미터 레퍼런스
+14. 성능 설계 원칙 요약
