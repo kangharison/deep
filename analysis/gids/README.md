@@ -55,6 +55,7 @@ gids/
 |------|------|
 | [gids-complete-architecture.md](gids-complete-architecture.md) | **완전 아키텍처 통합 문서** — 이 파일 하나로 전체 이해 (1,170줄) |
 | [gids-workload-analysis.md](gids-workload-analysis.md) | **워크로드 특징 분석** — 데이터셋·모델·샘플러별 I/O 특성, 메모리 풋프린트, 최적화 효과 |
+| [gids-ssd-write-flow.md](gids-ssd-write-flow.md) | **SSD 기록 플로우** — loffset ↔ heterograph_map 대응, STRIPE 레이아웃, 두 기록 도구 비교 |
 
 ### 문서 구성 (14개 섹션)
 1. 문제 정의 (기존 병목 vs GIDS 해결)
