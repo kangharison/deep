@@ -58,7 +58,7 @@ lighter 가 메우는 빈틈:
 
 ### 2.2. 비기능 요구사항 (Non-functional)
 
-- **NFR-1 (저오버헤드)**: 고 IOPS(수백만 IOPS)에서도 영향 최소화. **in-kernel 집계 + 샘플링**으로 per-event 유저스페이스 전송을 피한다(§6.6). 목표: kprobe 대비 tracepoint 우선, per-event 오버헤드 < ~수백 ns, IOPS 영향 한 자릿수 %.
+- **NFR-1 (저오버헤드)**: 고 IOPS(수백만 IOPS)에서도 영향 최소화. **in-kernel 집계 + 샘플링**으로 per-event 유저스페이스 전송을 피한다(§6.6). 목표: kprobe 대비 tracepoint 우선, per-event 오버헤드 < ~수백 ns, IOPS 영향 한 자릿수 %. 기준 워크로드 기반 정량 계산은 §16.
 - **NFR-2 (무수정)**: 대상 바이너리 재빌드 불필요.
 - **NFR-3 (이식성)**: libbpf **CO-RE(Compile Once – Run Everywhere)** + BTF로 커널 버전 간 이식. 타깃: Linux 5.8+ (ring buffer, BTF). 레퍼런스 환경은 Rocky/CentOS 9 (5.14+).
 - **NFR-4 (권한)**: `CAP_BPF`+`CAP_PERFMON`(또는 root). 커널 모듈 불필요.
@@ -664,3 +664,99 @@ bottleneck = argmax_s share_s
 - **SQ/CQ**: NVMe Submission/Completion Queue. **cid/qid**: command id / queue id.
 - **CO-RE**: Compile Once – Run Everywhere (libbpf+BTF 이식성).
 - **doorbell**: SQ tail을 디바이스에 알리는 MMIO 레지스터 쓰기.
+
+---
+
+## 16. 오버헤드 예산 — 기준 워크로드 계산
+
+> 아래 수치는 **모델 기반 추정**이다(전제·계산식 명시). 실측은 §16.6의 `bpftool prog show` 방법으로 교정한다. 절대값보다 **자릿수·상대 비교**로 읽을 것.
+
+### 16.1. 기준 워크로드
+
+```
+fio --numjobs=16 --iodepth=512 --bs=4k --direct=1 --ioengine=libaio --rw=randread
+```
+
+| 파라미터 | 값 | 오버헤드에 주는 함의 |
+|---------|----|--------------------|
+| numjobs | 16 | I/O 발행 스레드 16개 → 보통 16 코어에 분산. BPF 훅은 **발행/완료가 일어난 그 코어**에서 실행 → fio I/O 경로 CPU와 직접 경합 |
+| iodepth | 512 | 스레드당 512 in-flight |
+| **동시 in-flight** | **16 × 512 = 8192** | `inflight`/bridge 맵이 동시에 ~8192 live 엔트리 보유 → **맵 사이징 필수**(§16.5) |
+| bs / direct | 4k / O_DIRECT | 페이지캐시 우회 → S1 귀속 단순(설계 가정과 일치). 4k → IOPS가 높아 per-IO 비용이 그대로 증폭 |
+| libaio | 배치 | `io_submit`/`io_getevents` **syscall 훅(S1 진입, S6 종료)은 배치당 1회로 amortize**. block/nvme 6개 훅은 **I/O당 고정** |
+
+이 QD(8192 outstanding)는 단일 SSD 큐 용량을 크게 초과하므로, 보통 **device-bound**(코어에 유휴 여유 존재)다. 단, 초고속 디바이스나 다중 SSD로 코어가 포화되면 **CPU-bound**로 바뀐다 — 두 레짐을 §16.4에서 모두 계산한다.
+
+### 16.2. I/O 1건당 발화 훅 & 비용 (full 모드, Phase 2)
+
+| 훅 | I/O당 발화 | 추정 비용 | 작업 |
+|----|-----------|----------|------|
+| `sys_enter_io_submit` (S1) | 배치당 1회† | ~150ns | ktime, comm, tid_stack update |
+| `block_rq_insert` | 1 | ~200ns | tid_stack lookup + io_ctx(64B) 생성 + inflight.update |
+| `block_rq_issue` | 1 | ~120ns | inflight lookup + ts |
+| `nvme_setup_cmd` | 1 | ~180ns | request*↔(qid,cid) bridge 2맵 update |
+| `nvme_sq` | 1 | ~150ns | lookup + ts + qdepth atomic inc |
+| `nvme_complete_rq` | 1 | ~150ns | (qid,cid) lookup + ts |
+| `block_rq_complete` | 1 | ~120ns | lookup + ts |
+| `sys_exit_io_getevents` + finalize (S6) | 배치당 1회† | ~500ns | 6 delta 계산 + 6 히스토그램 update + 3 맵 delete |
+| **합계 (배치 amortize 가정)** | | **≈ 1.0–1.2µs/IO** | syscall 2훅이 배치로 희석된 경우 |
+| **합계 (batch=1, 최악)** | | **≈ 1.5–1.7µs/IO** | fio 기본 `iodepth_batch_submit=1` |
+
+† fio 기본은 제출 배치=1이지만 완료(`io_getevents`)는 다건 reap이 흔하다 → S6는 거의 amortize, S1은 워크로드 설정에 따라 per-IO일 수 있음. 보수적으로 **full ≈ 1.5µs/IO** 로 둔다.
+
+### 16.3. 모드별 I/O당 추가 CPU
+
+| 모드 | 발화 훅 수 | I/O당 CPU |
+|------|----------|----------|
+| **Phase 0 — S4(device)만** | 2 | **~0.4µs** |
+| **Phase 1 — +per-PID/TID +per-queue** | ~5 | **~0.8µs** |
+| **Phase 2 — full 전 계층 분해** | ~8 | **~1.5µs** |
+| (tracepoint에 request* 없어 kprobe 폴백 시, §6.1) | +1~2 | +0.4–0.8µs |
+
+### 16.4. IOPS / CPU 영향 계산
+
+추가 CPU 코어 수 = (I/O당 추가 CPU) × (완료 IOPS). 디바이스 등급별로:
+
+| | Phase 0 (0.4µs) | Phase 1 (0.8µs) | Full (1.5µs) |
+|---|---|---|---|
+| **1.0M IOPS (mainstream Gen4 NVMe)** | 0.40 코어 (16코어의 2.5%) | 0.80 코어 (5.0%) | 1.50 코어 (9.4%) |
+| **3.0M IOPS (top-tier/다중 SSD)** | 1.20 코어 (7.5%) | 2.40 코어 (15%) | 4.50 코어 (28%) |
+
+이 "추가 코어"가 IOPS를 깎는지는 레짐에 달림:
+
+- **device-bound (이 워크로드의 일반적 경우, 코어 유휴 여유 O)**: 추가 CPU는 유휴 헤드룸이 흡수 → **IOPS 거의 불변**, 대신 CPU 사용률이 위 표만큼 상승. Phase 0/1은 사실상 공짜.
+- **CPU-bound (코어 포화, 매우 빠른 디바이스/다중 SSD)**: 처리량 비례식
+  ```
+  IOPS_new / IOPS_old ≈ C_base / (C_base + C_added)
+  C_base = 포화 코어의 IO당 커널 경로 CPU (제출+완료) ≈ 2.5µs/IO 가정
+  ```
+  → Full(1.5µs): 2.5/(2.5+1.5) = **0.63 → IOPS 약 −37%**
+  → Phase 1(0.8µs): 2.5/3.3 = 0.76 → **−24%**
+  → Phase 0(0.4µs): 2.5/2.9 = 0.86 → **−14%**
+
+> 결론: 이 워크로드가 **device-bound면 Phase 0/1은 IOPS 영향 거의 없음**(CPU만 +0.4~0.8코어). **CPU-bound로 몰린 경우에만 full이 −30%대로 아파짐** → full은 진단용 단기 세션으로.
+
+### 16.5. 메모리 / 맵 사이징 (8192 in-flight 때문에 중요)
+
+동시 8192 I/O가 살아 있으므로 상관키 맵을 **넉넉히** 잡아야 한다(가득 차면 update 실패 → 샘플 유실).
+
+| 맵 | max_entries 권장 | 엔트리 | 대략 메모리 |
+|----|-----------------|--------|-----------|
+| `inflight` HASH<request*, io_ctx> | ≥ 16384 (8192의 2×) | 64B | ~1.0MB |
+| `rq_of` / `cid_of` bridge | ≥ 16384 | 8~16B | ~0.3MB |
+| `tid_stack` HASH<tid, tinfo> | ≥ 64 (스레드 16) | ~32B | 수 KB |
+| `qdepth`/`qdepth_max` PERCPU | ≥ 256 (qid) | 8B × ncpu | 수십 KB |
+| `stats` HASH<agg_key, lat_stats> | pid16×tid16×qid×op×stage | ~560B | 보통 수 MB 이하 (스레드당 큐 국소성으로 실제 카디널리티 작음) |
+
+- **이벤트 모드 금지 수준**: full 이벤트(샘플링 없음) = ~1M~3M events/s × ~48B = **48–144MB/s** ring buffer + 유저스페이스 소비 → 이 IOPS에서 **반드시 1/1000 이상 샘플링**(→ 1k~3k events/s로 무해).
+- 8192 엔트리 해시는 캐시 풋프린트(~1MB+)가 있어 per-op 비용을 약간(수~수십 ns) 끌어올림 — §16.2 추정에 이미 보수적으로 반영.
+
+### 16.6. 실측 교정 방법
+
+```bash
+# 각 BPF 프로그램의 누적 실행시간/횟수 → IO당 ns 실측
+bpftool prog show           # run_time_ns, run_cnt 확인 (kernel.bpf_stats_enabled=1 필요)
+# per-IO ns ≈ Σ(run_time_ns) / 완료 IO 수
+```
+
+검증 절차: 프로파일러 (off / Phase0 / Phase1 / full) × 위 fio 워크로드를 돌려 (1) 완료 IOPS, (2) p99 latency, (3) `mpstat` CPU%, (4) `bpftool` IO당 ns를 비교해 §16.3 표를 교정한다.
