@@ -2,7 +2,7 @@
 
 > 기준 코드: `sources/linux/drivers/nvme/host/{pci.c, core.c, ioctl.c, multipath.c}`, blk-mq(`block/blk-mq.c`)
 > 기준 스펙: NVMe Base Spec — Create I/O SQ/CQ, NVM Sets, Identify, Arbitration(WRR)
-> 작성: 2026-06-09 · 상태: 설계 확정(코드 착수 전)
+> 작성: 2026-06-09 · 갱신: 2026-06-17 · 상태: 설계 확정 + **실제 코드 구성안(§19~§27)** 추가
 
 **한 줄 요약**: NVMe IO SQ 를 **NVM Set(=namespace) 단위로 분리**해 namespace 별 전용 tagset 에 묶어 격리한다. 큐 생성은 **ioctl 로 NVMSETID 를 실은 Create I/O SQ** 를 발행하는 커스텀 드라이버가 담당하며, blk-mq 데이터패스(`nvme_queue_rq`)는 그대로 재사용한다. 이후 thread 격리는 cgroup 으로 얹는다.
 
@@ -541,8 +541,482 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq) {
 
 ---
 
+## 19. 실제 코드 구성 — 파일/모듈 레이아웃
+
+> §1~§18 은 "무엇을/왜"의 설계다. 이하 §19~§27 은 **"실제 코드를 어디에 어떻게 둘지"**(파일 트리, 실 자료구조 정의, UAPI, 레이어 분리, blk-mq ops, 통합 지점, 빌드, 락)를 확정한다. 코드는 골격(skeleton)이며 커널 버전에 따라 시그니처는 미세 조정될 수 있다(기준: 6.x mainline `drivers/nvme/host`).
+
+### 19.1 레이어 분리 원칙 (가장 중요한 결정)
+
+mainline `nvme` 는 **두 모듈**로 갈린다:
+- `nvme-core.ko` ← `core.c ioctl.c …` : 트랜스포트 독립. `struct nvme_ctrl`, `struct nvme_ns`, 스캔/바인딩.
+- `nvme.ko` ← `pci.c` : PCIe 전용. `struct nvme_dev`, `struct nvme_queue`(SQ 실체), 하드웨어 큐 생성/MSI-X.
+
+`struct nvme_dev`/`struct nvme_queue` 는 **`pci.c` 파일-private**(헤더에 없음). 따라서 NVMSETID·하드웨어 SQ 를 다루는 그룹 로직은 **반드시 PCIe 쪽(`nvme.ko`)** 에 있어야 한다. 반대로 ns→tagset 바인딩(`nvme_alloc_ns`)은 **core 쪽**이다. 둘을 잇는 유일한 깨끗한 통로는 **`nvme_ctrl_ops` 콜백**이다.
+
+```
+core.c (nvme-core.ko)                 pci.c / pci-nvmset.c (nvme.ko)
+  nvme_alloc_ns()                       struct nvme_dev { groups[] }
+    └ selector 훅 호출 ───ops 콜백──►    nvme_pci_ns_tagset()  ← 그룹 선택/lazy 생성
+                                         CSQ_CREATE/DELETE 핸들러 ← 하드웨어 SQ
+  nvme_dev_ioctl() (ioctl.c)            nvme_pci_nvmset_ctl()  ← ioctl 디스패치 대상
+    └ 신규 cmd ──ops 콜백──────────►
+```
+
+**원칙**: core 는 NVMSETID 를 *모르고*, "tagset 을 골라 달라"는 콜백만 호출한다. 콜백이 NULL(=mainline/비-PCIe)이면 `ctrl->tagset` 폴백 → **기존 동작 100% 보존**. 모든 NVM Set 지식은 PCIe 모듈에 격리.
+
+### 19.2 파일 트리 (신규/수정)
+
+```
+drivers/nvme/host/
+├── nvme.h            [수정] nvme_ctrl_ops 콜백 2개, nvme_ns_head.nvmset_id,
+│                            nvme_ns_info.nvmset_id 추가
+├── core.c            [수정] nvme_alloc_ns selector, nvme_ns_info_from_identify
+│                            에서 NVMSETID 채집, defer/rescan
+├── ioctl.c           [수정] nvme_dev_ioctl 에 CSQ_CREATE/DELETE case 추가(디스패치만)
+├── pci.c             [수정] struct nvme_dev/nvme_queue 확장, nvme_mq_ops 옆에
+│                            nvmset_mq_ops, nvme_queue_tagset 재작성, reset(Option B)
+├── pci.h             [신규] struct nvme_dev/nvme_queue/nvmset_group 선언을
+│                            pci.c ↔ pci-nvmset.c 공유 (모듈화할 경우)
+├── pci-nvmset.c      [신규] 그룹 lifecycle 전부: CSQ_CREATE/DELETE 구현,
+│                            그룹 tagset alloc/free, 큐 예산, selector 구현
+├── Makefile          [수정] nvme-y += pci-nvmset.o (CONFIG 가드)
+└── Kconfig           [수정] config NVME_NVMSET_ISOLATION
+include/uapi/linux/
+└── nvme_ioctl.h      [수정] CSQ_CREATE/DELETE ioctl 번호 + 인자 구조체(UAPI)
+```
+
+> **간이안(파일 1개)**: `pci.h`/`pci-nvmset.c` 분리가 부담이면 모든 신규 코드를 `pci.c` 안에 둬도 된다(struct 가 이미 거기 있으므로 추가 헤더 불필요). 모듈화는 리뷰/리베이스 편의를 위한 권장일 뿐. 본 문서는 분리안을 기준으로 기술한다.
+
+### 19.3 빌드 (Makefile / Kconfig)
+
+```makefile
+# drivers/nvme/host/Makefile
+nvme-y                                  += pci.o
+nvme-$(CONFIG_NVME_NVMSET_ISOLATION)    += pci-nvmset.o
+```
+```kconfig
+# drivers/nvme/host/Kconfig
+config NVME_NVMSET_ISOLATION
+    bool "NVMe per-NVM-Set SQ/tagset isolation (custom)"
+    depends on BLK_DEV_NVME
+    help
+      Create per-NVM-Set I/O submission queues and bind each namespace to a
+      dedicated blk-mq tag set for noisy-neighbor isolation. Controlled via
+      private CSQ_CREATE/CSQ_DELETE ioctls on the controller char device.
+```
+CONFIG 미설정 시: `nvme_ctrl_ops.ns_tagset == NULL`, ioctl case 들이 `-ENOTTY` → **빌드/동작이 정확히 mainline**.
+
+---
+
+## 20. 자료구조 — 실제 정의
+
+### 20.1 `pci.h` (신규) — 그룹과 dev/queue 확장
+
+```c
+/* drivers/nvme/host/pci.h  (CONFIG_NVME_NVMSET_ISOLATION) */
+
+enum nvmset_state { NVMSET_STATE_D, NVMSET_STATE_P };   /* §1 D/P */
+
+struct nvmset_group {                  /* per-set 격리 단위. NVMSETID k>=1 */
+    u16                    nvmset_id;   /* 이 그룹의 NVM Set ID */
+    struct blk_mq_tag_set  tagset;      /* 그룹 전용 IO tagset (일시) */
+    struct nvme_queue    **sqs;         /* group->sqs[j] = 로컬 j 번째 SQ (mainline nvme_queue) */
+    unsigned int           nr_sqs;      /* = tagset.nr_hw_queues. CSQ_CREATE 마다 ++ */
+    bool                   tagset_ready;/* lazy 생성 가드 (§9) */
+    refcount_t             ns_ref;      /* 이 그룹에 바인딩된 gendisk 수. 0→free 가능 */
+    struct list_head       entry;       /* nvme_dev.group_list 연결 */
+};
+
+/* mainline struct nvme_dev 에 추가할 필드 (pci.c 정의를 pci.h 로 이전) */
+struct nvme_dev {
+    /* ... 기존 필드 그대로: queues, tagset, admin_tagset, ctrl, max_qid, ... */
+    struct list_head   group_list;      /* nvmset_group 들 */
+    unsigned int       nr_groups;
+    enum nvmset_state  nvmset_state;    /* 판정 캐시 (§1.35: 활성 그룹>0 ? P : D) */
+    struct mutex       nvmset_lock;     /* CSQ_CREATE/DELETE ↔ reset ↔ scan 직렬화(§26) */
+    struct list_head   deferred_ns;     /* State P 에서 그룹 미존재로 보류된 ns (§23) */
+};
+
+/* mainline struct nvme_queue 에 추가할 필드 (완료 디먹스 §15) */
+struct nvme_queue {
+    /* ... 기존 필드: dev, sq_cmds, cq, qid, q_depth, cq_vector, ... */
+    struct blk_mq_tags *tags;           /* = hctx->tags. set:init_hctx get:완료. NULL=suspend */
+    struct nvmset_group *group;         /* 이 SQ 가 속한 그룹(기본그룹이면 NULL) */
+};
+```
+
+### 20.2 `nvme.h` (수정) — core↔pci 연결 필드/콜백
+
+```c
+/* struct nvme_ns_info 에 추가 — 스캔 중 NVMSETID 운반 (core.c 내부 구조체) */
+struct nvme_ns_info {
+    /* ... nsid, anagrpid, is_shared, ... */
+    u16 nvmset_id;                      /* Identify Namespace NVMSETID (§23) */
+};
+
+/* struct nvme_ns_head 에 추가 — teardown 시 그룹 식별 */
+struct nvme_ns_head {
+    /* ... ns_id, ... */
+    u16 nvmset_id;
+};
+
+/* struct nvme_ctrl_ops 에 추가 — 선택 콜백 (NULL 허용) */
+struct nvme_ctrl_ops {
+    /* ... 기존 콜백 ... */
+
+    /* ns 에 바인딩할 tagset 선택. NULL 이면 core 가 ctrl->tagset 사용(mainline).
+     * *defer=true 반환 시 core 는 이번 스캔에서 disk 생성을 보류(State P pending). */
+    struct blk_mq_tag_set *(*ns_tagset)(struct nvme_ctrl *ctrl,
+                                        struct nvme_ns_info *info, bool *defer);
+
+    /* 컨트롤러 char dev 의 private ioctl 디스패치(CSQ_CREATE/DELETE). NULL→-ENOTTY */
+    int (*nvmset_ctl)(struct nvme_ctrl *ctrl, unsigned int cmd, void __user *arg);
+};
+```
+
+> `struct nvme_ns` 자체는 **수정 0** — 바인딩된 tagset 정보는 `ns->queue`(request_queue)에 이미 내포된다. 그룹 식별용 `nvmset_id` 만 `ns_head` 에 둔다(§7 "nvmset_id 보관 필드 1개"의 실제 위치).
+
+---
+
+## 21. UAPI — private ioctl 인터페이스
+
+```c
+/* include/uapi/linux/nvme_ioctl.h (추가). 'N' 매직, 미사용 번호 0x50/0x51 (충돌 확인 필수) */
+
+struct nvme_csq_create {
+    __u16 nvmset_id;   /* 0 = State D(ctrl->tagset). >=1 = State P(그룹 k) */
+    __u16 qsize;       /* SQ 깊이(엔트리). 0 → 드라이버 기본 */
+    __u8  qprio;       /* WRR: 0=Urgent..3=Low. CAP.AMS 미지원 시 무시(§8.2) */
+    __u8  flags;       /* 예약(0) */
+    __u16 qid_out;     /* [out] 배정된 IO 큐 qid */
+    __u32 rsvd;
+};
+
+struct nvme_csq_delete {
+    __u16 nvmset_id;   /* 그룹 단위 삭제 시 */
+    __u16 qid;         /* 단일 큐 삭제 시(0이면 nvmset_id 그룹 전체) */
+    __u32 rsvd;
+};
+
+#define NVME_IOCTL_CSQ_CREATE  _IOWR('N', 0x50, struct nvme_csq_create)
+#define NVME_IOCTL_CSQ_DELETE  _IOW ('N', 0x51, struct nvme_csq_delete)
+```
+
+대상 디바이스: **컨트롤러 char dev `/dev/nvme0`**(ns 가 아니라 컨트롤러 레벨 자원이므로). 권한: `CAP_SYS_ADMIN` 필수(하드웨어 큐 생성).
+
+---
+
+## 22. 제어 경로 구현 (`ioctl.c` 디스패치 → `pci-nvmset.c`)
+
+### 22.1 ioctl.c — 디스패치만 (core, 트랜스포트 독립)
+
+```c
+/* drivers/nvme/host/ioctl.c : nvme_dev_ioctl() 의 switch 에 추가 */
+case NVME_IOCTL_CSQ_CREATE:
+case NVME_IOCTL_CSQ_DELETE:
+    if (!capable(CAP_SYS_ADMIN))            return -EACCES;
+    if (!ctrl->ops->nvmset_ctl)             return -ENOTTY;  /* 비-PCIe/CONFIG off */
+    return ctrl->ops->nvmset_ctl(ctrl, cmd, (void __user *)arg);
+```
+
+### 22.2 pci-nvmset.c — 실제 핸들러
+
+```c
+/* nvme_ctrl_ops.nvmset_ctl 구현체. ctrl→dev 역참조 후 분기 */
+int nvme_pci_nvmset_ctl(struct nvme_ctrl *ctrl, unsigned int cmd, void __user *arg)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    switch (cmd) {
+    case NVME_IOCTL_CSQ_CREATE: return nvmset_csq_create(dev, arg);
+    case NVME_IOCTL_CSQ_DELETE: return nvmset_csq_delete(dev, arg);
+    default:                    return -ENOTTY;
+    }
+}
+
+static int nvmset_csq_create(struct nvme_dev *dev, void __user *uarg)
+{
+    struct nvme_csq_create c;
+    struct nvmset_group *g;
+    struct nvme_queue *nvmeq;
+    int qid, ret;
+
+    if (copy_from_user(&c, uarg, sizeof(c)))           return -EFAULT;
+    guard(mutex)(&dev->nvmset_lock);                   /* §26 직렬화 */
+
+    /* all-or-nothing 불변식 검사 (§1 자기전이 #2) */
+    if (dev->nvmset_state == NVMSET_STATE_P && c.nvmset_id == 0) return -EBUSY; /* P 에 D 큐 금지 */
+    if (dev->nvmset_state == NVMSET_STATE_D && c.nvmset_id != 0 && dev->ctrl.tagset /*active*/)
+        /* D→P 진입: 기존 ctrl->tagset 큐가 살아있는 채로 섞으면 안 됨 → §13 정방향 teardown 선행 요구 */
+        return -EBUSY;
+
+    qid = nvme_alloc_queue_id(dev);                    /* 전역 qid 비트맵에서 할당 */
+    if (qid < 0) return qid;
+
+    /* §8.2: CQ DMA+MSI-X → Create I/O CQ → SQ DMA → Create I/O SQ(NVMSETID,QPRIO) */
+    ret = nvme_create_queue(/*dev,*/ qid, c.nvmset_id, c.qprio, c.qsize);
+    if (ret) { nvme_free_queue_id(dev, qid); return ret; }
+    nvmeq = dev->queues[qid];
+
+    if (c.nvmset_id == 0) {
+        /* State D: 기본 그룹. ctrl->tagset 의 nr_hw_queues 를 +1 (mainline grow) */
+        nvmeq->group = NULL;
+        return nvmset_grow_default(dev, c.qid_out = qid, uarg);   /* blk_mq_update_nr_hw_queues */
+    }
+
+    /* State P: per-set 그룹에 SQ 누적(tagset 은 아직 안 만듦, §9 queue-first) */
+    g = nvmset_group_get_or_create(dev, c.nvmset_id);  /* 없으면 그룹 구조만 신설 */
+    if (!g) { /* rollback */ return -ENOMEM; }
+    nvmeq->group = g;
+    g->sqs[g->nr_sqs++] = nvmeq;
+    dev->nvmset_state = NVMSET_STATE_P;
+
+    nvme_queue_scan(&dev->ctrl);                       /* §23: 보류 ns 재시도(D→P) */
+    c.qid_out = qid;
+    return copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+}
+```
+
+`nvmset_csq_delete()` 는 §12[C]/[D]·§13 역방향을 그대로 구현: drain → `adapter_delete_sq` → `adapter_delete_cq` → 벡터 반납 → (그룹 마지막이면) `nvmset_group_free()`.
+
+### 22.3 큐 예산 (§8.1)
+
+```c
+/* probe 후 1회: 가용 IO 큐/벡터 수 캐시 */
+dev->max_io_queues = nvme_set_queue_count(&dev->ctrl, want);   /* mainline */
+/* CSQ_CREATE 마다: Σ nr_sqs + 기본그룹 ≤ max_io_queues 검사. 초과 시 -ENOSPC */
+```
+
+---
+
+## 23. core 통합 — selector 훅 + NVMSETID 채집 + defer/rescan
+
+### 23.1 NVMSETID 채집 (`core.c : nvme_ns_info_from_identify`)
+
+```c
+/* Identify Namespace(CNS 00h) 응답에서 NVMSETID 를 info 로 옮긴다.
+ * id->nvmsetid 는 mainline struct nvme_id_ns 에 이미 존재(__le16). */
+info->nvmset_id = le16_to_cpu(id->nvmsetid);
+```
+
+### 23.2 selector (`core.c : nvme_alloc_ns`, §5/§1 자기전이 #3 의 실제 구현)
+
+```c
+/* 기존: disk = blk_mq_alloc_disk(ctrl->tagset, &lim, ns);  를 교체 */
+static struct blk_mq_tag_set *
+nvme_select_ns_tagset(struct nvme_ctrl *ctrl, struct nvme_ns_info *info, bool *defer)
+{
+    *defer = false;
+    if (ctrl->ops->ns_tagset)
+        return ctrl->ops->ns_tagset(ctrl, info, defer);   /* PCIe: 그룹/lazy/defer */
+    return ctrl->tagset;                                   /* mainline 폴백 */
+}
+
+/* nvme_alloc_ns() 내부 */
+bool defer;
+struct blk_mq_tag_set *ts = nvme_select_ns_tagset(ctrl, info, &defer);
+if (defer) {                          /* State P + 그룹 미존재 → 이번 스캔 보류 */
+    nvme_defer_ns(ctrl, info->nsid);  /* dev->deferred_ns 에 nsid 기록 */
+    goto out_free_ns;                 /* gendisk 만들지 않음(§1 자기전이 #3 pending) */
+}
+ns->head->nvmset_id = info->nvmset_id;
+disk = blk_mq_alloc_disk(ts, &lim, ns);
+```
+
+### 23.3 PCIe selector + lazy tagset (`pci-nvmset.c : nvme_pci_ns_tagset`)
+
+```c
+struct blk_mq_tag_set *
+nvme_pci_ns_tagset(struct nvme_ctrl *ctrl, struct nvme_ns_info *info, bool *defer)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    struct nvmset_group *g;
+    *defer = false;
+
+    if (info->nvmset_id == 0) {                       /* State D 경로 */
+        if (nvme_ctrl_tagset_active(ctrl)) return ctrl->tagset;
+        *defer = true; return NULL;                   /* P 인데 D ns? → 보류 */
+    }
+    g = nvmset_find_group(dev, info->nvmset_id);
+    if (!g || g->nr_sqs == 0) { *defer = true; return NULL; }   /* 그룹 큐 아직 없음 */
+    if (!g->tagset_ready) {                            /* ★ per-set tagset lazy 생성(§9) */
+        int ret = nvmset_alloc_tag_set(dev, g);       /* §24.1 */
+        if (ret) { *defer = true; return NULL; }
+    }
+    refcount_inc(&g->ns_ref);
+    return &g->tagset;
+}
+```
+
+### 23.4 defer 재구동
+
+`CSQ_CREATE` 가 새 그룹 SQ 를 누적한 뒤 `nvme_queue_scan(ctrl)` 호출(§22.2) → `nvme_scan_work` 가 NSID 리스트를 재순회 → 보류됐던 ns 가 이번엔 `tagset_ready` 그룹을 만나 정상 `blk_mq_alloc_disk`. **별도 보류 리스트 없이 rescan 만으로도 성립**하나, 대량 ns 환경에서 재순회 비용을 줄이려면 `dev->deferred_ns` 로 타깃 재시도.
+
+---
+
+## 24. blk-mq ops (per-set) — 실제 구현
+
+### 24.1 그룹 tagset 할당 — ⚠️ `nvme_alloc_io_tag_set` 재사용 불가
+
+> **설계 보정(§9 대비)**: §9 의 `nvme_alloc_io_tag_set(&group.tagset, nr_hw_queues=…)` 는 **그대로 못 쓴다.** mainline `nvme_alloc_io_tag_set()` 은 `set->nr_hw_queues` 를 **컨트롤러 전역 `ctrl->queue_count` 기준으로 내부 결정**하고 `ctrl->tagset` 포인터까지 건드린다. per-set 은 `nr_hw_queues = g->nr_sqs`(부분집합)여야 하므로 **`blk_mq_tag_set` 을 직접 채우고 `blk_mq_alloc_tag_set()` 을 호출**한다.
+
+```c
+static int nvmset_alloc_tag_set(struct nvme_dev *dev, struct nvmset_group *g)
+{
+    struct blk_mq_tag_set *set = &g->tagset;
+
+    memset(set, 0, sizeof(*set));
+    set->ops          = &nvmset_mq_ops;            /* §24.2 */
+    set->nr_hw_queues = g->nr_sqs;                 /* ★ 그룹 SQ 수 = hctx 수 */
+    set->nr_maps      = 1;                          /* phase1: DEFAULT 만 (§8.3) */
+    set->queue_depth  = dev->ctrl.sqsize + 1;
+    set->numa_node    = dev->ctrl.numa_node;
+    set->cmd_size     = nvme_pci_cmd_size(dev);    /* nvme_mq_ops 와 동일 계산 재사용 */
+    set->timeout      = NVME_IO_TIMEOUT;
+    set->flags        = BLK_MQ_F_SHOULD_MERGE;     /* ※ TAG_HCTX_SHARED 금지(§14 G6) */
+    set->driver_data  = g;                         /* ★ map_queues/init_hctx 가 그룹 접근 */
+
+    int ret = blk_mq_alloc_tag_set(set);
+    if (ret) return ret;
+    g->tagset_ready = true;                         /* §9 가드 */
+    return 0;
+}
+```
+
+### 24.2 `nvmset_mq_ops` — `nvme_mq_ops` 복제 + 2개 override
+
+```c
+/* pci.c: 기존 nvme_mq_ops 와 대부분 동일, .map_queues/.init_hctx 만 교체 */
+static const struct blk_mq_ops nvmset_mq_ops = {
+    .queue_rq    = nvme_queue_rq,        /* ← 무수정 재사용(§3 데이터패스) */
+    .complete    = nvme_pci_complete_rq, /* ← 무수정 */
+    .commit_rqs  = nvme_commit_rqs,      /* ← 무수정 */
+    .init_request= nvme_pci_init_request,/* ← 무수정 */
+    .timeout     = nvme_timeout,         /* ← 무수정 */
+    .poll        = nvme_poll,            /* phase2(poll map) 에서만 */
+    .init_hctx   = nvmset_init_hctx,     /* ★ override (§15) */
+    .map_queues  = nvmset_map_queues,    /* ★ override (§8.3) */
+};
+```
+
+### 24.3 `.map_queues` (§8.3 phase1 — 라운드로빈)
+
+```c
+static void nvmset_map_queues(struct blk_mq_tag_set *set)
+{
+    struct nvmset_group *g = set->driver_data;
+    struct blk_mq_queue_map *map = &set->map[HCTX_TYPE_DEFAULT];
+    map->nr_queues    = g->nr_sqs;
+    map->queue_offset = 0;
+    blk_mq_map_queues(map);    /* 전 online CPU → g->nr_sqs 라운드로빈(affinity 무관) */
+}
+```
+
+### 24.4 `.init_hctx` + 완료 디먹스 (§15 — 1단계 핵심)
+
+```c
+static int nvmset_init_hctx(struct blk_mq_hw_ctx *hctx, void *data, unsigned int hctx_idx)
+{
+    struct nvmset_group *g = data;                  /* = set->driver_data */
+    struct nvme_queue *nvmeq = g->sqs[hctx_idx];    /* 로컬 idx → 그룹 SQ(전역 qid 아님) */
+    nvmeq->tags = hctx->tags;                       /* ★ 완료 디먹스 정답 풀 캐시 */
+    hctx->driver_data = nvmeq;
+    return 0;
+}
+
+/* pci.c: nvme_queue_tagset() 재작성 (기본 그룹 init_hctx 도 nvmeq->tags=hctx->tags 로 통일) */
+static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
+{
+    if (!nvmeq->qid) return nvmeq->dev->admin_tagset.tags[0];  /* admin */
+    return nvmeq->tags;                                         /* qid 산술 제거 */
+}
+```
+
+---
+
+## 25. reset 통합 — Option B (§12.1) 실제 위치
+
+`nvme_reset_work()`(pci.c) 의 **disable 단계**와 **re-enable 단계**에 훅을 끼운다:
+
+```c
+static void nvme_reset_work(struct work_struct *work)
+{
+    /* ── disable 직후(하드웨어 큐 죽은 시점) ── */
+    nvmset_teardown_overlay(dev);   /* Case2: per-set ns del_gendisk + 그룹 free_tag_set
+                                       + group_list clear + nvmset_state=D (§12.1 1·2단계) */
+
+    /* ... mainline: nvme_dev_disable → 재초기화 → default IO 큐 재생성 ... */
+    /* nvme_pci_update_nr_queues(): ctrl->tagset blk_mq_update_nr_hw_queues (Case 공통 3단계) */
+
+    /* ── nvme_scan_work 재스캔(공통 4단계) ──
+       selector 가 group 없음 확인 → ctrl->tagset 재바인딩(자동 fallback, §12.1) */
+}
+```
+
+`nvmset_teardown_overlay()`:
+```c
+static void nvmset_teardown_overlay(struct nvme_dev *dev)
+{
+    struct nvmset_group *g, *t;
+    guard(mutex)(&dev->nvmset_lock);
+    if (dev->nvmset_state != NVMSET_STATE_P) return;             /* Case1: no-op */
+    list_for_each_entry_safe(g, t, &dev->group_list, entry) {
+        nvmset_remove_group_namespaces(dev, g);                 /* del_gendisk (re-home 위해) */
+        if (g->tagset_ready) blk_mq_free_tag_set(&g->tagset);
+        list_del(&g->entry); kfree(g->sqs); kfree(g);
+    }
+    dev->nr_groups = 0;
+    dev->nvmset_state = NVMSET_STATE_D;                          /* P→D 확정 */
+    /* 이후 재스캔에서 selector 가 NULL group → ctrl->tagset 자동 복귀 */
+}
+```
+
+> reset 은 per-set ns 를 제거하므로, **reset 경로가 명시적으로 `nvme_queue_scan()` 을 트리거**해 제거된 ns 를 ctrl->tagset 위로 재생성해야 한다(§12.1 주의). mainline 은 reset 시 ns 를 제거하지 않으므로 이 재추가가 우리 추가 로직.
+
+---
+
+## 26. 동시성 / 락 순서
+
+| 자원 | 락 | 보호 대상 |
+|------|----|-----------|
+| 그룹 생성/삭제/teardown | `dev->nvmset_lock`(mutex) | `group_list`, `nr_groups`, `nvmset_state`, `deferred_ns` |
+| ns 바인딩(scan) | mainline `namespaces_rwsem`/scan 직렬성 | `ns` 생성. selector 는 `nvmset_lock` 아래에서 그룹 조회 |
+| 하드웨어 큐 | mainline 큐 락 | `nvme_queue` SQ 링 |
+
+**락 순서(deadlock 회피)**: `nvmset_lock` → (필요 시) blk-mq freeze. **`nvmset_lock` 을 쥔 채 `nvme_queue_scan()` 의 완료를 기다리지 말 것**(scan_work 가 selector 에서 같은 락을 재취득 → ABBA). CSQ_CREATE 는 `nvme_queue_scan()` 을 **비동기 큐잉만** 하고 락을 즉시 놓는다(§22.2 가 그 순서). reset(`nvmset_lock`) ↔ CSQ(`nvmset_lock`) 는 동일 락으로 상호배제.
+
+---
+
+## 27. 함수 인벤토리 (신규 N / 수정 M) & 1단계 PR 분할
+
+| 심볼 | 파일 | N/M | 역할 | 절 |
+|------|------|-----|------|----|
+| `nvme_ctrl_ops.ns_tagset` / `.nvmset_ctl` | nvme.h | N | core↔pci 콜백 2개 | §20.2 |
+| `nvme_ns_info.nvmset_id` / `nvme_ns_head.nvmset_id` | nvme.h | N | NVMSETID 운반/보관 | §20.2 |
+| `nvme_ns_info_from_identify` | core.c | M | NVMSETID 채집 | §23.1 |
+| `nvme_select_ns_tagset` / `nvme_alloc_ns` | core.c | N/M | selector + defer | §23.2 |
+| `nvme_dev_ioctl` | ioctl.c | M | CSQ_* 디스패치 | §22.1 |
+| `struct nvmset_group`, dev/queue 확장 | pci.h | N | 그룹/캐시 필드 | §20.1 |
+| `nvme_pci_nvmset_ctl` / `nvmset_csq_create/delete` | pci-nvmset.c | N | 제어 경로 | §22.2 |
+| `nvme_pci_ns_tagset` / `nvmset_alloc_tag_set` | pci-nvmset.c | N | selector + lazy tagset | §23.3/§24.1 |
+| `nvmset_mq_ops` / `nvmset_map_queues` / `nvmset_init_hctx` | pci.c | N | blk-mq ops | §24 |
+| `nvme_queue_tagset` | pci.c | **M(핵심)** | 완료 디먹스 재작성 | §24.4/§15 |
+| `nvmset_teardown_overlay` / `nvme_reset_work` | pci.c | N/M | Option B | §25 |
+| ioctl 번호/구조체 | uapi/nvme_ioctl.h | N | UAPI | §21 |
+| Makefile / Kconfig | — | M | 빌드 가드 | §19.3 |
+
+**1단계 PR 분할(독립 리뷰·이등분 용이)**:
+1. **PR-A(무동작 인프라)**: `nvme_ctrl_ops` 콜백 추가 + `nvme_select_ns_tagset` 도입(콜백 NULL→mainline 동일). NVMSETID 채집. **기능 변화 0**, 회귀 테스트 통과 기준선.
+2. **PR-B(디먹스 재작성)**: `nvmeq->tags` 캐시 + `nvme_queue_tagset` 재작성 + 기본 그룹 init_hctx 통일. **단일 tagset 에서도 동작 동일**해야 함(§15 자가검증).
+3. **PR-C(그룹 lifecycle)**: `pci.h`/`pci-nvmset.c`, UAPI ioctl, `nvmset_mq_ops`, lazy tagset, defer/rescan. State D↔P 전이.
+4. **PR-D(reset Option B)**: `nvmset_teardown_overlay` + reset 재스캔.
+
+> PR-A·PR-B 는 NVM Set 없이도 머지 가능(순수 리팩터). 위험은 PR-C·PR-D 에 집중되므로 분리가 곧 안전장치.
+
+---
+
 ## 부록 — 참조
 
 - **NVMe spec**: Create I/O Submission/Completion Queue (CDW10~12, NVMSETID/QPRIO) · NVM Sets, Identify NVM Set List(CNS 04h), Identify Namespace 의 NVMSETID · Arbitration: WRR with Urgent Priority Class(`CAP.AMS`/`CC.AMS`)
 - **Linux**: `drivers/nvme/host/{pci.c, core.c, ioctl.c, multipath.c}` · blk-mq(`block/blk-mq.c`, `struct blk_mq_tag_set`)
 - **관련 노트**: [[nvme-driver.md]], [[sq-mapping-comparison.md]], [[io_submit-to-nvme_queue_rq-flow.md]], [[per-io-timeout-iocb-proposal.md]]
+- **코드 구조 분석 노트**: [[nvme-queue-mgmt-design]], [[nvme-queue-init-request-queue-tagset-hctx]], [[nvme-tagset-blkmq-flow]] (deep/analysis/kernel/) — tagset/hctx/SQ 매핑 실코드 근거
