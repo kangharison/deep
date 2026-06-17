@@ -2,7 +2,9 @@
 
 > 기준 코드: `sources/linux/drivers/nvme/host/{pci.c, core.c, ioctl.c, multipath.c}`, blk-mq(`block/blk-mq.c`)
 > 기준 스펙: NVMe Base Spec — Create I/O SQ/CQ, NVM Sets, Identify, Arbitration(WRR)
-> 작성: 2026-06-09 · 갱신: 2026-06-17 · 상태: 설계 확정 + **실제 코드 구성안(§19~§27)** + **보조 함수 전체 구현(§28)** 추가
+> 작성: 2026-06-09 · 갱신: 2026-06-17 · 상태: 설계 확정 + 코드 구성안(§19~§27) + 보조 함수 전체(§28) + **★ endurance_group 기반 개정 정본(§29)**
+>
+> **읽는 순서 주의**: 앵커 자료구조·"생성→큐맵 구성" 타이밍은 **§29가 정본**이다(§7·§9·§20·§22~24·§28의 해당 부분 대체). §29 외 절은 격리 원리·격리 검토·디먹스·reset 등 변하지 않는 설계.
 
 **한 줄 요약**: NVMe IO SQ 를 **NVM Set(=namespace) 단위로 분리**해 namespace 별 전용 tagset 에 묶어 격리한다. 큐 생성은 **ioctl 로 NVMSETID 를 실은 Create I/O SQ** 를 발행하는 커스텀 드라이버가 담당하며, blk-mq 데이터패스(`nvme_queue_rq`)는 그대로 재사용한다. 이후 thread 격리는 cgroup 으로 얹는다.
 
@@ -152,6 +154,8 @@ disk = blk_mq_alloc_disk(ts, &lim, ns);
 ---
 
 ## 7. 핵심 자료구조
+
+> **⚠️ §29로 개정됨**: 앵커 구조체가 `nvmset_group`(dev 직접 소유) → **`endurance_group`(ENDGRP 컨테이너) → `nvmset_entry`(NVM Set별 tagset)** 계층으로 바뀌고, SQ 식별이 포인터 배열 `sqs[]` → **`sqid` 목록**으로, tagset 생성 시점이 "첫 ns lazy" → **"rescan 때 sqid 테이블로 일괄 구성"**으로 변경. 이하 §7~§9·§20·§22~§24·§28의 해당 부분은 §29가 정본이다.
 
 ```c
 /* 개념 스케치 — 실제 필드/타입은 구현 시 확정 */
@@ -1454,6 +1458,324 @@ static void nvme_defer_ns(struct nvme_ctrl *ctrl, u32 nsid)
 ```
 
 > **함수 완결성 체크**: §22~§25 에서 호출된 미정의 심볼 — `nvmset_find_group`, `nvmset_group_get_or_create`, `nvmset_group_free`, `nvmset_remove_group_namespaces`, `nvme_alloc_queue_id`, `nvme_free_queue_id`, `nvmset_acquire/release_vector`, `nvmset_request_irq`, `nvmset_prio_flag`, `adapter_alloc_sq_nvmset`, `nvmset_create_hw_queue`(=§22 의 `nvme_create_queue`), `nvmset_destroy_hw_queue`, `nvme_ctrl_tagset_active`, `nvme_pci_cmd_size`, `nvmset_budget_ok`, `nvmset_grow_default`, `nvmset_shrink_default`, `nvmset_sq_index`, `nvmset_group_grow`, `nvmset_group_shrink`, `nvmset_csq_create`, `nvmset_csq_delete`, `nvme_pci_ns_tagset`, `nvme_defer_ns` — **전부 정의 완료.** mainline 재사용(무수정): `nvme_alloc_queue`, `nvme_free_queue`, `nvme_init_queue`, `nvme_suspend_queue`, `adapter_alloc_cq`, `adapter_delete_sq/cq`, `nvme_submit_sync_cmd`, `nvme_irq`, `nvme_ns_remove`, `blk_mq_update_nr_hw_queues`, `blk_mq_alloc_tag_set`, `blk_mq_free_tag_set`, `nvme_queue_scan`.
+
+---
+
+## 29. ★ 개정 정본 — endurance_group 기반 모델 (앵커 구조체 + rescan 큐맵 구성)
+
+> 이 절이 앵커 자료구조와 "생성→맵 구성" 타이밍의 **정본**이다. §7·§9·§20.1·§22.2·§23.3·§24.1/§24.3/§24.4(init_hctx)·§28.1/§28.6/§28.7 의 해당 부분을 대체한다. 그대로 유지되는 것: 완료 디먹스 원리(§15), QPRIO/하드웨어 큐 생성(§28.3), qid/벡터 회계(§28.2), reset Option B(§25, 단 순회 단위는 entry).
+>
+> **핵심 차이 3가지** (기존안 → 개정안):
+> 1. 앵커 = **`endurance_group`(ENDGRP별 list) → `nvmset_entry`(NVM Set별 tagset)** 2계층. (기존 `nvmset_group` 단일 계층)
+> 2. **CSQ_CREATE = 기록 전용** — 하드웨어 SQ 생성 후 `nvmset_entry.sqids[]` 에 sqid append 만. tagset/큐맵 안 만들고 **rescan 트리거도 안 함**.
+> 3. **큐맵 = rescan 때 일괄 구성** — 모든 큐 생성 후 ns attach→rescan(§13) 시, 그 ns 의 NVMSETID 로 `nvmset_entry` 를 찾아 **기록된 sqid 목록으로** tagset(`nr_hw_queues=nr_sqs`)과 `hctx→SQ` 맵을 만든다.
+
+### 29.1 자료구조 (정본 — §7/§20.1 대체)
+
+```c
+/* drivers/nvme/host/pci.h (개정) */
+
+enum nvmset_state { NVMSET_STATE_D, NVMSET_STATE_P };       /* §1 D/P 그대로 */
+
+struct nvmset_entry {                  /* NVM Set 1개 = blk-mq tagset 격리 단위 */
+    u16                   nvmset_id;    /* 이 set 의 NVM Set ID (>=1) */
+    u16                  *sqids;        /* ★ 이 set 에 포함된 SQ id 목록(CSQ_CREATE 순서) */
+    unsigned int          nr_sqs;       /* sqids 유효 개수 = tagset.nr_hw_queues */
+    struct blk_mq_tag_set tagset;       /* rescan 때 sqids 로 구성(일시 생성/소멸) */
+    bool                  tagset_ready; /* lazy 빌드 가드 */
+    struct nvme_dev      *dev;          /* init_hctx 에서 dev->queues[sqid] 해석용 back-ptr */
+    struct list_head      entry;        /* endurance_group.sets 연결 */
+};
+
+struct nvme_endurance_group {           /* ENDGRP 컨테이너 (1 ENDGRP : N NVM Set) */
+    u16               endgrp_id;        /* Endurance Group ID */
+    struct list_head  sets;             /* nvmset_entry 목록 */
+    unsigned int      nr_sets;
+    struct list_head  entry;            /* nvme_dev.endgrp_list 연결 */
+};
+
+struct nvme_dev {                       /* 확장 (기존 필드 그대로 + 아래) */
+    struct list_head   endgrp_list;     /* ★ nvme_endurance_group 목록 */
+    unsigned int       nr_endgrps;
+    enum nvmset_state  nvmset_state;
+    struct mutex       nvmset_lock;     /* CSQ ↔ reset ↔ scan 직렬화(§26) */
+    struct ida         qid_ida;         /* IO qid 1..max_qid */
+    struct ida         vec_ida;         /* MSI-X 1..num_vecs-1 */
+    struct list_head   deferred_ns;     /* 엣지: 큐보다 ns 가 먼저인 경우 보류 */
+};
+
+/* struct nvme_queue 확장(§20.1 동일, 이름만): */
+struct nvme_queue {
+    /* ... 기존 ... */
+    struct blk_mq_tags  *tags;          /* = hctx->tags. 완료 디먹스(§15) */
+    struct nvmset_entry *set;           /* 이 SQ 가 속한 NVM Set(기본그룹이면 NULL) */
+};
+```
+
+> **NVM Set ID 유일성**: NVM Set ID 는 컨트롤러(서브시스템) 범위에서 유일하므로, ns→entry 조회는 endgrp 를 가로질러 `nvmset_id` 키 하나로 충분하다(§29.5 `nvmset_find_entry`). `endgrp_id` 는 *배치(컨테이너)* 와 ENDGRP 단위 정책(추후 WRR/예산)에만 쓰인다.
+
+### 29.2 UAPI 개정 — `endgrp_id` 추가 (§21 대체)
+
+```c
+struct nvme_csq_create {
+    __u16 endgrp_id;   /* 이 SQ 가 속할 Endurance Group (배치 컨테이너) */
+    __u16 nvmset_id;   /* 0 = State D(ctrl->tagset). >=1 = State P(해당 NVM Set) */
+    __u16 qsize;       /* SQ 깊이(0→기본) */
+    __u8  qprio;       /* WRR 우선순위(§28.3) */
+    __u8  flags;       /* 예약(0) */
+    __u16 qid_out;     /* [out] 배정 qid */
+    __u16 rsvd;
+};
+/* DELETE 는 §21 그대로(+endgrp_id 선택). 번호도 §21 동일. */
+```
+> `endgrp_id` 는 Identify(NVM Set/Endurance Group List)로 검증 가능하나, **private ioctl 이므로 orchestration 이 직접 지정**하는 편이 단순(§8 "제어면은 드라이버 전용"). 미지정(0) 시 단일 ENDGRP 로 폴백.
+
+### 29.3 CSQ_CREATE = 기록 전용 (§22.2/§28.6 create 대체)
+
+```c
+static int nvmset_csq_create(struct nvme_dev *dev, void __user *uarg)
+{
+    struct nvme_csq_create c;
+    struct nvme_endurance_group *eg;
+    struct nvmset_entry *se;
+    struct nvme_queue *nvmeq;
+    int qid, ret;
+
+    if (copy_from_user(&c, uarg, sizeof(c)))                 return -EFAULT;
+    guard(mutex)(&dev->nvmset_lock);
+
+    /* all-or-nothing 불변식(§1 #2) */
+    if (dev->nvmset_state == NVMSET_STATE_P && c.nvmset_id == 0)              return -EBUSY;
+    if (dev->nvmset_state == NVMSET_STATE_D && c.nvmset_id != 0 &&
+        nvme_ctrl_tagset_active(&dev->ctrl))                                  return -EBUSY;
+    if (!nvmset_budget_ok(dev))                                              return -ENOSPC;
+
+    qid = nvme_alloc_queue_id(dev);
+    if (qid < 0)                                             return qid;
+
+    /* 하드웨어 SQ/CQ 는 지금 만든다(§28.3). 단 tagset/맵은 만들지 않음. */
+    ret = nvmset_create_hw_queue(dev, qid, c.nvmset_id, c.qprio, c.qsize);
+    if (ret) { nvme_free_queue_id(dev, qid); return ret; }
+    nvmeq = dev->queues[qid];
+
+    if (c.nvmset_id == 0)                                    /* State D: 기본 그룹 흡수 */
+        return nvmset_grow_default(dev, qid, uarg);
+
+    /* ★ State P: 'endurance_group → nvmset_entry' 테이블에 sqid 기록만 */
+    eg = nvme_endgrp_get_or_create(dev, c.endgrp_id);
+    if (!eg)            { nvmset_destroy_hw_queue(dev, nvmeq); return -ENOMEM; }
+    se = nvmset_entry_get_or_create(dev, eg, c.nvmset_id);
+    if (!se)            { nvmset_destroy_hw_queue(dev, nvmeq); return -ENOMEM; }
+
+    se->sqids[se->nr_sqs++] = qid;                           /* 기록 */
+    nvmeq->set = se;
+    dev->nvmset_state = NVMSET_STATE_P;
+
+    /* ★ rescan 트리거 안 함 — provisioning 은 '모든 큐 생성 후' ns attach→rescan(§13).
+     *   이미 tagset 이 떠 있던(=ns 가 있던) set 에 한해서만 grow 반영: */
+    if (se->tagset_ready)
+        blk_mq_update_nr_hw_queues(&se->tagset, se->nr_sqs);  /* P→P [B] 동적 grow */
+
+    c.qid_out = qid;
+    return copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+}
+```
+
+> 기존안과의 차이: ① `nvme_queue_scan()` 호출 제거(정상 흐름은 ns attach 가 rescan 유발). ② SQ 를 포인터 배열이 아니라 **sqid 번호로 기록**. ③ tagset 은 여기서 안 만든다(§29.4 가 만든다).
+
+### 29.4 rescan 큐맵 구성 (정본 — §9·§23.3·§24 init_hctx 대체)
+
+ns attach AEN → `nvme_scan_work` → `nvme_alloc_ns`(core) → selector 콜백에서 **기록 테이블로 tagset+맵을 구성**한다.
+
+```c
+/* (pci-nvmset.c) nvme_ctrl_ops.ns_tagset 구현 — rescan 시 호출 */
+struct blk_mq_tag_set *
+nvme_pci_ns_tagset(struct nvme_ctrl *ctrl, struct nvme_ns_info *info, bool *defer)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    struct nvmset_entry *se;
+
+    *defer = false;
+    guard(mutex)(&dev->nvmset_lock);
+
+    if (info->nvmset_id == 0) {                              /* State D */
+        if (nvme_ctrl_tagset_active(ctrl)) return ctrl->tagset;
+        *defer = true; return NULL;                          /* P 인데 D ns → 보류 */
+    }
+    se = nvmset_find_entry(dev, info->nvmset_id);            /* 기록 테이블 조회 */
+    if (!se || se->nr_sqs == 0) { *defer = true; return NULL; }  /* 큐 기록 없음 → 보류 */
+
+    if (!se->tagset_ready) {                                 /* ★ 최초 ns 때 sqids 로 빌드 */
+        if (nvmset_build_tagset(dev, se)) { *defer = true; return NULL; }
+    }
+    return &se->tagset;                                      /* 이 set 의 모든 ns 가 공유 */
+}
+
+/* sqids 목록 → tagset 구성. nr_hw_queues = 기록된 SQ 수 */
+static int nvmset_build_tagset(struct nvme_dev *dev, struct nvmset_entry *se)
+{
+    struct blk_mq_tag_set *set = &se->tagset;
+
+    memset(set, 0, sizeof(*set));
+    set->ops          = &nvmset_mq_ops;
+    set->nr_hw_queues = se->nr_sqs;                          /* ★ = sqids 개수 */
+    set->nr_maps      = 1;                                   /* phase1: DEFAULT */
+    set->queue_depth  = dev->ctrl.sqsize + 1;
+    set->numa_node    = dev->ctrl.numa_node;
+    set->cmd_size     = nvme_pci_cmd_size(dev);
+    set->timeout      = NVME_IO_TIMEOUT;
+    set->flags        = BLK_MQ_F_SHOULD_MERGE;               /* TAG_HCTX_SHARED 금지(§14 G6) */
+    set->driver_data  = se;                                  /* map/init_hctx 가 sqids 접근 */
+
+    if (blk_mq_alloc_tag_set(set))                           /* → map_queues + init_hctx 콜백 */
+        return -ENOMEM;
+    se->tagset_ready = true;
+    return 0;
+}
+
+/* .map_queues — 라운드로빈(§8.3) */
+static void nvmset_map_queues(struct blk_mq_tag_set *set)
+{
+    struct nvmset_entry *se = set->driver_data;
+    struct blk_mq_queue_map *map = &set->map[HCTX_TYPE_DEFAULT];
+    map->nr_queues = se->nr_sqs;  map->queue_offset = 0;
+    blk_mq_map_queues(map);
+}
+
+/* .init_hctx — ★ 로컬 idx → 기록된 sqid → dev->queues[sqid] 로 nvme_queue 해석 + 디먹스 캐시(§15) */
+static int nvmset_init_hctx(struct blk_mq_hw_ctx *hctx, void *data, unsigned int hctx_idx)
+{
+    struct nvmset_entry *se = data;
+    struct nvme_dev *dev = se->dev;
+    u16 sqid = se->sqids[hctx_idx];
+    struct nvme_queue *nvmeq = dev->queues[sqid];           /* sqid → 실제 SQ */
+
+    nvmeq->tags = hctx->tags;                               /* 완료 디먹스 정답 풀 캐시 */
+    hctx->driver_data = nvmeq;
+    return 0;
+}
+```
+
+`nvme_queue_tagset()`(완료, §24.4/§15)는 그대로 — `return nvmeq->tags;`. 즉 **"sqid 목록"은 제출측 맵 구성에만 쓰이고, 완료측은 init_hctx 가 캐시한 `nvmeq->tags` 로 O(1) 역매핑**되어 §15 정합이 유지된다.
+
+> §9 와의 관계: 기존 §9 는 "첫 ns 바인딩에서 lazy 생성"이라 했고, 개정안도 트리거는 동일(첫 ns)하되 **재료가 `g->nr_sqs`(누적 카운트)에서 `se->sqids[]`(명시적 목록)로** 바뀐다. 명시 목록이라 grow/shrink 후에도 어떤 sqid 가 어느 hctx 인덱스인지 추적이 명확하다.
+
+### 29.5 보조 함수 (정본 — §28.1 그룹 관리 대체)
+
+```c
+/* ── 조회 ── caller holds nvmset_lock */
+static struct nvme_endurance_group *nvme_endgrp_find(struct nvme_dev *dev, u16 id)
+{
+    struct nvme_endurance_group *eg;
+    list_for_each_entry(eg, &dev->endgrp_list, entry)
+        if (eg->endgrp_id == id) return eg;
+    return NULL;
+}
+static struct nvmset_entry *nvmset_find_entry(struct nvme_dev *dev, u16 nvmset_id)
+{
+    struct nvme_endurance_group *eg;
+    struct nvmset_entry *se;
+    list_for_each_entry(eg, &dev->endgrp_list, entry)
+        list_for_each_entry(se, &eg->sets, entry)
+            if (se->nvmset_id == nvmset_id) return se;     /* NVM Set ID 유일 */
+    return NULL;
+}
+
+/* ── 생성 ── caller holds nvmset_lock */
+static struct nvme_endurance_group *nvme_endgrp_get_or_create(struct nvme_dev *dev, u16 id)
+{
+    struct nvme_endurance_group *eg = nvme_endgrp_find(dev, id);
+    if (eg) return eg;
+    eg = kzalloc(sizeof(*eg), GFP_KERNEL);
+    if (!eg) return NULL;
+    eg->endgrp_id = id;
+    INIT_LIST_HEAD(&eg->sets);
+    list_add_tail(&eg->entry, &dev->endgrp_list);
+    dev->nr_endgrps++;
+    return eg;
+}
+static struct nvmset_entry *
+nvmset_entry_get_or_create(struct nvme_dev *dev, struct nvme_endurance_group *eg, u16 nvmset_id)
+{
+    struct nvmset_entry *se = nvmset_find_entry(dev, nvmset_id);
+    if (se) return se;                                      /* 이미 있으면 누적 대상 */
+    se = kzalloc(sizeof(*se), GFP_KERNEL);
+    if (!se) return NULL;
+    se->sqids = kcalloc(dev->max_qid, sizeof(u16), GFP_KERNEL);  /* 상한 = 전역 qid 수 */
+    if (!se->sqids) { kfree(se); return NULL; }
+    se->nvmset_id = nvmset_id;
+    se->dev = dev;
+    list_add_tail(&se->entry, &eg->sets);
+    eg->nr_sets++;
+    return se;
+}
+
+/* ── 해제 ── caller holds nvmset_lock. 전제: 소속 ns 전부 제거됨 */
+static void nvmset_entry_free(struct nvme_dev *dev, struct nvme_endurance_group *eg,
+                             struct nvmset_entry *se)
+{
+    int i;
+    if (se->tagset_ready) blk_mq_free_tag_set(&se->tagset);          /* §13 조건1 */
+    for (i = se->nr_sqs - 1; i >= 0; i--)                            /* SQ→CQ 순(§12 규칙①) */
+        nvmset_destroy_hw_queue(dev, dev->queues[se->sqids[i]]);
+    list_del(&se->entry);
+    eg->nr_sets--;
+    kfree(se->sqids);
+    kfree(se);
+}
+static void nvme_endgrp_free(struct nvme_dev *dev, struct nvme_endurance_group *eg)
+{
+    struct nvmset_entry *se, *t;
+    list_for_each_entry_safe(se, t, &eg->sets, entry) {
+        nvmset_remove_entry_namespaces(dev, se);                     /* del_gendisk(§28.1 변형) */
+        nvmset_entry_free(dev, eg, se);
+    }
+    list_del(&eg->entry);
+    dev->nr_endgrps--;
+    kfree(eg);
+}
+
+/* 이 NVM Set 에 바인딩된 ns 제거 — §28.1 nvmset_remove_group_namespaces 의 entry 판 */
+static void nvmset_remove_entry_namespaces(struct nvme_dev *dev, struct nvmset_entry *se)
+{
+    struct nvme_ctrl *ctrl = &dev->ctrl;
+    struct nvme_ns *ns, *next;  LIST_HEAD(rm);
+    down_write(&ctrl->namespaces_rwsem);
+    list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+        if (ns->head->nvmset_id == se->nvmset_id) list_move_tail(&ns->list, &rm);
+    up_write(&ctrl->namespaces_rwsem);
+    list_for_each_entry_safe(ns, next, &rm, list) nvme_ns_remove(ns);
+}
+```
+
+`nvmset_csq_delete`(§28.6)·`nvmset_teardown_overlay`(§25)는 위 entry 헬퍼로 치환: 그룹 삭제 = `nvme_endgrp_free`/`nvmset_entry_free`, shrink = `se->sqids[]` 에서 해당 sqid 스왑-제거 후 `blk_mq_update_nr_hw_queues(&se->tagset, --se->nr_sqs)`.
+
+### 29.6 그대로 유지되는 부분 (재사용)
+
+| 유지 | 절 | 비고 |
+|------|----|------|
+| 완료 디먹스(`nvmeq->tags` 캐시 + `nvme_queue_tagset`) | §15·§24.4 | init_hctx 가 sqid→nvmeq 로 해석만 바뀜 |
+| 하드웨어 큐 생성(CDW12 NVMSETID, QPRIO) | §28.3 | `nvmset_create_hw_queue`/`adapter_alloc_sq_nvmset` 동일 |
+| qid/MSI-X 회계, State 판정, cmd_size, 예산 | §28.2·§28.4 | 동일 |
+| selector 훅·core 통합(NVMSETID 채집·defer) | §23.1·§23.2·§23.4 | `nvme_ns_info.nvmset_id` 채집 동일, entry 조회만 변경 |
+| reset Option B | §25 | 순회 단위가 group_list → **endgrp_list→sets** |
+| 락 순서 | §26 | 동일(`nvmset_lock`) |
+
+### 29.7 한눈에 보는 흐름 (개정)
+
+```
+[ioctl] CSQ_CREATE(endgrp=E, nvmset=k) × N
+   └ nvmset_create_hw_queue(qid)            : 하드웨어 SQ/CQ 생성(CDW12=k)
+   └ endgrp[E].set[k].sqids[nr++] = qid     : ★ 기록만 (tagset/맵 X, rescan X)
+        ... 모든 큐 생성 완료 ...
+[admin] ns create & attach (ENDGRP E, NVMSET k)  → AEN
+[scan]  nvme_scan_work → nvme_alloc_ns → ns_tagset(info.nvmset_id=k):
+           se = find_entry(k)
+           if !se->tagset_ready: build_tagset(se)   ★ sqids[] 로 nr_hw_queues 구성
+                                                       map_queues(라운드로빈)
+                                                       init_hctx: sqid→dev->queues[sqid], tags 캐시
+           return &se->tagset → blk_mq_alloc_disk → /dev/nvme0nX
+```
 
 ---
 
