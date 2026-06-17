@@ -2,7 +2,7 @@
 
 > 기준 코드: `sources/linux/drivers/nvme/host/{pci.c, core.c, ioctl.c, multipath.c}`, blk-mq(`block/blk-mq.c`)
 > 기준 스펙: NVMe Base Spec — Create I/O SQ/CQ, NVM Sets, Identify, Arbitration(WRR)
-> 작성: 2026-06-09 · 갱신: 2026-06-17 · 상태: 설계 확정 + **실제 코드 구성안(§19~§27)** 추가
+> 작성: 2026-06-09 · 갱신: 2026-06-17 · 상태: 설계 확정 + **실제 코드 구성안(§19~§27)** + **보조 함수 전체 구현(§28)** 추가
 
 **한 줄 요약**: NVMe IO SQ 를 **NVM Set(=namespace) 단위로 분리**해 namespace 별 전용 tagset 에 묶어 격리한다. 큐 생성은 **ioctl 로 NVMSETID 를 실은 Create I/O SQ** 를 발행하는 커스텀 드라이버가 담당하며, blk-mq 데이터패스(`nvme_queue_rq`)는 그대로 재사용한다. 이후 thread 격리는 cgroup 으로 얹는다.
 
@@ -1011,6 +1011,449 @@ static void nvmset_teardown_overlay(struct nvme_dev *dev)
 4. **PR-D(reset Option B)**: `nvmset_teardown_overlay` + reset 재스캔.
 
 > PR-A·PR-B 는 NVM Set 없이도 머지 가능(순수 리팩터). 위험은 PR-C·PR-D 에 집중되므로 분리가 곧 안전장치.
+
+---
+
+## 28. 보조 함수 전체 구현 (full helpers)
+
+> §22~§25 에서 이름만 등장한 모든 헬퍼를 완성한다. 작성하며 확정된 **3개 보정점**(앞 절과의 정합):
+> 1. **§22.2 의 `nvme_create_queue(qid,nvmset_id,qprio,qsize)` → `nvmset_create_hw_queue()`** 로 명명(아래 §28.3).
+> 2. **§20.1 `refcount_t ns_ref` / §23.3 `refcount_inc` 제거** — 그룹 해제는 명시적(CSQ_DELETE/teardown)이고 ns 는 `head->nvmset_id` 로 열거하므로 카운터 불요(queue-first 라 ns 0 그룹 정상, §13). 통계가 필요하면 락 보호 `unsigned int nr_ns` 로만.
+> 3. **§22.2 P-branch grow 누락 보강** — 기존 그룹(`tagset_ready`)에 SQ 추가 시 `blk_mq_update_nr_hw_queues()` 호출(P→P [B], §28.5).
+>
+> 공통 전제: **별도 명시 없으면 모든 헬퍼는 호출자가 `dev->nvmset_lock` 보유**(§26). `to_nvme_dev(ctrl)=container_of(ctrl,struct nvme_dev,ctrl)`.
+>
+> `struct nvme_dev` 추가 필드(§20.1 보완): `struct ida qid_ida;`(IO qid 1..max_qid), `struct ida vec_ida;`(MSI-X 1..num_vecs-1) — probe 에서 `ida_init`, remove 에서 `ida_destroy`.
+
+### 28.1 그룹 조회 / 생성 / 해제
+
+```c
+/* 그룹 검색 — caller holds nvmset_lock */
+static struct nvmset_group *nvmset_find_group(struct nvme_dev *dev, u16 id)
+{
+    struct nvmset_group *g;
+    list_for_each_entry(g, &dev->group_list, entry)
+        if (g->nvmset_id == id)
+            return g;
+    return NULL;
+}
+
+/* 없으면 그룹 구조만 신설(하드웨어 SQ/tagset 은 아직 X) — caller holds nvmset_lock */
+static struct nvmset_group *nvmset_group_get_or_create(struct nvme_dev *dev, u16 id)
+{
+    struct nvmset_group *g = nvmset_find_group(dev, id);
+    if (g)
+        return g;                       /* 이미 존재: 그대로 반환(누적 대상) */
+
+    g = kzalloc(sizeof(*g), GFP_KERNEL);
+    if (!g)
+        return NULL;
+    /* SQ 포인터 배열은 그룹이 최대로 가질 수 있는 SQ 수(=전역 max_qid)로 1회 할당 */
+    g->sqs = kcalloc(dev->max_qid, sizeof(*g->sqs), GFP_KERNEL);
+    if (!g->sqs) {
+        kfree(g);
+        return NULL;
+    }
+    g->nvmset_id    = id;
+    g->nr_sqs       = 0;
+    g->tagset_ready = false;
+    INIT_LIST_HEAD(&g->entry);
+    list_add_tail(&g->entry, &dev->group_list);
+    dev->nr_groups++;
+    return g;
+}
+
+/* 그룹 완전 해제 — 전제: 소속 ns 전부 nvmset_remove_group_namespaces() 로 제거됨.
+ * caller holds nvmset_lock. (§13 조건1: free_tag_set 은 gendisk 제거 후) */
+static void nvmset_group_free(struct nvme_dev *dev, struct nvmset_group *g)
+{
+    int i;
+
+    if (g->tagset_ready)
+        blk_mq_free_tag_set(&g->tagset);          /* SW tagset 해제 */
+    for (i = g->nr_sqs - 1; i >= 0; i--)          /* SQ→CQ 순, 역순 정리(§12 규칙①) */
+        nvmset_destroy_hw_queue(dev, g->sqs[i]);
+    list_del(&g->entry);
+    dev->nr_groups--;
+    kfree(g->sqs);
+    kfree(g);
+}
+
+/* 이 그룹에 바인딩된 gendisk 전부 제거(re-home/teardown 전 선행) — caller holds nvmset_lock.
+ * nvme_ns_remove() 는 rwsem 안에서 못 부르므로 mainline 패턴대로 락을 풀고 호출. */
+static void nvmset_remove_group_namespaces(struct nvme_dev *dev, struct nvmset_group *g)
+{
+    struct nvme_ctrl *ctrl = &dev->ctrl;
+    struct nvme_ns *ns, *next;
+    LIST_HEAD(rm);
+
+    down_write(&ctrl->namespaces_rwsem);          /* 최신 커널은 srcu — 버전에 맞춤 */
+    list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+        if (ns->head->nvmset_id == g->nvmset_id)
+            list_move_tail(&ns->list, &rm);
+    up_write(&ctrl->namespaces_rwsem);
+
+    list_for_each_entry_safe(ns, next, &rm, list)
+        nvme_ns_remove(ns);                        /* del_gendisk + 정리(mainline) */
+}
+```
+
+### 28.2 qid / MSI-X 벡터 회계
+
+```c
+/* 전역 IO qid 비트맵 할당(1..max_qid). 그룹 간 비연속 가능 → IDA 사용 */
+static int nvme_alloc_queue_id(struct nvme_dev *dev)
+{
+    return ida_alloc_range(&dev->qid_ida, 1, dev->max_qid, GFP_KERNEL);
+}
+static void nvme_free_queue_id(struct nvme_dev *dev, u16 qid)
+{
+    ida_free(&dev->qid_ida, qid);
+}
+
+/* MSI-X 벡터 1개 확보/반납(admin=0 제외). ★ 실제 affinity 배정은 §17 리스크 — 여기선 풀에서 인덱스만 */
+static int nvmset_acquire_vector(struct nvme_dev *dev)
+{
+    return ida_alloc_range(&dev->vec_ida, 1, dev->num_vecs - 1, GFP_KERNEL);
+}
+static void nvmset_release_vector(struct nvme_dev *dev, int vector)
+{
+    if (vector >= 0)
+        ida_free(&dev->vec_ida, vector);
+}
+
+/* 큐 IRQ 등록(mainline nvme_irq 핸들러 재사용) */
+static int nvmset_request_irq(struct nvme_dev *dev, struct nvme_queue *nvmeq)
+{
+    struct pci_dev *pdev = to_pci_dev(dev->dev);
+    return pci_request_irq(pdev, nvmeq->cq_vector, nvme_irq, NULL, nvmeq,
+                           "nvme%dq%d", dev->ctrl.instance, nvmeq->qid);
+}
+```
+
+### 28.3 하드웨어 큐 생성 — NVMSETID/QPRIO 주입 (§8.2 실제 코드)
+
+```c
+/* QPRIO → Create I/O SQ CDW11 sq_flags 비트. WRR 미지원(CC.AMS=0)이면 URGENT(=0) 무해 */
+static u16 nvmset_prio_flag(u8 qprio)
+{
+    switch (qprio) {
+    case 0:  return NVME_SQ_PRIO_URGENT;   /* (0 << 1) */
+    case 1:  return NVME_SQ_PRIO_HIGH;     /* (1 << 1) */
+    case 2:  return NVME_SQ_PRIO_MEDIUM;   /* (2 << 1) */
+    default: return NVME_SQ_PRIO_LOW;      /* (3 << 1) */
+    }
+}
+
+/* mainline adapter_alloc_sq 확장: CDW11 에 QPRIO, CDW12 에 NVMSETID.
+ * ★ struct nvme_create_sq 의 CDW12 예약영역을 fork 에서 nvmsetid 필드로 명명
+ *   (mainline: __le32 rsvd12[...]; → fork: __le16 nvmsetid; __le16 rsvd; __u32 rsvd13[3];) */
+static int adapter_alloc_sq_nvmset(struct nvme_dev *dev, u16 qid,
+                                   struct nvme_queue *nvmeq, u16 nvmset_id, u8 qprio)
+{
+    struct nvme_command c = { };
+    u16 flags = NVME_QUEUE_PHYS_CONTIG | nvmset_prio_flag(qprio);
+
+    c.create_sq.opcode   = nvme_admin_create_sq;
+    c.create_sq.prp1     = cpu_to_le64(nvmeq->sq_dma_addr);
+    c.create_sq.sqid     = cpu_to_le16(qid);
+    c.create_sq.qsize    = cpu_to_le16(nvmeq->q_depth - 1);  /* 0-based */
+    c.create_sq.sq_flags = cpu_to_le16(flags);
+    c.create_sq.cqid     = cpu_to_le16(qid);                 /* SQ:CQ = 1:1 */
+    c.create_sq.nvmsetid = cpu_to_le16(nvmset_id);           /* ◄── CDW12 (§8.2) */
+    return nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
+}
+
+/* §22.2 의 nvme_create_queue(...) 실체. CQ→SQ 순 생성 + 벡터 + IRQ + 등록 */
+static int nvmset_create_hw_queue(struct nvme_dev *dev, u16 qid, u16 nvmset_id,
+                                  u8 qprio, u16 qsize)
+{
+    struct nvme_queue *nvmeq;
+    int vector, ret;
+    u16 depth = qsize ? qsize : dev->q_depth;
+
+    nvmeq = nvme_alloc_queue(dev, qid, depth);    /* nvme_queue + SQ/CQ DMA(mainline) */
+    if (!nvmeq)
+        return -ENOMEM;
+
+    vector = nvmset_acquire_vector(dev);
+    if (vector < 0) { ret = vector; goto free_q; }
+    nvmeq->cq_vector = vector;
+
+    ret = adapter_alloc_cq(dev, qid, nvmeq, vector);              /* Create I/O CQ */
+    if (ret) goto put_vec;
+    ret = adapter_alloc_sq_nvmset(dev, qid, nvmeq, nvmset_id, qprio); /* Create I/O SQ */
+    if (ret) goto del_cq;
+    ret = nvmset_request_irq(dev, nvmeq);
+    if (ret) goto del_sq;
+
+    nvme_init_queue(nvmeq, qid);                  /* doorbell/상태 활성(mainline) */
+    dev->queues[qid] = nvmeq;                     /* 전역 큐 테이블 등록 */
+    dev->online_queues++;
+    return 0;
+
+del_sq:  adapter_delete_sq(dev, qid);
+del_cq:  adapter_delete_cq(dev, qid);
+put_vec: nvmset_release_vector(dev, vector);
+free_q:  nvme_free_queue(nvmeq);
+    return ret;
+}
+
+/* 단일 하드웨어 큐 파괴(역순) — §12 규칙① SQ→CQ */
+static void nvmset_destroy_hw_queue(struct nvme_dev *dev, struct nvme_queue *nvmeq)
+{
+    u16 qid = nvmeq->qid;
+
+    nvme_suspend_queue(nvmeq);                    /* IRQ/doorbell off, in-flight drain(mainline) */
+    nvmeq->tags = NULL;                           /* §15 stale 디먹스 방지 */
+    adapter_delete_sq(dev, qid);                  /* SQ 먼저 */
+    adapter_delete_cq(dev, qid);                  /* CQ 나중 */
+    nvmset_release_vector(dev, nvmeq->cq_vector);
+    dev->queues[qid] = NULL;
+    dev->online_queues--;
+    nvme_free_queue_id(dev, qid);
+    nvme_free_queue(nvmeq);
+}
+```
+
+### 28.4 State 판정 / cmd_size / 예산
+
+```c
+/* ctrl->tagset 이 active(State D, SQ>0)인가 — dormant(State P)와 구분(§5/§1 #3) */
+static inline bool nvme_ctrl_tagset_active(struct nvme_ctrl *ctrl)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    return ctrl->tagset &&
+           dev->nvmset_state == NVMSET_STATE_D &&
+           ctrl->tagset->nr_hw_queues > 0;
+}
+
+/* per-set tagset 의 cmd_size — mainline ctrl tagset 과 동일 계산 재사용(§24.1) */
+static unsigned int nvme_pci_cmd_size(struct nvme_dev *dev)
+{
+    /* 실제 식은 커널 버전 의존: sizeof(struct nvme_iod) + PRP/SGL 디스크립터 풀.
+     * mainline 이 dev->tagset.cmd_size 에 넣는 값을 그대로 쓰면 됨. */
+    return sizeof(struct nvme_iod) +
+           (NVME_MAX_SEGS * sizeof(struct scatterlist));
+}
+
+/* Σ(모든 그룹 nr_sqs) + 신규 1 ≤ max_io_queues 인가 (§8.1) — caller holds nvmset_lock */
+static bool nvmset_budget_ok(struct nvme_dev *dev)
+{
+    struct nvmset_group *g;
+    unsigned int used = dev->online_queues;       /* 이미 떠 있는 IO SQ 수(admin 제외) */
+    (void)g;
+    return used + 1 <= dev->max_io_queues;
+}
+```
+
+### 28.5 State D grow/shrink + P 그룹 grow/shrink
+
+```c
+/* State D: 새 SQ 를 ctrl->tagset 에 흡수(D→D). caller holds nvmset_lock */
+static int nvmset_grow_default(struct nvme_dev *dev, u16 qid, void __user *uarg)
+{
+    struct nvme_csq_create c;
+    int ret;
+
+    /* nvmset_create_hw_queue() 가 이미 dev->queues[qid] 등록·online_queues++ 함.
+     * ctrl->tagset 의 hw queue 수를 현재 online IO 큐 수로 재매핑(mainline 패턴). */
+    ret = blk_mq_update_nr_hw_queues(dev->ctrl.tagset, dev->online_queues - 1);
+    if (ret)
+        return ret;
+
+    if (copy_from_user(&c, uarg, sizeof(c)))
+        return -EFAULT;
+    c.qid_out = qid;
+    return copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+}
+
+/* State D 큐 축소(D→D) */
+static int nvmset_shrink_default(struct nvme_dev *dev, u16 qid)
+{
+    struct nvme_queue *nvmeq = dev->queues[qid];
+
+    if (!nvmeq || nvmeq->group)                   /* per-set 큐를 D 경로로 지우면 안 됨 */
+        return -EINVAL;
+    nvmset_destroy_hw_queue(dev, nvmeq);
+    return blk_mq_update_nr_hw_queues(dev->ctrl.tagset, dev->online_queues - 1);
+}
+
+/* 그룹 SQ 로컬 인덱스 검색 */
+static int nvmset_sq_index(struct nvmset_group *g, u16 qid)
+{
+    unsigned int i;
+    for (i = 0; i < g->nr_sqs; i++)
+        if (g->sqs[i]->qid == qid)
+            return i;
+    return -1;
+}
+
+/* P→P [B] grow: 기존 그룹에 이미 만든 nvmeq 를 편입 후 tagset 확장.
+ * (§22.2 csq_create 의 P-branch 끝에서 호출 — 보정점 #3) */
+static int nvmset_group_grow(struct nvme_dev *dev, struct nvmset_group *g,
+                             struct nvme_queue *nvmeq)
+{
+    nvmeq->group = g;
+    g->sqs[g->nr_sqs++] = nvmeq;
+    if (g->tagset_ready)                          /* 이미 ns 바인딩됨 → 큐 확장 */
+        return blk_mq_update_nr_hw_queues(&g->tagset, g->nr_sqs);
+    return 0;                                     /* 아직 lazy 전: 누적만(§9) */
+}
+
+/* P→P [C] shrink: 그룹에서 SQ 하나 제거(라운드로빈 매핑이라 인덱스 스왑 안전) */
+static int nvmset_group_shrink(struct nvme_dev *dev, struct nvmset_group *g, u16 qid)
+{
+    int idx = nvmset_sq_index(g, qid);
+    struct nvme_queue *victim;
+
+    if (idx < 0)
+        return -ENOENT;
+    if (g->nr_sqs == 1 && g->tagset_ready)        /* 마지막 SQ 는 ns 있으면 못 뺌 */
+        return -EBUSY;
+
+    swap(g->sqs[idx], g->sqs[g->nr_sqs - 1]);     /* victim 을 끝으로 */
+    victim = g->sqs[--g->nr_sqs];
+    if (g->tagset_ready)
+        blk_mq_update_nr_hw_queues(&g->tagset, g->nr_sqs);  /* freeze→remap→unfreeze */
+    nvmset_destroy_hw_queue(dev, victim);
+    return 0;
+}
+```
+
+### 28.6 제어 핸들러 최종본 (§22.2 보강 반영)
+
+```c
+static int nvmset_csq_create(struct nvme_dev *dev, void __user *uarg)
+{
+    struct nvme_csq_create c;
+    struct nvmset_group *g;
+    struct nvme_queue *nvmeq;
+    int qid, ret;
+
+    if (copy_from_user(&c, uarg, sizeof(c)))
+        return -EFAULT;
+    guard(mutex)(&dev->nvmset_lock);                       /* §26 */
+
+    /* all-or-nothing 불변식(§1 #2) */
+    if (dev->nvmset_state == NVMSET_STATE_P && c.nvmset_id == 0)
+        return -EBUSY;                                     /* P 에 D 큐 금지 */
+    if (dev->nvmset_state == NVMSET_STATE_D && c.nvmset_id != 0 &&
+        nvme_ctrl_tagset_active(&dev->ctrl))
+        return -EBUSY;                                     /* D active 와 P 혼용 금지(§13 선행 teardown) */
+    if (!nvmset_budget_ok(dev))
+        return -ENOSPC;                                    /* §8.1 예산 */
+
+    qid = nvme_alloc_queue_id(dev);
+    if (qid < 0)
+        return qid;
+
+    ret = nvmset_create_hw_queue(dev, qid, c.nvmset_id, c.qprio, c.qsize);
+    if (ret) {
+        nvme_free_queue_id(dev, qid);
+        return ret;
+    }
+    nvmeq = dev->queues[qid];
+
+    if (c.nvmset_id == 0)                                  /* State D: 기본 그룹 흡수 */
+        return nvmset_grow_default(dev, qid, uarg);
+
+    /* State P: 그룹 편입(+필요 시 grow) */
+    g = nvmset_group_get_or_create(dev, c.nvmset_id);
+    if (!g) {
+        nvmset_destroy_hw_queue(dev, nvmeq);              /* rollback */
+        return -ENOMEM;
+    }
+    ret = nvmset_group_grow(dev, g, nvmeq);               /* 누적 or update_nr_hw_queues */
+    if (ret) {
+        nvmset_destroy_hw_queue(dev, nvmeq);
+        return ret;
+    }
+    dev->nvmset_state = NVMSET_STATE_P;
+    nvme_queue_scan(&dev->ctrl);                          /* §23.4 보류 ns 재시도(비동기) */
+
+    c.qid_out = qid;
+    return copy_to_user(uarg, &c, sizeof(c)) ? -EFAULT : 0;
+}
+
+static int nvmset_csq_delete(struct nvme_dev *dev, void __user *uarg)
+{
+    struct nvme_csq_delete c;
+    struct nvmset_group *g;
+
+    if (copy_from_user(&c, uarg, sizeof(c)))
+        return -EFAULT;
+    guard(mutex)(&dev->nvmset_lock);
+
+    if (c.nvmset_id == 0)                                  /* State D 큐 축소 */
+        return nvmset_shrink_default(dev, c.qid);
+
+    g = nvmset_find_group(dev, c.nvmset_id);
+    if (!g)
+        return -ENOENT;
+
+    if (c.qid)                                            /* 그룹 내 SQ 1개 축소(§12[C]) */
+        return nvmset_group_shrink(dev, g, c.qid);
+
+    /* 그룹 전체 삭제(§12[D]): ns 제거 → tagset/SQ 해제 */
+    nvmset_remove_group_namespaces(dev, g);
+    nvmset_group_free(dev, g);
+    if (list_empty(&dev->group_list))
+        dev->nvmset_state = NVMSET_STATE_D;              /* 마지막 그룹 → 무큐 중간상태(§1 #4) */
+    return 0;
+}
+```
+
+### 28.7 lazy tagset + selector (refcount 제거 반영, §23.3 갱신본)
+
+```c
+struct blk_mq_tag_set *
+nvme_pci_ns_tagset(struct nvme_ctrl *ctrl, struct nvme_ns_info *info, bool *defer)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    struct nvmset_group *g;
+
+    *defer = false;
+    guard(mutex)(&dev->nvmset_lock);                      /* 그룹 조회 보호(§26) */
+
+    if (info->nvmset_id == 0) {                           /* State D 경로 */
+        if (nvme_ctrl_tagset_active(ctrl))
+            return ctrl->tagset;
+        *defer = true; return NULL;                       /* P 인데 D ns → 보류 */
+    }
+    g = nvmset_find_group(dev, info->nvmset_id);
+    if (!g || g->nr_sqs == 0) { *defer = true; return NULL; }   /* 그룹 큐 아직 없음 */
+
+    if (!g->tagset_ready) {                                /* ★ per-set tagset lazy 생성(§9/§24.1) */
+        if (nvmset_alloc_tag_set(dev, g)) { *defer = true; return NULL; }
+    }
+    return &g->tagset;                                     /* refcount 불요 — ns 는 head->nvmset_id 로 열거 */
+}
+```
+
+### 28.8 core 측 defer 보조 (선택적 최적화)
+
+```c
+/* dev->deferred_ns 리스트 항목 */
+struct nvme_deferred_ns { struct list_head entry; u32 nsid; };
+
+/* 보류 등록(중복 방지). rescan 만으로도 재시도되지만, 대량 ns 에서 타깃 재시도용(§23.4) */
+static void nvme_defer_ns(struct nvme_ctrl *ctrl, u32 nsid)
+{
+    struct nvme_dev *dev = to_nvme_dev(ctrl);
+    struct nvme_deferred_ns *d;
+
+    guard(mutex)(&dev->nvmset_lock);
+    list_for_each_entry(d, &dev->deferred_ns, entry)
+        if (d->nsid == nsid) return;                      /* 이미 보류됨 */
+    d = kzalloc(sizeof(*d), GFP_KERNEL);
+    if (!d) return;                                       /* OOM 시 rescan 폴백 */
+    d->nsid = nsid;
+    list_add_tail(&d->entry, &dev->deferred_ns);
+}
+```
+
+> **함수 완결성 체크**: §22~§25 에서 호출된 미정의 심볼 — `nvmset_find_group`, `nvmset_group_get_or_create`, `nvmset_group_free`, `nvmset_remove_group_namespaces`, `nvme_alloc_queue_id`, `nvme_free_queue_id`, `nvmset_acquire/release_vector`, `nvmset_request_irq`, `nvmset_prio_flag`, `adapter_alloc_sq_nvmset`, `nvmset_create_hw_queue`(=§22 의 `nvme_create_queue`), `nvmset_destroy_hw_queue`, `nvme_ctrl_tagset_active`, `nvme_pci_cmd_size`, `nvmset_budget_ok`, `nvmset_grow_default`, `nvmset_shrink_default`, `nvmset_sq_index`, `nvmset_group_grow`, `nvmset_group_shrink`, `nvmset_csq_create`, `nvmset_csq_delete`, `nvme_pci_ns_tagset`, `nvme_defer_ns` — **전부 정의 완료.** mainline 재사용(무수정): `nvme_alloc_queue`, `nvme_free_queue`, `nvme_init_queue`, `nvme_suspend_queue`, `adapter_alloc_cq`, `adapter_delete_sq/cq`, `nvme_submit_sync_cmd`, `nvme_irq`, `nvme_ns_remove`, `blk_mq_update_nr_hw_queues`, `blk_mq_alloc_tag_set`, `blk_mq_free_tag_set`, `nvme_queue_scan`.
 
 ---
 
