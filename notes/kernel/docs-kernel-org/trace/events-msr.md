@@ -1,0 +1,44 @@
+# MSR Trace Events
+
+> 출처(원문): https://docs.kernel.org/trace/events-msr.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# MSR Trace Events
+
+The x86 kernel supports tracing most MSR (Model Specific Register) accesses.
+To see the definition of the MSRs on Intel systems please see the SDM
+at <https://www.intel.com/sdm> (Volume 3)
+
+Available trace points:
+
+/sys/kernel/tracing/events/msr/
+
+Trace MSR reads:
+
+read\_msr
+
+> * msr: MSR number
+> * val: Value written
+> * failed: 1 if the access failed, otherwise 0
+
+Trace MSR writes:
+
+write\_msr
+
+> * msr: MSR number
+> * val: Value written
+> * failed: 1 if the access failed, otherwise 0
+
+Trace RDPMC in kernel:
+
+rdpmc
+
+The trace data can be post processed with the postprocess/decode\_msr.py script:
+
+```
+cat /sys/kernel/tracing/trace | decode_msr.py /usr/src/linux/include/asm/msr-index.h
+```
+
+to add symbolic MSR names.

@@ -1,0 +1,45 @@
+# Kernel Hacking Guides
+
+> 출처(원문): https://docs.kernel.org/kernel-hacking/index.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# Kernel Hacking Guides
+
+* [Unreliable Guide To Hacking The Linux Kernel](hacking.html)
+  + [Introduction](hacking.html#introduction)
+  + [The Players](hacking.html#the-players)
+  + [Some Basic Rules](hacking.html#some-basic-rules)
+  + [ioctls: Not writing a new system call](hacking.html#ioctls-not-writing-a-new-system-call)
+  + [Recipes for Deadlock](hacking.html#recipes-for-deadlock)
+  + [Common Routines](hacking.html#common-routines)
+  + [Wait Queues `include/linux/wait.h`](hacking.html#wait-queues-include-linux-wait-h)
+  + [Atomic Operations](hacking.html#atomic-operations)
+  + [Symbols](hacking.html#symbols)
+  + [Routines and Conventions](hacking.html#routines-and-conventions)
+  + [Putting Your Stuff in the Kernel](hacking.html#putting-your-stuff-in-the-kernel)
+  + [Kernel Cantrips](hacking.html#kernel-cantrips)
+  + [Thanks](hacking.html#thanks)
+* [Unreliable Guide To Locking](locking.html)
+  + [Introduction](locking.html#introduction)
+  + [The Problem With Concurrency](locking.html#the-problem-with-concurrency)
+  + [Locking in the Linux Kernel](locking.html#locking-in-the-linux-kernel)
+  + [Hard IRQ Context](locking.html#hard-irq-context)
+  + [Cheat Sheet For Locking](locking.html#cheat-sheet-for-locking)
+  + [The trylock Functions](locking.html#the-trylock-functions)
+  + [Common Examples](locking.html#common-examples)
+  + [Common Problems](locking.html#common-problems)
+  + [Locking Speed](locking.html#locking-speed)
+  + [What Functions Are Safe To Call From Interrupts?](locking.html#what-functions-are-safe-to-call-from-interrupts)
+  + [Mutex API reference](locking.html#mutex-api-reference)
+  + [Futex API reference](locking.html#futex-api-reference)
+  + [Further reading](locking.html#further-reading)
+  + [Thanks](locking.html#thanks)
+  + [Glossary](locking.html#glossary)
+* [False Sharing](false-sharing.html)
+  + [What is False Sharing](false-sharing.html#what-is-false-sharing)
+  + [False Sharing Pitfalls](false-sharing.html#false-sharing-pitfalls)
+  + [How to detect and analyze False Sharing](false-sharing.html#how-to-detect-and-analyze-false-sharing)
+  + [Possible Mitigations](false-sharing.html#possible-mitigations)
+  + [Miscellaneous](false-sharing.html#miscellaneous)

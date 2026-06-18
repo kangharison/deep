@@ -1,0 +1,197 @@
+# 20.AMD HSMP interface
+
+> 출처(원문): https://docs.kernel.org/arch/x86/amd_hsmp.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# 20. AMD HSMP interface
+
+Newer Fam19h(model 0x00-0x1f, 0x30-0x3f, 0x90-0x9f, 0xa0-0xaf),
+Fam1Ah(model 0x00-0x1f) EPYC server line of processors from AMD support
+system management functionality via HSMP (Host System Management Port).
+
+The Host System Management Port (HSMP) is an interface to provide
+OS-level software with access to system management functions via a
+set of mailbox registers.
+
+More details on the interface can be found in chapter
+“7 Host System Management Port (HSMP)” of the family/model PPR
+Eg: <https://docs.amd.com/v/u/en-US/55898_B1_pub_0_50>
+
+HSMP interface is supported on EPYC line of server CPUs and MI300A (APU).
+
+## 20.1. HSMP device
+
+amd\_hsmp driver under drivers/platforms/x86/amd/hsmp/ has separate driver files
+for ACPI object based probing, platform device based probing and for the common
+code for these two drivers.
+
+Kconfig option CONFIG\_AMD\_HSMP\_PLAT compiles plat.c and creates amd\_hsmp.ko.
+Kconfig option CONFIG\_AMD\_HSMP\_ACPI compiles acpi.c and creates hsmp\_acpi.ko.
+Selecting any of these two configs automatically selects CONFIG\_AMD\_HSMP. This
+compiles common code hsmp.c and creates hsmp\_common.ko module.
+
+Both the ACPI and plat drivers create the miscdevice /dev/hsmp to let
+user space programs run hsmp mailbox commands.
+
+The ACPI object format supported by the driver is defined below.
+
+$ ls -al /dev/hsmp
+crw-r--r-- 1 root root 10, 123 Jan 21 21:41 /dev/hsmp
+
+Characteristics of the dev node:
+:   * Write mode is used for running set/configure commands
+    * Read mode is used for running get/status monitor commands
+
+Access restrictions:
+:   * Only root user is allowed to open the file in write mode.
+    * The file can be opened in read mode by all the users.
+
+In-kernel integration:
+:   * Other subsystems in the kernel can use the exported transport
+      function `hsmp_send_message()`.
+    * Locking across callers is taken care by the driver.
+
+## 20.2. HSMP sysfs interface
+
+1. Metrics table binary sysfs
+
+AMD MI300A MCM provides GET\_METRICS\_TABLE message to retrieve
+most of the system management information from SMU in one go.
+
+The metrics table is made available as hexadecimal sysfs binary file
+under per socket sysfs directory created at
+/sys/devices/platform/amd\_hsmp/socket%d/metrics\_bin
+
+Note: `lseek()` is not supported as entire metrics table is read.
+
+Metrics table definitions will be documented as part of Public PPR.
+The same is defined in the amd\_hsmp.h header.
+
+2. HSMP telemetry sysfs files
+
+Following sysfs files are available at /sys/devices/platform/AMDI0097:0X/.
+
+* c0\_residency\_input: Percentage of cores in C0 state.
+* prochot\_status: Reports 1 if the processor is at thermal threshold value,
+  0 otherwise.
+* smu\_fw\_version: SMU firmware version.
+* protocol\_version: HSMP interface version.
+* ddr\_max\_bw: Theoretical maximum DDR bandwidth in GB/s.
+* ddr\_utilised\_bw\_input: Current utilized DDR bandwidth in GB/s.
+* ddr\_utilised\_bw\_perc\_input(%): Percentage of current utilized DDR bandwidth.
+* mclk\_input: Memory clock in MHz.
+* fclk\_input: Fabric clock in MHz.
+* clk\_fmax: Maximum frequency of socket in MHz.
+* clk\_fmin: Minimum frequency of socket in MHz.
+* cclk\_freq\_limit\_input: Core clock frequency limit per socket in MHz.
+* pwr\_current\_active\_freq\_limit: Current active frequency limit of socket
+  in MHz.
+* pwr\_current\_active\_freq\_limit\_source: Source of current active frequency
+  limit.
+
+## 20.3. ACPI device object format
+
+The ACPI object format expected from the amd\_hsmp driver
+for socket with ID00 is given below:
+
+```
+Device(HSMP)
+              {
+                      Name(_HID, "AMDI0097")
+                      Name(_UID, "ID00")
+                      Name(HSE0, 0x00000001)
+                      Name(RBF0, ResourceTemplate()
+                      {
+                              Memory32Fixed(ReadWrite, 0xxxxxxx, 0x00100000)
+                      })
+                      Method(_CRS, 0, NotSerialized)
+                      {
+                              Return(RBF0)
+                      }
+                      Method(_STA, 0, NotSerialized)
+                      {
+                              If(LEqual(HSE0, One))
+                              {
+                                      Return(0x0F)
+                              }
+                              Else
+                              {
+                                      Return(Zero)
+                              }
+                      }
+                      Name(_DSD, Package(2)
+                      {
+                              Buffer(0x10)
+                              {
+                                      0x9D, 0x61, 0x4D, 0xB7, 0x07, 0x57, 0xBD, 0x48,
+                                      0xA6, 0x9F, 0x4E, 0xA2, 0x87, 0x1F, 0xC2, 0xF6
+                              },
+                              Package(3)
+                              {
+                                      Package(2) {"MsgIdOffset", 0x00010934},
+                                      Package(2) {"MsgRspOffset", 0x00010980},
+                                      Package(2) {"MsgArgOffset", 0x000109E0}
+                              }
+                      })
+              }
+```
+
+## 20.4. HSMP HWMON interface
+
+HSMP power sensors are registered with the hwmon interface. A separate hwmon
+directory is created for each socket and the following files are generated
+within the hwmon directory.
+- power1\_input (read only)
+- power1\_cap\_max (read only)
+- power1\_cap (read, write)
+
+## 20.5. An example
+
+To access hsmp device from a C program.
+First, you need to include the headers:
+
+```
+#include <linux/amd_hsmp.h>
+```
+
+Which defines the supported messages/message IDs.
+
+Next thing, open the device file, as follows:
+
+```
+int file;
+
+file = open("/dev/hsmp", O_RDWR);
+if (file < 0) {
+  /* ERROR HANDLING; you can check errno to see what went wrong */
+  exit(1);
+}
+```
+
+The following IOCTL is defined:
+
+`ioctl(file, HSMP_IOCTL_CMD, struct hsmp_message *msg)`
+:   The argument is a pointer to a:
+
+    ```
+    struct hsmp_message {
+        __u32   msg_id;                         /* Message ID */
+        __u16   num_args;                       /* Number of input argument words in message */
+        __u16   response_sz;                    /* Number of expected output/response words */
+        __u32   args[HSMP_MAX_MSG_LEN];         /* argument/response buffer */
+        __u16   sock_ind;                       /* socket number */
+    };
+    ```
+
+The ioctl would return a non-zero on failure; you can read errno to see
+what happened. The transaction returns 0 on success.
+
+More details on the interface and message definitions can be found in chapter
+“7 Host System Management Port (HSMP)” of the respective family/model PPR
+eg: <https://docs.amd.com/v/u/en-US/55898_B1_pub_0_50>
+
+User space C-APIs are made available by linking against the esmi library,
+which is provided by the E-SMS project <https://www.amd.com/en/developer/e-sms.html>.
+See: <https://github.com/amd/esmi_ib_library>

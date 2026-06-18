@@ -1,0 +1,36 @@
+# TEE (Trusted Execution Environment) Userspace API
+
+> 출처(원문): https://docs.kernel.org/userspace-api/tee.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# TEE (Trusted Execution Environment) Userspace API
+
+include/uapi/linux/tee.h defines the generic interface to a TEE.
+
+User space (the client) connects to the driver by opening /dev/tee[0-9]\* or
+/dev/teepriv[0-9]\*.
+
+* TEE\_IOC\_SHM\_ALLOC allocates shared memory and returns a file descriptor
+  which user space can mmap. When user space doesn’t need the file
+  descriptor any more, it should be closed. When shared memory isn’t needed
+  any longer it should be unmapped with `munmap()` to allow the reuse of
+  memory.
+* TEE\_IOC\_VERSION lets user space know which TEE this driver handles and
+  its capabilities.
+* TEE\_IOC\_OPEN\_SESSION opens a new session to a Trusted Application.
+* TEE\_IOC\_INVOKE invokes a function in a Trusted Application.
+* TEE\_IOC\_CANCEL may cancel an ongoing TEE\_IOC\_OPEN\_SESSION or TEE\_IOC\_INVOKE.
+* TEE\_IOC\_CLOSE\_SESSION closes a session to a Trusted Application.
+
+There are two classes of clients, normal clients and supplicants. The latter is
+a helper process for the TEE to access resources in Linux, for example file
+system access. A normal client opens /dev/tee[0-9]\* and a supplicant opens
+/dev/teepriv[0-9].
+
+Much of the communication between clients and the TEE is opaque to the
+driver. The main job for the driver is to receive requests from the
+clients, forward them to the TEE and send back the results. In the case of
+supplicants the communication goes in the other direction, the TEE sends
+requests to the supplicant which then sends back the result.

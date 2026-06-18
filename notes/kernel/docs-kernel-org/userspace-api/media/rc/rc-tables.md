@@ -1,0 +1,133 @@
+# 4.Remote controller tables
+
+> 출처(원문): https://docs.kernel.org/userspace-api/media/rc/rc-tables.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# 4. Remote controller tables
+
+Unfortunately, for several years, there was no effort to create uniform
+IR keycodes for different devices. This caused the same IR keyname to be
+mapped completely differently on different IR devices. This resulted
+that the same IR keyname to be mapped completely different on different
+IR’s. Due to that, V4L2 API now specifies a standard for mapping Media
+keys on IR.
+
+This standard should be used by both V4L/DVB drivers and userspace
+applications
+
+The modules register the remote as keyboard within the linux input
+layer. This means that the IR key strokes will look like normal keyboard
+key strokes (if CONFIG\_INPUT\_KEYBOARD is enabled). Using the event
+devices (CONFIG\_INPUT\_EVDEV) it is possible for applications to access
+the remote via /dev/input/event devices.
+
+IR default keymapping
+
+|  |  |  |
+| --- | --- | --- |
+| Key code | Meaning | Key examples on IR |
+| **Numeric keys** | | |
+| `KEY_NUMERIC_0` | Keyboard digit 0 | 0 |
+| `KEY_NUMERIC_1` | Keyboard digit 1 | 1 |
+| `KEY_NUMERIC_2` | Keyboard digit 2 | 2 |
+| `KEY_NUMERIC_3` | Keyboard digit 3 | 3 |
+| `KEY_NUMERIC_4` | Keyboard digit 4 | 4 |
+| `KEY_NUMERIC_5` | Keyboard digit 5 | 5 |
+| `KEY_NUMERIC_6` | Keyboard digit 6 | 6 |
+| `KEY_NUMERIC_7` | Keyboard digit 7 | 7 |
+| `KEY_NUMERIC_8` | Keyboard digit 8 | 8 |
+| `KEY_NUMERIC_9` | Keyboard digit 9 | 9 |
+| **Movie play control** | | |
+| `KEY_FORWARD` | Instantly advance in time | >> / FORWARD |
+| `KEY_BACK` | Instantly go back in time | <<< / BACK |
+| `KEY_FASTFORWARD` | Play movie faster | ``` >>> / FORWARD ``` |
+| `KEY_REWIND` | Play movie back | REWIND / BACKWARD |
+| `KEY_NEXT` | Select next chapter / sub-chapter / interval | NEXT / SKIP |
+| `KEY_PREVIOUS` | Select previous chapter / sub-chapter / interval | << / PREV / PREVIOUS |
+| `KEY_AGAIN` | Repeat the video or a video interval | REPEAT / LOOP / RECALL |
+| `KEY_PAUSE` | Pause stream | PAUSE / FREEZE |
+| `KEY_PLAY` | Play movie at the normal timeshift | NORMAL TIMESHIFT / LIVE / > |
+| `KEY_PLAYPAUSE` | Alternate between play and pause | PLAY / PAUSE |
+| `KEY_STOP` | Stop stream | STOP |
+| `KEY_RECORD` | Start/stop recording stream | CAPTURE / REC / RECORD/PAUSE |
+| `KEY_CAMERA` | Take a picture of the image | CAMERA ICON / CAPTURE / SNAPSHOT |
+| `KEY_SHUFFLE` | Enable shuffle mode | SHUFFLE |
+| `KEY_TIME` | Activate time shift mode | TIME SHIFT |
+| `KEY_TITLE` | Allow changing the chapter | CHAPTER |
+| `KEY_SUBTITLE` | Allow changing the subtitle | SUBTITLE |
+| **Image control** | | |
+| `KEY_BRIGHTNESSDOWN` | Decrease Brightness | BRIGHTNESS DECREASE |
+| `KEY_BRIGHTNESSUP` | Increase Brightness | BRIGHTNESS INCREASE |
+| `KEY_ANGLE` | Switch video camera angle (on videos with more than one angle stored) | ANGLE / SWAP |
+| `KEY_EPG` | Open the Elecrowonic Play Guide (EPG) | EPG / GUIDE |
+| `KEY_TEXT` | Activate/change closed caption mode | CLOSED CAPTION/TELETEXT / DVD TEXT / TELETEXT / TTX |
+| **Audio control** | | |
+| `KEY_AUDIO` | Change audio source | AUDIO SOURCE / AUDIO / MUSIC |
+| `KEY_MUTE` | Mute/unmute audio | MUTE / DEMUTE / UNMUTE |
+| `KEY_VOLUMEDOWN` | Decrease volume | VOLUME- / VOLUME DOWN |
+| `KEY_VOLUMEUP` | Increase volume | VOLUME+ / VOLUME UP |
+| `KEY_MODE` | Change sound mode | MONO/STEREO |
+| `KEY_LANGUAGE` | Select Language | 1ST / 2ND LANGUAGE / DVD LANG / MTS/SAP / MTS SEL |
+| **Channel control** | | |
+| `KEY_CHANNEL` | Go to the next favorite channel | ALT / CHANNEL / CH SURFING / SURF / FAV |
+| `KEY_CHANNELDOWN` | Decrease channel sequentially | CHANNEL - / CHANNEL DOWN / DOWN |
+| `KEY_CHANNELUP` | Increase channel sequentially | CHANNEL + / CHANNEL UP / UP |
+| `KEY_DIGITS` | Use more than one digit for channel | PLUS / 100/ 1xx / xxx / -/-- / Single Double Triple Digit |
+| `KEY_SEARCH` | Start channel autoscan | SCAN / AUTOSCAN |
+| **Colored keys** | | |
+| `KEY_BLUE` | IR Blue key | BLUE |
+| `KEY_GREEN` | IR Green Key | GREEN |
+| `KEY_RED` | IR Red key | RED |
+| `KEY_YELLOW` | IR Yellow key | YELLOW |
+| **Media selection** | | |
+| `KEY_CD` | Change input source to Compact Disc | CD |
+| `KEY_DVD` | Change input to DVD | DVD / DVD MENU |
+| `KEY_EJECTCLOSECD` | Open/close the CD/DVD player | -> ) / CLOSE / OPEN |
+| `KEY_MEDIA` | Turn on/off Media application | PC/TV / TURN ON/OFF APP |
+| `KEY_PC` | Selects from TV to PC | PC |
+| `KEY_RADIO` | Put into AM/FM radio mode | RADIO / TV/FM / TV/RADIO / FM / FM/RADIO |
+| `KEY_TV` | Select tv mode | TV / LIVE TV |
+| `KEY_TV2` | Select Cable mode | AIR/CBL |
+| `KEY_VCR` | Select VCR mode | VCR MODE / DTR |
+| `KEY_VIDEO` | Alternate between input modes | SOURCE / SELECT / DISPLAY / SWITCH INPUTS / VIDEO |
+| **Power control** | | |
+| `KEY_POWER` | Turn on/off computer | SYSTEM POWER / COMPUTER POWER |
+| `KEY_POWER2` | Turn on/off application | TV ON/OFF / POWER |
+| `KEY_SLEEP` | Activate sleep timer | SLEEP / SLEEP TIMER |
+| `KEY_SUSPEND` | Put computer into suspend mode | STANDBY / SUSPEND |
+| **Window control** | | |
+| `KEY_CLEAR` | Stop stream and return to default input video/audio | CLEAR / RESET / BOSS KEY |
+| `KEY_CYCLEWINDOWS` | Minimize windows and move to the next one | ALT-TAB / MINIMIZE / DESKTOP |
+| `KEY_FAVORITES` | Open the favorites stream window | TV WALL / Favorites |
+| `KEY_MENU` | Call application menu | 2ND CONTROLS (USA: MENU) / DVD/MENU / SHOW/HIDE CTRL |
+| `KEY_NEW` | Open/Close Picture in Picture | PIP |
+| `KEY_OK` | Send a confirmation code to application | OK / ENTER / RETURN |
+| `KEY_ASPECT_RATIO` | Select screen aspect ratio | 4:3 16:9 SELECT |
+| `KEY_FULL_SCREEN` | Put device into zoom/full screen mode | ZOOM / FULL SCREEN / ZOOM+ / HIDE PANEL / SWITCH |
+| **Navigation keys** | | |
+| `KEY_ESC` | Cancel current operation | CANCEL / BACK |
+| `KEY_HELP` | Open a Help window | HELP |
+| `KEY_HOMEPAGE` | Navigate to Homepage | HOME |
+| `KEY_INFO` | Open On Screen Display | DISPLAY INFORMATION / OSD |
+| `KEY_WWW` | Open the default browser | WEB |
+| `KEY_UP` | Up key | UP |
+| `KEY_DOWN` | Down key | DOWN |
+| `KEY_LEFT` | Left key | LEFT |
+| `KEY_RIGHT` | Right key | RIGHT |
+| **Miscellaneous keys** | | |
+| `KEY_DOT` | Return a dot | . |
+| `KEY_FN` | Select a function | FUNCTION |
+
+It should be noted that, sometimes, there some fundamental missing keys
+at some cheaper IR’s. Due to that, it is recommended to:
+
+Notes
+
+|  |
+| --- |
+| On simpler IR’s, without separate channel keys, you need to map UP as `KEY_CHANNELUP` |
+| On simpler IR’s, without separate channel keys, you need to map DOWN as `KEY_CHANNELDOWN` |
+| On simpler IR’s, without separate volume keys, you need to map LEFT as `KEY_VOLUMEDOWN` |
+| On simpler IR’s, without separate volume keys, you need to map RIGHT as `KEY_VOLUMEUP` |

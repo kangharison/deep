@@ -1,0 +1,35 @@
+# Surface System Aggregator Module (SSAM)
+
+> 출처(원문): https://docs.kernel.org/driver-api/surface_aggregator/index.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# Surface System Aggregator Module (SSAM)
+
+* [Overview](overview.html)
+  + [Features and Integration](overview.html#features-and-integration)
+  + [Communication](overview.html#communication)
+* [Writing Client Drivers](client.html)
+  + [Client Driver API Documentation](client-api.html)
+  + [Overview](client.html#overview)
+  + [Non-SSAM Client Drivers](client.html#non-ssam-client-drivers)
+  + [Adding SSAM Devices](client.html#adding-ssam-devices)
+  + [SSAM Client Drivers](client.html#ssam-client-drivers)
+  + [Making Synchronous Requests](client.html#making-synchronous-requests)
+  + [Handling Events](client.html#handling-events)
+* [Client Driver Documentation](clients/index.html)
+  + [User-Space EC Interface (cdev)](clients/cdev.html)
+  + [User-Space DTX (Clipboard Detachment System) Interface](clients/dtx.html)
+  + [Surface ACPI Notify](clients/san.html)
+* [Surface Serial Hub Protocol](ssh.html)
+  + [SSH Packet Protocol: Definitions](ssh.html#ssh-packet-protocol-definitions)
+  + [SSH Packet Protocol: Flow Sequence](ssh.html#ssh-packet-protocol-flow-sequence)
+  + [Commands: Requests, Responses, and Events](ssh.html#commands-requests-responses-and-events)
+  + [Limitations and Observations](ssh.html#limitations-and-observations)
+* [Core Driver Internals](internal.html)
+  + [Internal API Documentation](internal-api.html)
+  + [Overview](internal.html#overview)
+  + [Packet Transport Layer](internal.html#packet-transport-layer)
+  + [Request Transport Layer](internal.html#request-transport-layer)
+  + [Controller Layer](internal.html#controller-layer)

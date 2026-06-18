@@ -1,0 +1,151 @@
+# 包含用户空间API头文件
+
+> 출처(원문): https://docs.kernel.org/translations/zh_CN/doc-guide/parse-headers.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+Note
+
+此文件的目的是为让中文读者更容易阅读和理解，而不是作为一个分支。 因此，
+如果您对此文件有任何意见或更新，请先尝试更新原始英文文件。
+如果您发现本文档与原始文件有任何不同或者有翻译问题，请发建议或者补丁给
+该文件的译者，或者请求中文文档维护者和审阅者的帮助。
+
+Original:
+:   [Including uAPI header files](../../../doc-guide/parse-headers.html)
+
+译者:
+:   吴想成 Wu XiangCheng <[bobwxc@email.cn](mailto:bobwxc%40email.cn)>
+
+# 包含用户空间API头文件
+
+有时，为了描述用户空间API并在代码和文档之间生成交叉引用，需要包含头文件和示例
+C代码。为用户空间API文件添加交叉引用还有一个好处：如果在文档中找不到相应符号，
+Sphinx将生成警告。这有助于保持用户空间API文档与内核更改同步。
+[parse\_headers.py](#parse-headers-zh) 提供了生成此类交叉引用的一种方法。
+在构建文档时，必须通过Makefile调用它。有关如何在内核树中使用它的示例，请参阅
+`Documentation/userspace-api/media/Makefile` 。
+
+## parse\_headers.py
+
+### 脚本名称
+
+parse\_headers.py——解析一个C文件，识别函数、结构体、枚举、定义并对Sphinx文档
+创建交叉引用。
+
+### 用法概要
+
+**parse\_headers.py** [<选项>] <C文件> <输出文件> [<例外文件>]
+
+<选项> 可以是： --debug, --help 或 --usage 。
+
+### 选项
+
+**--debug**
+
+> 开启脚本详细模式，在调试时很有用。
+
+**--usage**
+
+> 打印简短的帮助信息并退出。
+
+**--help**
+
+> 打印更详细的帮助信息并退出。
+
+### 说明
+
+通过C头文件或源文件（<C文件>）中为描述API的文档编写的带交叉引用的 ..预格式化
+文本 块将文件转换成重构文本（RST）。它接受一个可选的<例外文件>，其中描述了
+哪些元素将被忽略或指向非默认引用。
+
+输出被写入到<输出文件>。
+
+它能够识别定义、函数、结构体、typedef、枚举和枚举符号，并为它们创建交叉引用。
+它还能够区分用于指定Linux ioctl的 `#define` 。
+
+<例外文件> 包含两种类型的语句： **ignore** 或 **replace**.
+
+ignore标记的语法为：
+
+ignore **type** **name**
+
+The **ignore** 意味着它不会为类型为 **type**的 **name**符号生成
+交叉引用。
+
+replace标记的语法为：
+
+replace **type** **name** **new\_value**
+
+The **replace** 味着它将为 **type**类型的 **name**符号生成交叉引
+用，但是它将使用 **new\_value**来取代默认的替换规则。
+
+这两种语句中， **type**可以是以下任一项：
+
+**ioctl**
+
+> ignore 或 replace 语句应用于ioctl定义，如：
+>
+> #define VIDIOC\_DBG\_S\_REGISTER \_IOW(‘V’, 79, `struct v4l2_dbg_register`)
+
+**define**
+
+> ignore 或 replace 语句应用于在<C文件>中找到的任何其他 `#define` 。
+
+**typedef**
+
+> ignore 和 replace 语句应用于<C文件>中的typedef语句。
+
+**struct**
+
+> ignore 和 replace 语句应用于<C文件>中的结构体名称语句。
+
+**enum**
+
+> ignore 和 replace 语句应用于<C文件>中的枚举名称语句。
+
+**symbol**
+
+> ignore 和 replace 语句应用于<C文件>中的枚举值名称语句。
+>
+> replace语句中， **new\_value** 会自动使用 **typedef**, **enum**和 **struct**类型的 :c:type: 引用；以及 **ioctl**, **define** 和
+> **symbol**类型的 :ref: 。引用的类型也可以在replace语句中显式定义。
+
+### 示例
+
+ignore define \_VIDEODEV2\_H
+
+忽略<C文件>中的 #define \_VIDEODEV2\_H 。
+
+ignore symbol PRIVATE
+
+如下结构体：
+
+`enum foo` { BAR1, BAR2, PRIVATE };
+
+不会为 **PRIVATE**生成交叉引用。
+
+replace symbol BAR1 :c:type:`foo`
+replace symbol BAR2 :c:type:`foo`
+
+如下结构体：
+
+`enum foo` { BAR1, BAR2, PRIVATE };
+
+它会让BAR1和BAR2枚举符号交叉引用C域中的foo符号。
+
+### 缺陷
+
+请向Mauro Carvalho Chehab <[mchehab@kernel.org](mailto:mchehab%40kernel.org)>报告有关缺陷。
+
+中文翻译问题请找中文翻译维护者。
+
+### 版权
+
+版权所有 (c) 2016 Mauro Carvalho Chehab <[mchehab+samsung@kernel.org](mailto:mchehab+samsung%40kernel.org)>
+
+许可证 GPLv2：GNU GPL version 2 <<https://gnu.org/licenses/gpl.html>>
+
+这是自由软件：你可以自由地修改和重新发布它。
+在法律允许的范围内，**不提供任何保证**。

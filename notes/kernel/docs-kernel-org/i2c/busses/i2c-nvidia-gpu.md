@@ -1,0 +1,26 @@
+# Kernel driver i2c-nvidia-gpu
+
+> 출처(원문): https://docs.kernel.org/i2c/busses/i2c-nvidia-gpu.html
+> 자동 미러링: docs.kernel.org · 정본은 출처 URL (영문 원문 자동 변환본)
+
+---
+
+# Kernel driver i2c-nvidia-gpu
+
+Datasheet: not publicly available.
+
+Authors:
+:   Ajay Gupta <[ajayg@nvidia.com](mailto:ajayg%40nvidia.com)>
+
+## Description
+
+i2c-nvidia-gpu is a driver for I2C controller included in NVIDIA Turing
+and later GPUs and it is used to communicate with Type-C controller on GPUs.
+
+If your `lspci -v` listing shows something like the following:
+
+```
+01:00.3 Serial bus controller [0c80]: NVIDIA Corporation Device 1ad9 (rev a1)
+```
+
+then this driver should support the I2C controller of your GPU.

@@ -1,3 +1,5 @@
 sources/*
 !sources/bam/
 .paper.md.swp
+scripts/km_crawl.log
+scripts/km_failed.txt
