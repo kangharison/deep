@@ -11,7 +11,7 @@
 | 항목 | 값 |
 |------|-----|
 | 커널 | `6.17.0-35-generic` (Ubuntu 24.04 HWE, x86_64) |
-| 타입 소스 | BTF (`/sys/kernel/btf/vmlinux` + 모듈 BTF) / debuginfod 풀 DWARF |
+| 타입 소스 | **DWARF**(vmlinux 디버그심볼) — drgn은 BTF/debuginfod로 이 우분투 커널을 못 잡음 → `linux-image-$(uname -r)-dbgsym` 설치 필요 |
 | NVMe | `/dev/nvme0n1` (VirtualBox 에뮬, `ORCL-VBOX-NVME-VER12`) |
 | PCIe 위치 | `0000:00:0e.0` |
 | blk-mq HW 큐 | 1개 (hctx0), I/O 스케줄러 `mq-deadline` |
@@ -35,7 +35,26 @@ pipx install drgn
 pip3 install --break-system-packages drgn
 ```
 
-drgn 0.2.0 이상 권장 (BTF + 모듈 BTF 지원).
+drgn 0.2.0 이상 권장.
+
+## ⚠️ DWARF 디버그심볼 먼저 설치 (필수 전제)
+
+drgn은 타입 정보를 **DWARF로만** 얻는다(**BTF는 안 씀**). 또 비-Fedora 커널에선
+debuginfod 자동 다운로드도 막혀 있다(`is_fedora_kernel()`). 그래서 이 우분투
+머신에서는 **vmlinux 디버그심볼(dbgsym)** 을 직접 설치해야 한다. 안 하면
+`00_env_check.py`의 `struct nvme_dev` 해석 단계에서 `LookupError`가 난다.
+
+```bash
+sudo apt install -y ubuntu-dbgsym-keyring
+echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
+deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" \
+  | sudo tee /etc/apt/sources.list.d/ddebs.list
+sudo apt update
+sudo apt install -y linux-image-$(uname -r)-dbgsym   # 수백 MB
+#  → /usr/lib/debug/boot/vmlinux-$(uname -r) 생성 → drgn이 자동 인식
+```
+
+근거·상세: `deep/analysis/drgn/03-debuginfo-dwarf.md`, `06-linux-kernel.md` §8.
 
 ## 실행
 

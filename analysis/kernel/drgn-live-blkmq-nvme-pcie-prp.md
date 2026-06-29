@@ -5,6 +5,7 @@
 > - drgn GitHub (Omar Sandoval, Meta): https://github.com/osandov/drgn
 > - 커널 문서 미러: [[drgn]] (`deep/notes/kernel/docs-kernel-org/bpf/drgn.md`)
 > - 실행 스크립트: `deep/scripts/drgn/` (이 문서와 1:1 대응, `01~04`)
+> - drgn 코드베이스 분석: [[drgn-codebase-overview]] (= `analysis/drgn/01-overview.md`) · [[03-debuginfo-dwarf]] · [[06-linux-kernel]]
 > - 관련 분석: [[nvme-tagset-blkmq-flow]] · [[nvme-queue-init-request-queue-tagset-hctx]] · [[io-lifecycle-no-scheduler]] · [[io_submit-to-nvme_queue_rq-flow]] · [[nvme-driver]] · [[kdump-custom-kernel]]
 >
 > **작성 환경 실측 일자**: 2026-06-29 / 커널 `6.17.0-35-generic` (Ubuntu 24.04 HWE, x86_64)
@@ -14,8 +15,10 @@
 ## 0. 한 줄 결론
 
 > **네 가지(blk-mq · NVMe 드라이버 · PCIe · PRP payload) 모두 drgn 으로 실시간 관찰 가능하다.**
-> 이 머신은 BTF·debuginfod·`/proc/kcore`·IOMMU 미사용이 모두 갖춰져 있어 **PRP가 가리키는 실제 DMA 데이터 바이트까지** 읽을 수 있다.
+> `/proc/kcore` + IOMMU 미사용이 갖춰져 있어 **PRP가 가리키는 실제 DMA 데이터 바이트까지** 읽을 수 있다.
 > 단 (a) `/proc/kcore` 접근에 **root** 필요, (b) 디바이스 **MMIO 레지스터(도어벨/CC/CSTS)** 는 읽을 수 없음(호스트 RAM이 아니라서), (c) **in-flight 요청은 부하를 깔아야 잡힘**, (d) 라이브 메모리는 **race** 가능.
+>
+> > ⚠️ **2026-06-29 정정 (drgn 소스 분석 후)**: 본 문서 초판은 "BTF로 충분 / debuginfod 자동 다운로드"라고 적었으나 **둘 다 이 우분투 커널엔 틀렸다.** drgn은 **DWARF만** 타입 소스로 쓰며 BTF(`/sys/kernel/btf/*`)는 읽지 않는다. 또 drgn은 `is_fedora_kernel()` 검사로 **비-Fedora 커널엔 debuginfod를 끈다**. 따라서 이 머신에서 라이브 디버깅을 하려면 **`linux-image-$(uname -r)-dbgsym`(ddebs 저장소)** 를 반드시 설치해 vmlinux DWARF를 확보해야 한다. 근거·상세는 [[03-debuginfo-dwarf]] §2·§4, [[06-linux-kernel]] §8. (§1·§3 본문도 정정함.)
 
 ### 타당성 매트릭스
 
@@ -40,8 +43,9 @@ drgn 은 실행 중인 커널을 멈추지 않고 메모리를 **읽기 전용**
                         │              │              │
               (1) 메모리 소스    (2) 타입 소스    (3) 심볼 소스
                         │              │              │
-                 /proc/kcore     BTF 또는 DWARF    /proc/kallsyms
+                 /proc/kcore     DWARF(필수)      /proc/kallsyms
               "주소→바이트"     "구조체 레이아웃"   "이름→주소"
+                              ※ BTF는 안 씀
               (RAM 스냅샷)      (필드 오프셋)      (전역변수/함수)
                         │              │              │
                         └──────────────┴──────────────┘
@@ -52,7 +56,7 @@ drgn 은 실행 중인 커널을 멈추지 않고 메모리를 **읽기 전용**
 | 다리 | 무엇 | 이 머신에서 |
 |------|------|------------|
 | (1) 메모리 | `/proc/kcore` (ELF로 본 물리/가상 RAM) | `CONFIG_PROC_KCORE=y` ✅, root 필요 |
-| (2) 타입 | BTF(`/sys/kernel/btf/*`) 또는 DWARF(vmlinux) | BTF + 모듈 BTF ✅ / debuginfod DWARF ✅ |
+| (2) 타입 | **DWARF**(vmlinux 디버그심볼) — drgn은 BTF 미사용 | ❗ dbgsym 미설치 → **설치 필요**([[03-debuginfo-dwarf]]) |
 | (3) 심볼 | `/proc/kallsyms` | `CONFIG_KALLSYMS=y` ✅ (root 시 실주소) |
 
 `gdb`/`crash` 대비 차별점: **명령어가 아니라 Python** 이라 `for rq in busy_iter(q): ...` 처럼 자료구조를 순회·필터·집계하는 임의 로직을 즉석에서 짤 수 있다. 커널을 멈추지 않으므로(=non-intrusive) 운영 중 시스템에도 붙는다.
@@ -65,10 +69,9 @@ drgn 은 실행 중인 커널을 멈추지 않고 메모리를 **읽기 전용**
 |------|------|------|
 | drgn 설치 | ❌ 미설치 → pip wheel로 설치 가능 | `pip install drgn` (0.2.0, manylinux, **컴파일 불필요**) |
 | 커널 | `6.17.0-35-generic` x86_64 | 최신, 아래 nvme_iod 레이아웃 주의 |
-| `CONFIG_DEBUG_INFO_BTF` | `=y`, `BTF_MODULES=y` | dbgsym 없이도 코어+모듈 타입 확보 |
-| `/sys/kernel/btf/vmlinux` | 존재 (6.9 MB) | drgn 코어 타입 소스로 즉시 사용 |
-| `/sys/kernel/btf/{nvme,nvme_core,...}` | 존재 | `struct nvme_dev/nvme_iod/nvme_queue` 해석 가능 |
-| `DEBUGINFOD_URLS` | `https://debuginfod.ubuntu.com` 설정됨 | drgn이 **풀 DWARF vmlinux 자동 다운로드** 가능 |
+| **DWARF 디버그심볼** | ❌ **미설치** (`/usr/lib/debug/.../vmlinux` 없음) | ❗ **drgn의 필수 전제** — `linux-image-$(uname -r)-dbgsym` 설치 필요(ddebs) |
+| `CONFIG_DEBUG_INFO_BTF` | `=y`, `BTF_MODULES=y`, `/sys/kernel/btf/*` 존재 | ⚠️ **drgn은 BTF를 안 씀** — 이 BTF는 drgn에 무의미(bpftool/pahole용) |
+| `DEBUGINFOD_URLS` | `https://debuginfod.ubuntu.com` 설정됨 | ⚠️ drgn은 `is_fedora_kernel()` 검사로 **비-Fedora 커널엔 debuginfod 비활성** → 이 우분투 커널엔 무용 |
 | `/proc/kcore` | 존재 (`root` 전용) | 라이브 메모리 소스 OK, **sudo 필요** |
 | `kptr_restrict` | `1` | 비-root는 kallsyms 주소가 0 → root로 실행해야 함 |
 | **IOMMU** | `/sys/class/iommu/` **비어있음**, nvme0에 `iommu_group` 없음 | **DMA 주소 = 물리 주소** → PRP 직접 읽기 가능 ★ |
@@ -82,19 +85,34 @@ drgn 은 실행 중인 커널을 멈추지 않고 메모리를 **읽기 전용**
 
 ---
 
-## 3. 타입 소스 결정 — BTF vs DWARF(debuginfod) vs dbgsym
+## 3. 타입 소스 결정 — drgn은 DWARF만 쓴다 (BTF·debuginfod 함정)
 
-drgn 라이브 디버깅의 유일한 실질 관문은 "**타입 정보를 어디서 얻나**"다. 세 가지 경로가 있고, 이 머신은 셋 다 또는 둘이 가능하다.
+> **초판 정정**: 이 절은 원래 "BTF로 충분"이라고 적었으나 **drgn 소스 분석 결과 틀렸다.** drgn은 타입 정보를 **DWARF**(`.debug_info`/`.debug_abbrev`/...)에서만 얻고, **BTF(`.BTF` 섹션)는 로드하지 않는다.** 코드 근거: drgn이 인덱싱하는 ELF 섹션 목록(`libdrgn/build-aux/gen_elf_sections.py`)에 `.BTF`가 없고, libdrgn 전체에 `BTF` 심볼이 0건이다. (BTF가 등장하는 곳은 `drgn/helpers/linux/bpf.py` — 타깃의 `struct btf`를 *데이터로* 순회하는 헬퍼일 뿐, drgn 자신의 타입 소스가 아니다.) 상세: [[03-debuginfo-dwarf]] §2.
 
-| 방법 | 준비물 | 장점 | 단점 | 이 머신 |
-|------|--------|------|------|--------|
-| **BTF** | `/sys/kernel/btf/*` (커널 내장) | 추가 다운로드 0, 6.9MB로 가벼움, 모듈 타입까지 | 인라인 함수/라인정보 없음, 일부 정적심볼 제한 | ✅ 즉시 사용 |
-| **debuginfod DWARF** | 인터넷 + `DEBUGINFOD_URLS` | 풀 DWARF(가장 충실), 자동 다운로드 | 첫 사용 시 수백 MB 캐싱, 인터넷 필요 | ✅ URL 설정됨 |
-| **dbgsym 패키지** | `linux-image-*-dbgsym` (ddebs) | 오프라인 완전, 풀 DWARF | ddebs 저장소 추가+대용량 설치 | ❌ 미설치 |
+drgn 라이브 디버깅의 유일한 실질 관문은 "**DWARF를 어디서 얻나**"다. 세 경로가 있는데, **이 우분투 머신에서 실제로 통하는 건 dbgsym 설치뿐**이다.
 
-**권장**: 일상 탐색은 **BTF로 충분**(이 문서 스크립트는 BTF만으로 전부 동작). 더 깊은 정밀도(인라인된 타입, 정적 함수 심볼)가 필요하면 drgn이 **debuginfod로 풀 DWARF를 자동 페치**하게 두면 된다. drgn은 BTF→DWARF 순으로 알아서 시도한다.
+| 방법 | 준비물 | 이 우분투 6.17 머신 | 비고 |
+|------|--------|--------------------|------|
+| ~~BTF~~ | `/sys/kernel/btf/*` | ❌ **불가** | drgn은 BTF를 타입 소스로 쓰지 않음 |
+| debuginfod 자동 다운로드 | 인터넷 + `DEBUGINFOD_URLS` | ❌ **불가** | drgn `is_fedora_kernel()`이 비-Fedora 커널엔 debuginfod 끔([[06-linux-kernel]] §8) |
+| **dbgsym 패키지** | `linux-image-*-dbgsym` (ddebs) | ✅ **유일한 길** | 수백 MB, ddebs 저장소 추가 필요 |
 
-> BTF의 한 가지 실무 함의: 구버전 drgn(≤0.0.24)은 BTF 지원이 약했다. **drgn 0.2.0**에서는 BTF+모듈 BTF가 안정적이라 이 환경에 적합하다.
+### 이 머신에서 DWARF 확보 절차 (실행 전 필수)
+
+```bash
+# 1) ddebs(우분투 디버그심볼) 저장소 추가
+sudo apt install -y ubuntu-dbgsym-keyring
+echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
+deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" \
+  | sudo tee /etc/apt/sources.list.d/ddebs.list
+sudo apt update
+
+# 2) 실행 중인 커널의 vmlinux DWARF 설치 (수백 MB)
+sudo apt install -y linux-image-$(uname -r)-dbgsym
+#  → /usr/lib/debug/boot/vmlinux-$(uname -r) 생성. drgn이 자동으로 찾는다.
+```
+
+> 정밀 검증을 못 하는 환경(인터넷/디스크 제약)이라면, **이 머신과 동일한 커널을 KVM/QEMU로 띄우고 `--qemu`로 붙거나**, dbgsym이 이미 있는 Fedora 게스트에서 실습하는 것도 대안이다([[07-stack-arch]] §6 QMP).
 
 ---
 
@@ -308,7 +326,9 @@ rq (driver 태그 in-flight)
 
 **제가(분석자) 이 머신에서 직접 확인한 것**
 - ✅ drgn 0.2.0 venv 설치 성공(wheel, 컴파일 불필요), 헬퍼 심볼(`request_queue_busy_iter`/`blk_mq_rq_to_pdu`/`for_each_pci_dev`/`Program.read(physical=)`) 존재 실측
-- ✅ BTF(코어+nvme 모듈), debuginfod URL, `/proc/kcore`, `CONFIG_*` 플래그, IOMMU 미사용, NVMe/PCIe/blk-mq sysfs 토폴로지 실측
+- ✅ `/proc/kcore`, `CONFIG_*` 플래그, IOMMU 미사용, NVMe/PCIe/blk-mq sysfs 토폴로지 실측
+- ✅ (정정) drgn 소스 분석으로 **DWARF 전용·BTF 미사용·비-Fedora debuginfod 비활성** 확정 → 이 머신은 **dbgsym 설치가 전제**임을 명확화([[03-debuginfo-dwarf]] · [[06-linux-kernel]])
+- ⏳ (미완) dbgsym 미설치 상태라 **실제 라이브 세션은 아직 미검증** — §3 절차로 dbgsym 설치 후 `00_env_check.py`부터 확인 필요
 - ✅ 커널 6.17 소스에서 `nvme_iod`/`nvme_queue`/`nvme_dev`/`struct request` **정확한 필드명** 확인 → 스크립트에 반영
 - ✅ 스크립트 5종 문법 컴파일 + 헬퍼 임포트 통과
 
