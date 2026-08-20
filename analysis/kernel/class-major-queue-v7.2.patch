@@ -1,0 +1,454 @@
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 6754d8f9449c..8b8fc3fceffc 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -376,6 +376,11 @@ static const char *const hctx_types[] = {
+ 	[HCTX_TYPE_DEFAULT]	= "default",
+ 	[HCTX_TYPE_READ]	= "read",
+ 	[HCTX_TYPE_POLL]	= "poll",
++	[HCTX_TYPE_URGENT]	= "urgent",
++	[HCTX_TYPE_FUA]		= "fua",
++	[HCTX_TYPE_SYNC]	= "sync",
++	[HCTX_TYPE_BULK]	= "bulk",
++	[HCTX_TYPE_SPARE]	= "spare",
+ };
+ 
+ static int hctx_type_show(void *data, struct seq_file *m)
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2c850330a32b..dd13ce9b8f8e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -4414,7 +4414,12 @@ struct request_queue *blk_mq_alloc_queue(struct blk_mq_tag_set *set,
+ 	if (!lim)
+ 		lim = &default_lim;
+ 	lim->features |= BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
+-	if (set->nr_maps > HCTX_TYPE_POLL)
++	/*
++	 * nr_maps alone no longer implies poll queues exist: classes after
++	 * HCTX_TYPE_POLL push nr_maps up even when poll is unused.
++	 */
++	if (set->nr_maps > HCTX_TYPE_POLL &&
++	    set->map[HCTX_TYPE_POLL].nr_queues)
+ 		lim->features |= BLK_FEAT_POLL;
+ 
+ 	q = blk_alloc_queue(lim, set->numa_node);
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index aa15d31aaae9..fef9bcea0e03 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -87,18 +87,49 @@ static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *
+ 	return queue_hctx((q), (q->tag_set->map[type].mq_map[cpu]));
+ }
+ 
++/*
++ * Pick the service class for an operation.  This is the single place where a
++ * request is bound to one of the per-CPU hardware queues, so the whole
++ * (class x CPU) queue grid is steered from here.
++ *
++ * Classification only, never spreading: identical traffic must keep landing on
++ * the same queue so that plug batching (->queue_rqs) and doorbell write
++ * amortisation survive.  Do not round-robin here.
++ *
++ * Types beyond the maps a driver actually allocated are aliased onto the
++ * HCTX_TYPE_DEFAULT queue by blk_mq_map_swqueue(), so single-map drivers keep
++ * their current behaviour.
++ */
+ static inline enum hctx_type blk_mq_get_hctx_type(blk_opf_t opf)
+ {
+-	enum hctx_type type = HCTX_TYPE_DEFAULT;
+-
+ 	/*
+ 	 * The caller ensure that if REQ_POLLED, poll must be enabled.
+ 	 */
+ 	if (opf & REQ_POLLED)
+-		type = HCTX_TYPE_POLL;
+-	else if ((opf & REQ_OP_MASK) == REQ_OP_READ)
+-		type = HCTX_TYPE_READ;
+-	return type;
++		return HCTX_TYPE_POLL;
++	/* Metadata is latency critical and must not queue behind bulk data. */
++	if (opf & REQ_META)
++		return HCTX_TYPE_URGENT;
++	/* Barriers serialise the device; keep them off the data classes. */
++	if (opf & (REQ_FUA | REQ_PREFLUSH))
++		return HCTX_TYPE_FUA;
++	if ((opf & REQ_OP_MASK) == REQ_OP_READ)
++		return HCTX_TYPE_READ;
++	/*
++	 * Bandwidth oriented traffic, safe to sit in a deep queue.
++	 *
++	 * REQ_IDLE must NOT be tested here.  It means "anticipate more I/O
++	 * after this one" (an elevator idling hint), not "low priority", and
++	 * dio_bio_write_op() sets it on every synchronous O_DIRECT write
++	 * (block/fops.c:31).  Testing it sent all direct writes to the bulk
++	 * class, which was confirmed by per-queue interrupt counts in QEMU.
++	 */
++	if (opf & REQ_BACKGROUND)
++		return HCTX_TYPE_BULK;
++	/* A waiter is blocked on this write. */
++	if (opf & REQ_SYNC)
++		return HCTX_TYPE_SYNC;
++	return HCTX_TYPE_DEFAULT;
+ }
+ 
+ /*
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 69932d640b53..c07299280c5c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -272,6 +272,67 @@ static unsigned int poll_queues;
+ module_param_cb(poll_queues, &io_queue_count_ops, &poll_queues, 0644);
+ MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
+ 
++/*
++ * [Class-Major queue model]
++ * Number of interrupt driven service classes.  Each class gets up to one
++ * queue per possible CPU, so the controller ends up with
++ *
++ *	io_classes x num_possible_cpus() (+ poll_queues)
++ *
++ * I/O queues laid out as a (class x CPU) grid.  This is how the driver
++ * consumes a device that offers more queue pairs than the host has CPUs:
++ * the extra queues become extra classes, not extra queues per class.
++ *
++ * The per-class queue count must stay <= num_possible_cpus().  Beyond that
++ * blk_mq_map_queues() wraps with "queue % nr_masks" and the low numbered
++ * queues end up mapped to no CPU at all, which strands them.
++ *
++ * io_classes == 1 reproduces the historical behaviour exactly, in which case
++ * write_queues/poll_queues keep their old meaning.
++ */
++static unsigned int io_classes = 1;
++
++static int io_classes_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int n;
++	int ret;
++
++	ret = kstrtouint(val, 10, &n);
++	/* One class per hctx type, except the poll class which has no IRQ. */
++	if (ret != 0 || n < 1 || n > HCTX_MAX_TYPES - 1)
++		return -EINVAL;
++	return param_set_uint(val, kp);
++}
++
++static const struct kernel_param_ops io_classes_ops = {
++	.set = io_classes_set,
++	.get = param_get_uint,
++};
++
++module_param_cb(io_classes, &io_classes_ops, &io_classes, 0644);
++MODULE_PARM_DESC(io_classes,
++	"Number of interrupt driven I/O service classes; each gets one queue "
++	"per CPU. 1 (default) keeps the legacy default/read split.");
++
++/*
++ * Order in which hctx types are laid out over the queue id space.
++ *
++ * HCTX_TYPE_POLL must come last: nvme_create_io_queues() decides which queue
++ * ids are polled by treating everything above the interrupt driven queues as
++ * poll queues, and nvme_setup_irqs() likewise assumes the poll queues are the
++ * tail of the id space.
++ */
++static const u8 nvme_class_order[HCTX_MAX_TYPES] = {
++	HCTX_TYPE_DEFAULT,
++	HCTX_TYPE_READ,
++	HCTX_TYPE_URGENT,
++	HCTX_TYPE_FUA,
++	HCTX_TYPE_SYNC,
++	HCTX_TYPE_BULK,
++	HCTX_TYPE_SPARE,
++	HCTX_TYPE_POLL,
++};
++
+ static bool noacpi;
+ module_param(noacpi, bool, 0444);
+ MODULE_PARM_DESC(noacpi, "disable acpi bios quirks");
+@@ -332,6 +393,11 @@ struct nvme_dev {
+ 	struct nvme_host_mem_buf_desc *host_mem_descs;
+ 	void **host_mem_desc_bufs;
+ 	unsigned int nr_allocated_queues;
++	/*
++	 * Sampled from the io_classes module parameter at reset time so the
++	 * value stays stable for the whole setup sequence.
++	 */
++	unsigned int nr_io_classes;
+ 	unsigned int nr_write_queues;
+ 	unsigned int nr_poll_queues;
+ 	struct nvme_descriptor_pools descriptor_pools[];
+@@ -689,12 +755,24 @@ static void nvme_pci_map_queues(struct blk_mq_tag_set *set)
+ 	int i, qoff, offset;
+ 
+ 	offset = queue_irq_offset(dev);
+-	for (i = 0, qoff = 0; i < set->nr_maps; i++) {
+-		struct blk_mq_queue_map *map = &set->map[i];
++	/*
++	 * Walk classes in nvme_class_order, not in hctx type order, so that the
++	 * poll class always lands at the tail of the queue id space.  qoff is
++	 * the running hctx index and offset the running MSI-X vector index;
++	 * both must advance in the same order the queues were created in.
++	 */
++	for (i = 0, qoff = 0; i < ARRAY_SIZE(nvme_class_order); i++) {
++		unsigned int type = nvme_class_order[i];
++		struct blk_mq_queue_map *map;
++
++		/* The map array was sized once, at tag set allocation time. */
++		if (type >= set->nr_maps)
++			continue;
+ 
+-		map->nr_queues = dev->io_queues[i];
++		map = &set->map[type];
++		map->nr_queues = dev->io_queues[type];
+ 		if (!map->nr_queues) {
+-			BUG_ON(i == HCTX_TYPE_DEFAULT);
++			BUG_ON(type == HCTX_TYPE_DEFAULT);
+ 			continue;
+ 		}
+ 
+@@ -703,7 +781,7 @@ static void nvme_pci_map_queues(struct blk_mq_tag_set *set)
+ 		 * affinity), so use the regular blk-mq cpu mapping
+ 		 */
+ 		map->queue_offset = qoff;
+-		if (i != HCTX_TYPE_POLL && offset)
++		if (type != HCTX_TYPE_POLL && offset)
+ 			blk_mq_map_hw_queues(map, dev->dev, offset);
+ 		else
+ 			blk_mq_map_queues(map);
+@@ -2421,8 +2499,15 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
+ 
+ 	max = min(dev->max_qid, dev->ctrl.queue_count - 1);
+ 	if (max != 1 && dev->io_queues[HCTX_TYPE_POLL]) {
+-		rw_queues = dev->io_queues[HCTX_TYPE_DEFAULT] +
+-				dev->io_queues[HCTX_TYPE_READ];
++		/*
++		 * Everything that is not the poll class is interrupt driven
++		 * and occupies the low part of the queue id space.
++		 */
++		rw_queues = 0;
++		for (i = 0; i < HCTX_MAX_TYPES; i++) {
++			if (i != HCTX_TYPE_POLL)
++				rw_queues += dev->io_queues[i];
++		}
+ 	} else {
+ 		rw_queues = max;
+ 	}
+@@ -2860,8 +2945,60 @@ static void nvme_calc_irq_sets(struct irq_affinity *affd, unsigned int nrirqs)
+ {
+ 	struct nvme_dev *dev = affd->priv;
+ 	unsigned int nr_read_queues, nr_write_queues = dev->nr_write_queues;
++	unsigned int i;
+ 
+ 	/*
++	 * Clear every interrupt driven class.  HCTX_TYPE_POLL is owned by
++	 * nvme_setup_irqs() and must survive.
++	 */
++	for (i = 0; i < HCTX_MAX_TYPES; i++) {
++		if (i != HCTX_TYPE_POLL)
++			dev->io_queues[i] = 0;
++		affd->set_size[i] = 0;
++	}
++
++	if (dev->nr_io_classes > 1) {
++		unsigned int ncpus = blk_mq_num_possible_queues(0);
++		unsigned int set = 0, left = nrirqs;
++
++		/*
++		 * Hand out vectors class by class, at most one per CPU each.
++		 * Affinity sets are positional and must be contiguous and
++		 * non-zero: irq_create_affinity_masks() calls
++		 * group_cpus_evenly() once per set and a zero sized set makes
++		 * the whole allocation fail.  So we stop at the first class we
++		 * cannot fill at all.
++		 */
++		for (i = 0; i < ARRAY_SIZE(nvme_class_order) && left; i++) {
++			u8 type = nvme_class_order[i];
++			unsigned int n;
++
++			if (type == HCTX_TYPE_POLL)
++				continue;
++			if (set >= dev->nr_io_classes)
++				break;
++			n = min(left, ncpus);
++			dev->io_queues[type] = n;
++			affd->set_size[set++] = n;
++			left -= n;
++		}
++
++		/*
++		 * At least one interrupt driven queue must exist; the default
++		 * class is never allowed to be empty (nvme_pci_map_queues()
++		 * BUG_ON()s on that).
++		 */
++		if (!set) {
++			dev->io_queues[HCTX_TYPE_DEFAULT] = 1;
++			affd->set_size[set++] = 1;
++		}
++		affd->nr_sets = set;
++		return;
++	}
++
++	/*
++	 * Legacy single-class layout below.
++	 *
+ 	 * If there is no interrupt available for queues, ensure that
+ 	 * the default queue is set to 1. The affinity set size is
+ 	 * also set to one, but the irq core ignores it for this case.
+@@ -2937,6 +3074,14 @@ static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
+ 	 */
+ 	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS)
+ 		return 1;
++	/*
++	 * Class-Major layout: one queue per CPU per interrupt driven class.
++	 * This is the only place that used to bound the queue count by the CPU
++	 * count; multiplying by the class count is what lifts that bound.
++	 */
++	if (dev->nr_io_classes > 1)
++		return blk_mq_num_possible_queues(0) * dev->nr_io_classes +
++			dev->nr_poll_queues;
+ 	return blk_mq_num_possible_queues(0) + dev->nr_write_queues +
+ 		dev->nr_poll_queues;
+ }
+@@ -2955,6 +3100,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+ 	 */
+ 	dev->nr_write_queues = write_queues;
+ 	dev->nr_poll_queues = poll_queues;
++	dev->nr_io_classes = io_classes;
+ 
+ 	if (dev->ctrl.tagset) {
+ 		/*
+@@ -2966,6 +3112,16 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+ 			dev->nr_poll_queues = 0;
+ 		if (dev->ctrl.tagset->nr_maps < 2)
+ 			dev->nr_write_queues = 0;
++
++		/*
++		 * Same restriction for the extra classes: a reset can shrink
++		 * the class count but never grow it past the map array that
++		 * was sized when the tag set was created.
++		 */
++		while (dev->nr_io_classes > 1 &&
++		       nvme_class_order[dev->nr_io_classes - 1] >=
++				dev->ctrl.tagset->nr_maps)
++			dev->nr_io_classes--;
+ 	}
+ 
+ 	/*
+@@ -3064,10 +3220,24 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+ 		nvme_suspend_io_queues(dev);
+ 		goto retry;
+ 	}
+-	dev_info(dev->ctrl.device, "%d/%d/%d default/read/poll queues\n",
++	if (dev->nr_io_classes > 1) {
++		char buf[64];
++		unsigned int i;
++		int n = 0;
++
++		/* Report every class, the legacy line only covers three. */
++		for (i = 0; i < HCTX_MAX_TYPES; i++)
++			n += scnprintf(buf + n, sizeof(buf) - n, "%s%u",
++				       i ? "/" : "", dev->io_queues[i]);
++		dev_info(dev->ctrl.device,
++			 "%s default/read/poll/urgent/fua/sync/bulk/spare queues\n",
++			 buf);
++	} else {
++		dev_info(dev->ctrl.device, "%d/%d/%d default/read/poll queues\n",
+ 					dev->io_queues[HCTX_TYPE_DEFAULT],
+ 					dev->io_queues[HCTX_TYPE_READ],
+ 					dev->io_queues[HCTX_TYPE_POLL]);
++	}
+ 	return 0;
+ out_unlock:
+ 	mutex_unlock(&dev->shutdown_lock);
+@@ -3156,13 +3326,23 @@ static void nvme_delete_io_queues(struct nvme_dev *dev)
+ 		__nvme_delete_io_queues(dev, nvme_admin_delete_cq);
+ }
+ 
++/*
++ * Number of queue maps the tag set needs: one past the highest hctx type that
++ * actually carries queues.  Gaps are fine - blk_mq_map_swqueue() aliases a map
++ * with nr_queues == 0 back onto the default hardware queue.
++ *
++ * Note this is evaluated once, when the tag set is allocated; a later reset
++ * cannot grow it (see nvme_setup_io_queues()).
++ */
+ static unsigned int nvme_pci_nr_maps(struct nvme_dev *dev)
+ {
+-	if (dev->io_queues[HCTX_TYPE_POLL])
+-		return 3;
+-	if (dev->io_queues[HCTX_TYPE_READ])
+-		return 2;
+-	return 1;
++	unsigned int i, nr_maps = 1;
++
++	for (i = 0; i < HCTX_MAX_TYPES; i++) {
++		if (dev->io_queues[i])
++			nr_maps = i + 1;
++	}
++	return nr_maps;
+ }
+ 
+ static bool nvme_pci_update_nr_queues(struct nvme_dev *dev)
+@@ -3688,6 +3868,7 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 
+ 	dev->nr_write_queues = write_queues;
+ 	dev->nr_poll_queues = poll_queues;
++	dev->nr_io_classes = io_classes;
+ 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+ 	dev->queues = kcalloc_node(dev->nr_allocated_queues,
+ 			sizeof(struct nvme_queue), GFP_KERNEL, node);
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index af878597afb8..f01d5b2bc16a 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -483,12 +483,34 @@ struct blk_mq_queue_map {
+  * @HCTX_TYPE_DEFAULT:	All I/O not otherwise accounted for.
+  * @HCTX_TYPE_READ:	Just for READ I/O.
+  * @HCTX_TYPE_POLL:	Polled I/O of any kind.
++ * @HCTX_TYPE_URGENT:	Metadata / latency critical I/O.
++ * @HCTX_TYPE_FUA:	Cache flush and FUA I/O.
++ * @HCTX_TYPE_SYNC:	Synchronous writes.
++ * @HCTX_TYPE_BULK:	Background / idle bandwidth oriented I/O.
++ * @HCTX_TYPE_SPARE:	Reserved for driver defined classes.
+  * @HCTX_MAX_TYPES:	Number of types of hctx.
++ *
++ * A type is a *service class*.  One software queue (per-CPU ctx) belongs to
++ * one hardware queue per type, so the number of types is exactly the number
++ * of hardware queues a single CPU can submit to.  Growing this enum is what
++ * lets a device expose more hardware queues than the machine has CPUs: the
++ * queues are laid out as a (class x CPU) grid.
++ *
++ * HCTX_TYPE_POLL must keep index 2: blk_mq_alloc_queue() and several drivers
++ * (virtio_blk, rnbd) treat "nr_maps > HCTX_TYPE_POLL" as "poll is available",
++ * so new classes are appended after it.  Drivers that allocate fewer maps are
++ * unaffected - blk_mq_map_swqueue() aliases every unused type back onto the
++ * HCTX_TYPE_DEFAULT hardware queue.
+  */
+ enum hctx_type {
+ 	HCTX_TYPE_DEFAULT,
+ 	HCTX_TYPE_READ,
+ 	HCTX_TYPE_POLL,
++	HCTX_TYPE_URGENT,
++	HCTX_TYPE_FUA,
++	HCTX_TYPE_SYNC,
++	HCTX_TYPE_BULK,
++	HCTX_TYPE_SPARE,
+ 
+ 	HCTX_MAX_TYPES,
+ };
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index 3bf969ad8fe0..957ddf5da344 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -276,7 +276,11 @@ struct irq_affinity_notify {
+ 	void (*release)(struct kref *ref);
+ };
+ 
+-#define	IRQ_AFFINITY_MAX_SETS  4
++/*
++ * One affinity set per hardware queue service class (enum hctx_type),
++ * minus the poll class which carries no interrupt.
++ */
++#define	IRQ_AFFINITY_MAX_SETS  8
+ 
+ /**
+  * struct irq_affinity - Description for automatic irq affinity assignments

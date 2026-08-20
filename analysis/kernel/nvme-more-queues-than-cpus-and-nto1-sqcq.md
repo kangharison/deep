@@ -952,3 +952,132 @@ NVMe 중재는 같은 우선순위 안에서 **SQ 단위 라운드로빈**이므
 - 본 절의 QEMU는 `-accel tcg`(소프트웨어 에뮬레이션)이고 NVMe도 소프트웨어 모델이다. **기능·매핑·자료구조 검증에는 유효하나, IOPS/지연 수치는 실물로 전이되지 않는다.**
 - §11.6의 depth 값, 클래스 비율, replica 축 필요성은 **실물 SSD 실측으로만 결정할 수 있다.**
 - 게스트 커널이 6.1.4라 §11.1은 구조적 사실(맵 축이 CPU보다 많은 hctx를 만든다)의 확인이며, v7.2에서 해당 코드 경로가 동일함은 §1의 코드 판독으로 대조했다.
+
+---
+
+## 12. 구현과 QEMU 검증 결과
+
+§11의 Class-Major Queue Model을 v7.2에 실제로 구현하고 QEMU에서 검증했다.
+
+- **패치**: `deep/analysis/kernel/class-major-queue-v7.2.patch` (6 파일, +269 −21)
+- **작업 트리**: `company/linux` (v7.2 `8d3ae59288f1` 위, 커밋하지 않은 상태)
+- **검증 환경**: qemu-8.2.2 `-accel tcg`, 게스트 = 위 패치 커널, `-device nvme,max_ioqpairs=64`
+
+### 12.1 변경 요약
+
+| 파일 | 변경 |
+|------|------|
+| `include/linux/blk-mq.h` | `enum hctx_type`에 URGENT/FUA/SYNC/BULK/SPARE 추가, `HCTX_MAX_TYPES` 3→8 |
+| `block/blk-mq.h` | `blk_mq_get_hctx_type()`을 클래스 선택 정책으로 확장 |
+| `block/blk-mq-debugfs.c` | 타입 이름 5개 추가 (`BUILD_BUG_ON(ARRAY_SIZE == HCTX_MAX_TYPES)` 충족) |
+| `block/blk-mq.c` | `BLK_FEAT_POLL` 게이트에 `map[POLL].nr_queues` 조건 추가 |
+| `include/linux/interrupt.h` | `IRQ_AFFINITY_MAX_SETS` 4→8 |
+| `drivers/nvme/host/pci.c` | `io_classes` 모듈 파라미터, `nvme_class_order[]`, `nvme_max_io_queues` / `nvme_calc_irq_sets` / `nvme_pci_nr_maps` / `nvme_pci_map_queues` / `nvme_create_io_queues` / `nvme_setup_io_queues` |
+
+**설계상 반드시 지켜야 했던 제약 3가지** (구현 중 확인됨)
+
+1. **`HCTX_TYPE_POLL`은 인덱스 2에 고정.** `blk_mq_alloc_queue()`의 `nr_maps > HCTX_TYPE_POLL` 판정(`blk-mq.c:4417`)과 virtio_blk·rnbd가 이 값을 경계로 쓴다. 대신 NVMe 쪽에서 `nvme_class_order[]`로 poll을 **큐 ID 공간 마지막**에 배치했다 — `nvme_create_io_queues()`가 "IRQ 큐 뒤쪽 = poll"로 판정하기 때문이다.
+2. **affinity set은 위치 기반이며 크기 0이 불가.** `irq_create_affinity_masks()`가 set마다 `group_cpus_evenly()`를 부르는데 크기 0이면 NULL을 반환해 **벡터 할당 전체가 실패**한다. 그래서 `nvme_calc_irq_sets()`는 hctx 타입 인덱스가 아니라 **연속된 set 인덱스**로 채운다.
+3. **클래스당 큐 수 ≤ ncpus.** `min(left, ncpus)`로만 지켜지며 코드가 강제하지는 않는다. 어기면 `blk_mq_map_queues()`의 `queue % nr_masks` 덮어쓰기(§1.2 B2)로 앞쪽 큐가 고아가 된다.
+
+### 12.2 격자 형성 검증
+
+| 테스트 | 구성 | hctx 총수 | cpu_list | nvme IRQ 라인 |
+|--------|------|-----------|----------|---------------|
+| **T0** | `smp=2`, `io_classes=1` (기본) | 2 | 각 1 CPU | 3 |
+| **T1** | `smp=4`, `io_classes=6` | **24** | 각 1 CPU | **25** |
+| **T2** | `smp=2`, `io_classes=7` + `poll_queues=2` | **16** | 각 1 CPU | 15 |
+
+T1의 매핑 전개 — 24개가 정확히 6그룹, 각 그룹이 CPU 4개를 한 번씩 덮는다:
+
+```
+h0=[1]  h1=[3]  h2=[2]  h3=[0]    ┐ class0
+h4=[1]  h5=[3]  h6=[2]  h7=[0]    ┤ class1
+h8=[1]  h9=[3]  h10=[2] h11=[0]   ┤ class2
+h12=[1] h13=[3] h14=[2] h15=[0]   ┤ class3
+h16=[1] h17=[3] h18=[2] h19=[0]   ┤ class4
+h20=[1] h21=[3] h22=[2] h23=[0]   ┘ class5
+```
+
+**CPU 4개에 hctx 24개, I/O 벡터 24개** (CPU 수의 6배). 각 hctx가 CPU 하나를 전담하므로 **라운드로빈이 없다** — §11.3 근거 1이 구현으로 실현됐다.
+
+T2는 poll을 포함한 경우다: 7 IRQ 클래스 × 2 CPU = 14, + poll 2 = 16 hctx, IRQ 15개(= admin 1 + 14, poll은 벡터 없음). `nvme_class_order[]`의 poll-마지막 배치가 의도대로 동작했다.
+
+T0은 회귀 확인이다 — `io_classes=1`이면 vanilla와 동일(2/0/0, hctx 2개).
+
+`smp=2, io_classes=6`일 때의 클래스 배치:
+
+```
+2/2/0/2/2/2/2/0 default/read/poll/urgent/fua/sync/bulk/spare queues
+
+hctx0,1 = default   hctx6,7   = fua
+hctx2,3 = read      hctx8,9   = sync
+hctx4,5 = urgent    hctx10,11 = bulk
+```
+
+### 12.3 IO 라우팅 검증 — 그리고 측정이 잡아낸 버그
+
+라우팅은 `/proc/interrupts`의 **큐별 누적 인터럽트 델타**로 측정했다(큐 이름이 `nvme0qN`, qid = hctx_idx + 1). 클래스 대응: `q1,2=default q3,4=read q5,6=urgent q7,8=fua q9,10=sync q11,12=bulk`.
+
+**1차 측정 (수정 전)**
+
+| IO 패턴 | 델타 | 착지 클래스 | 기대 | 판정 |
+|---------|------|------------|------|------|
+| direct READ | `q4 +200` | read | read | ✅ |
+| direct WRITE | `q12 +200` | **bulk** | sync | ❌ |
+| buffered WRITE + fsync | `q8 +1`, `q10 +25` | fua + sync | fua + sync | ✅ |
+| buffered READ (readahead) | `q3 +88` | read | read | ✅ |
+
+**★ 코드 판독만으로는 놓쳤을 버그**: direct write가 최저 우선순위 클래스로 강등됐다. 원인은 선택자의 `REQ_IDLE` 사용이다.
+
+```c
+/* block/fops.c:29-37 */
+static blk_opf_t dio_bio_write_op(struct kiocb *iocb)
+{
+	blk_opf_t opf = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;   /* ← 항상 설정 */
+	...
+}
+```
+
+`REQ_IDLE`은 `blk_types.h:391`에 *"anticipate more IO after this one"* — **엘리베이터 idling 힌트이지 우선순위 신호가 아니다.** 그런데 O_DIRECT 동기 쓰기가 항상 이 비트를 세우므로, BULK 조건에 넣으면 모든 direct write가 강등된다. 조건에서 제거하고 `REQ_BACKGROUND`만 남겼다.
+
+**2차 측정 (수정 후)**
+
+| IO 패턴 | 델타 | 착지 클래스 | 판정 |
+|---------|------|------------|------|
+| direct READ | `q3 +200` | read | ✅ |
+| direct WRITE | `q9 +200` | **sync** | ✅ 교정됨 |
+| buffered WRITE + fsync | `q7 +1`, `q9 +25` | fua + sync | ✅ |
+| buffered write + `sync(1)` | `q10 +24` | sync | ✅ (WB_SYNC_ALL이므로 정상) |
+
+fsync 케이스가 특히 명확하다 — **flush 명령 1개가 fua 클래스로, writeback 쓰기 25개가 sync 클래스로** 갈렸다. 클래스 분리가 실제 IO 경로에서 작동한다는 직접 증거다. 게스트의 `write_cache`가 `write back`이므로 flush/FUA는 실제로 의미 있는 명령이다.
+
+### 12.4 검증되지 않은 것 (정직한 한계)
+
+| 항목 | 상태 | 이유 |
+|------|------|------|
+| URGENT 클래스 (`REQ_META`) | **미검증** | 파일시스템 메타데이터가 필요한데 테스트가 raw 블록 디바이스라 트리거 불가 |
+| BULK 클래스 (`REQ_BACKGROUND`) | **미검증** | 백그라운드 writeback은 dirty 임계 기반이라 결정적으로 유발하기 어려움. `sync(1)`은 WB_SYNC_ALL이라 SYNC로 간다 |
+| dsync direct write (FUA 경로 단독) | **테스트 불가** | busybox `dd`가 `oflag=dsync` 미지원. 단 FUA 라우팅 자체는 fsync 케이스(`q7 +1`)로 증명됨 |
+| 새 배치에서의 실제 poll IO | **미검증** | 큐 배치와 IRQ 부재는 확인, 실제 폴링 제출은 미측정 |
+| 성능 (IOPS/지연) | **측정 안 함** | TCG 소프트웨어 에뮬레이션이라 수치가 실물로 전이되지 않음 (§11.9) |
+
+### 12.5 구현이 드러낸 설계 한계 — opf만으로는 우선순위를 표현할 수 없다
+
+현재 선택자는 `blk_mq_get_hctx_type(blk_opf_t opf)` 시그니처를 유지하려고 **opf 비트만** 사용한다. 이 제약이 실측에서 드러났다.
+
+- READ / SYNC / FUA / META는 opf로 충분히 구분된다 — §12.3에서 확인.
+- 그러나 **우선순위(ioprio)는 opf에 없다.** `IOPRIO_CLASS_RT` / `IOPRIO_CLASS_IDLE`은 `bio->bi_ioprio` / `rq->ioprio`에 있다.
+- 그 결과 **BULK 클래스는 사실상 도달 불가능**하다. `REQ_BACKGROUND`는 파일시스템의 백그라운드 writeback에서나 붙는다.
+
+→ 실용적인 QoS 정책(§11.6의 5클래스 구성)을 하려면 **선택자가 bio 또는 request를 받아야 한다**. 호출부는 `__blk_mq_alloc_requests`(`blk-mq.c:553`)와 `blk_mq_get_tag` 재시도 경로 두 곳뿐이므로 시그니처 확장 자체는 국소적이다. **다음 단계의 1순위 작업.**
+
+### 12.6 다음 단계
+
+| 순위 | 작업 | 근거 |
+|------|------|------|
+| 1 | 선택자가 bio/request를 받도록 확장 → ioprio 기반 클래스 | §12.5 |
+| 2 | 파일시스템 위에서 URGENT/BULK 라우팅 검증 (ext4 + fio) | §12.4 |
+| 3 | `HCTX_MAX_TYPES` 런타임화 (`__alloc_percpu` + flexible array) | 컴파일 상수는 모든 블록 디바이스에 과세 (§11.4) |
+| 4 | 클래스별 depth / CQ 정책 / QPRIO (§10.3, §11.6) | 클래스가 실제 QoS를 갖게 하는 단계 |
+| 5 | 실물 SSD 성능 측정 | TCG로는 불가 (§11.9) |
