@@ -41,11 +41,19 @@ G3 (ctx ≤ hctx) ──enables──> G1이 "블록 IO에서 실제로 쓰임"
 | **F3** | 전체 freeze 없이 hctx 하나만 격리·drain하는 프리미티브가 **이미 있다** — `BLK_MQ_S_INACTIVE` + 태그 반납 + retry (blk-mq.c:3735 / blk-mq-tag.c:227 / blk-mq.c:586) | G3의 "동적 삭제"를 `blk_mq_update_nr_hw_queues`의 전체 freeze 없이 구현할 토대 |
 | **F4** | `blk_mq_map_swqueue`가 tags를 **lazy alloc**한다 (blk-mq.c:4191-4200) + 매핑 없는 hctx는 tags를 해제한다 (4237-4245) | "hctx는 존재하지만 `tags == NULL`인 **휴면 상태**"가 blk-mq에 이미 1급 상태로 존재 → 오버프로비저닝 + 동적 활성화의 토대 |
 
-### 0.4 권장 결론
+### 0.4 권장 결론 → **§11로 대체됨**
+
+> 아래는 초기 잠정 권고다. 요구사항 확정(CPU < hctx, 메모리 제약 없음, 디바이스 전체 큐 활용)과 **§11.1의 QEMU 실측**으로 결론이 바뀌었다. **최종 결론은 §11 (Class-Major Queue Model)** 을 볼 것.
+
+**최종 결론 요약**: 큐를 **(클래스 × CPU) 격자**로 배치한다. 클래스 = blk-mq의 map(hctx type)이며, 지금 3개(default/read/poll)로 고정된 arity를 K개로 일반화한다. **클래스당 큐 수 = ncpus**를 불변식으로 유지하면 (CPU, 클래스)가 큐를 유일하게 결정하므로 **라운드로빈이 필요 없고 배칭이 100% 보존**된다. 실측(§11.1)에서 CPU 2개짜리 게스트가 hctx 6개(=3×2)로 정상 동작함을 확인했으므로, 이는 신규 메커니즘이 아니라 **shipping 메커니즘의 arity 확장**이다.
+
+<details><summary>초기 잠정 권고 (참고용)</summary>
 
 **옵션 1(드라이버 내 SQ fan-out) → 옵션 4(per-hctx 동적 activate/deactivate) → (필요 시) 옵션 2/3(hctx 축 일반화)** 의 단계적 접근.
 
-이유: 옵션 1만으로 G1·G2가 **blk-mq 무수정**으로 달성되고, 완료 경로 정합성(가장 위험한 부분)이 **구조적으로 자동 해결**된다. ctx ≤ hctx(옵션 2/3)는 `struct blk_mq_ctx`를 모든 블록 디바이스에 대해 키우는 침습적 변경이므로, "옵션 1로는 부족하다"가 계측으로 증명된 뒤에 간다.
+이유: 옵션 1만으로 G1·G2가 **blk-mq 무수정**으로 달성되고, 완료 경로 정합성(가장 위험한 부분)이 **구조적으로 자동 해결**된다.
+
+</details>
 
 ---
 
@@ -778,3 +786,134 @@ G. 가상화 자원            (Virtualization Management 0x1Ch — VQ/VI)
 | **7** | NVMSETID 노출 (10.1) | NVM Set 격리. 별도 트랙 |
 | **8** | PC=0 + CAP.CQR (10.5) | 큐가 매우 커질 때만 필요. 후순위 |
 | **9** | Virtualization Management (10.7) | 별도 트랙 (SR-IOV) |
+
+---
+
+## 11. 결론 — 권장 모델 (Class-Major Queue Model)
+
+> 이 절이 최종 결론이다. §0.4의 잠정 권고(옵션 1 우선)는 아래 실측 결과로 **대체된다**.
+
+### 11.1 결정적 실측 — blk-mq는 이미 CPU보다 많은 hctx로 돌고 있다
+
+QEMU(qemu-8.2.2, `-accel tcg`, 게스트 커널 6.1.4, NVMe `max_ioqpairs=64`)로 3회 부팅해 확인했다.
+
+| # | 구성 | dmesg | `/sys/block/nvme0n1/mq/` | nvme IRQ 라인 |
+|---|------|-------|--------------------------|---------------|
+| 1 | `-smp 2`, 기본 | `2/0/0 default/read/poll` | `0 1` (2개) | 3 (admin+2) |
+| 2 | `-smp 2`, `nvme.write_queues=4 poll_queues=4` | `2/0/0` — **파라미터 거부됨** | `0 1` | 3 |
+| 3 | `-smp 2`, `nvme.write_queues=2 poll_queues=2` | `2/2/2` → **I/O 큐 6개** | `0 1 2 3 4 5` (**6개**) | 5 (admin+2+2) |
+
+실험 3의 CPU↔hctx 매핑 (`mq/N/cpu_list`, `nr_tags`):
+
+```
+hctx0  cpus=0   nr_tags=1023      ┐ default 클래스
+hctx1  cpus=1   nr_tags=1023      ┘
+hctx2  cpus=0   nr_tags=1023      ┐ read 클래스
+hctx3  cpus=1   nr_tags=1023      ┘
+hctx4  cpus=0   nr_tags=1023      ┐ poll 클래스
+hctx5  cpus=1   nr_tags=1023      ┘
+
+→ CPU0 ⟶ hctx {0, 2, 4},  CPU1 ⟶ hctx {1, 3, 5}
+→ hctx 6개 = 3 × CPU 2개.  각 hctx는 CPU 1개 전담 + 독립 tags 1023개.
+```
+
+**이것이 정확히 "ctx ≤ hctx"이며, 이미 메인라인에서 동작 중이다.** 우리가 만들려던 구조가 신규 개념이 아니라 **arity가 3으로 고정된 기존 메커니즘**이라는 뜻이다.
+
+부수 확인 2가지:
+- 실험 2에서 파라미터가 거부된 것은 `io_queue_count_set()`의 `n > blk_mq_num_possible_queues(0)` 검사(pci.c:249-257, **N11**)다. **모듈 파라미터 자체가 CPU 수로 상한**이 걸려 있다.
+- 실험 3의 IRQ 5개 = admin 1 + default 2 + read 2 (poll은 IRQ 없음). **CPU 2개에 I/O 벡터 4개** — `irq_calc_affinity_vectors()`가 `calc_sets` 존재 시 CPU 캡을 걸지 않는다는 코드 판독(affinity.c:117-121)이 실측으로 확인됐다.
+
+### 11.2 결론 모델
+
+큐를 **(클래스 × CPU) 2차원 격자**로 배치한다.
+
+```
+        class0(default)   class1(read)   class2       ...   class K-1
+cpu0    Q(0,0)            Q(1,0)         Q(2,0)             Q(K-1,0)
+cpu1    Q(0,1)            Q(1,1)         Q(2,1)             Q(K-1,1)
+...
+cpuN-1  Q(0,N-1)          Q(1,N-1)       Q(2,N-1)           Q(K-1,N-1)
+
+총 큐 수 = K × ncpus
+```
+
+- **클래스 = blk-mq의 map(hctx type).** 지금 3개(default/read/poll)를 K개로 일반화한다.
+- **클래스 내부는 CPU당 정확히 1큐** — 이것이 핵심 불변식이다.
+- 클래스 선택은 IO의 성격이 정한다 (`blk_mq_get_hctx_type()`의 정책 확장).
+
+### 11.3 왜 이 모델이 가장 효율적인가
+
+| # | 근거 |
+|---|------|
+| **1** | **라운드로빈이 없다.** (CPU, 클래스) 쌍이 큐를 유일하게 결정하므로 한 태스크의 연속 IO는 항상 같은 큐로 간다 → `nvme_queue_rqs` 배칭과 도어벨 amortization이 **100% 보존**된다. §5.3에서 경고한 성능 리스크가 **구조적으로 제거**된다 |
+| **2** | **신규 메커니즘이 아니라 shipping 메커니즘의 arity 확장.** §11.1이 보여주듯 매핑·hotplug·sched·sysfs·IRQ set이 이미 이 축으로 동작한다. 검증 부담이 압도적으로 낮다 |
+| **3** | **각 큐가 독립 tags/depth/스케줄러/sysfs 엔트리를 갖는다** (실측: hctx마다 `nr_tags=1023`) → "blk-mq가 디바이스 큐를 인식해야 한다"는 요구가 그대로 충족된다 |
+| **4** | **클래스가 곧 QoS 단위**라, §11.6의 "구분(differentiation)" 원칙과 자료구조가 일치한다. 분산이 아니라 분류로 큐를 쓴다 |
+| **5** | 코드 변경이 국소적이다 (§11.4) |
+
+### 11.4 변경 목록
+
+| # | 대상 | 변경 |
+|---|------|------|
+| 1 | `linux/include/linux/blk-mq.h:488-494` | `enum hctx_type` / `HCTX_MAX_TYPES` 3 → K. **런타임화 권장** — `struct blk_mq_ctx`에 flexible array + `__alloc_percpu(size, align)`(`include/linux/percpu.h:142`)로 tagset별 K. 그래야 loop·virtio-blk 등이 세금을 안 낸다 |
+| 2 | `linux/block/blk-mq.h:90-102` | `blk_mq_get_hctx_type(opf)` → 정책 훅 (ioprio class / REQ_META·SYNC / cgroup / write stream / NS) |
+| 3 | `linux/block/blk-mq.c:4876`, `5119` | `nr_maps == 1` 캡 — K 일반화 후 의미 재검토 (클래스당 ≤ ncpus 불변식이 실질 가드) |
+| 4 | `linux/include/linux/interrupt.h:279` | `IRQ_AFFINITY_MAX_SETS` 4 → K (**K ≤ 4면 무수정**) |
+| 5 | `linux/drivers/nvme/host/pci.c:2859` | `nvme_calc_irq_sets()` — `nr_sets = K`, `set_size[i] = 클래스 i의 큐 수` |
+| 6 | `linux/drivers/nvme/host/pci.c:249-257` | `io_queue_count_set()`의 CPU 캡 제거 (N11) |
+| 7 | `linux/drivers/nvme/host/pci.c:2932`, `3691` | `nvme_max_io_queues()` 재정의, `dev->queues[]` 사이징 |
+| 8 | `linux/drivers/nvme/host/pci.c:686` | `nvme_pci_map_queues()` — K개 map 채우기 (기존 루프가 이미 `set->nr_maps` 순회이므로 거의 그대로) |
+
+**절대 불변식**: **클래스당 큐 수 ≤ ncpus.** 넘는 순간 `blk_mq_map_queues()`의 `queue % nr_masks` 덮어쓰기(§1.2 B2)가 재발해 앞쪽 큐가 고아가 된다.
+
+### 11.5 상한과 K 선택
+
+```
+총 큐 수 = Σ(클래스별 큐 수) ≤ K × ncpus
+디바이스 전체 큐를 쓰려면  K = ceil(device_queues / ncpus)
+```
+
+- percpu 할당 32KB 상한(`PCPU_MIN_UNIT_SIZE`, `mm/percpu.c:1770`), 슬롯당 약 32B → **K ≲ 250**. 64 CPU면 16,000큐까지라 실물로는 걸리지 않는다.
+- **활성 클래스 수는 실제로 구분되는 트래픽 종류 수를 넘을 수 없다** — 현실적으로 4~8개다.
+
+**그래서 "전체 리소스를 모두 생성한다"의 올바른 해석**: 디바이스 큐를 **전부 생성하되(협상·자원 확보), 활성 클래스는 의미 있는 만큼만** 둔다. 나머지는 **휴면 hctx**(§3.4의 오버프로비저닝 + `tags == NULL`)로 두고 워크로드가 요구할 때 활성화한다. 이것이 "전부 생성"과 "잘 활용"을 동시에 만족시키는 유일한 구성이다. **동적 큐 관리(G3)의 존재 이유가 바로 이것이다.**
+
+### 11.6 클래스 설계 (시작 구성 제안)
+
+| 클래스 | 선택 조건 | 큐 수 | depth | CQ 정책 | QPRIO |
+|--------|----------|-------|-------|---------|-------|
+| `URGENT` | `REQ_META`, `REQ_FUA`, `IOPRIO_CLASS_RT` | ncpus | 8 | 전용 CQ, coalescing off (FID 09h CD=1) | Urgent |
+| `SYNC` | `REQ_SYNC` 읽기, 지연 민감 | ncpus | 64 | 전용 CQ, coalescing off | High |
+| `DEFAULT` | 그 외 | ncpus | 256 | 2:1 공유 CQ | Medium |
+| `BULK` | 대용량 순차 쓰기, `IOPRIO_CLASS_IDLE` | ncpus | 512 | 8:1 공유 CQ (N:1), coalescing on (FID 08h) | Low |
+| `POLL` | `REQ_POLLED` | ncpus | 128 | CQ만, IRQ 없음 | — |
+
+→ K=5, 64 CPU면 320큐. depth 합 = 8+64+256+512+128 = 968/CPU × 64 = 61,952 태그.
+**이 총합이 `ctrl->maxcmd`(Identify Controller MAXCMD, `include/linux/nvme.h:368`)를 넘지 않도록 depth를 조정해야 한다.** PCIe 드라이버는 현재 이 필드를 읽지 않으므로(`fc.c`/`tcp.c`만 사용) 확인 경로를 추가한다.
+
+> 실측 참고: 실험 3에서 이미 6 × 1023 = **6,138 태그**가 CPU 2개짜리 게스트에 잡혀 있었다. 기본 구성에서도 오버서브스크립션은 이미 심하다 — 큐를 늘릴 때 depth를 함께 낮추지 않으면 지연만 늘어난다.
+
+### 11.7 replica 축 (Model B — 조건부, 기본 비권장)
+
+NVMe 중재는 같은 우선순위 안에서 **SQ 단위 라운드로빈**이므로, 클래스 내 큐 개수가 그 클래스의 fetch 대역 비율이 된다. 우선순위 4단계보다 촘촘한 가중치가 필요하면 (클래스, CPU) 셀 안에 큐를 여러 개 둔다.
+
+- 이때만 `ctx->rq_lists[type]` / `index_hw[type]` / `hctxs[type]`의 **2차원 확장**이 필요하다 (§3.3).
+- 선택은 반드시 **sticky**(per-task 또는 per-plug). **per-IO 라운드로빈은 금지** — §11.3의 근거 1이 무효화된다.
+- **계측으로 필요성이 증명될 때만 착수한다.** 대상 컨트롤러가 클래스 내 RR을 스펙대로 구현하는지 먼저 실측해야 한다 (벤더 편차 큼).
+
+### 11.8 최종 로드맵
+
+| 단계 | 내용 | 검증 |
+|------|------|------|
+| **1** | `HCTX_MAX_TYPES` 런타임화 + `blk_mq_get_hctx_type` 정책 훅 | **null_blk 우선** (NVMe 없이 blk-mq 단독). `mq/N/cpu_list`가 (클래스×CPU) 격자를 이루는지 |
+| **2** | `IRQ_AFFINITY_MAX_SETS` + `nvme_calc_irq_sets` K sets | `/proc/interrupts` 라인 수 = 1 + Σ(IRQ 있는 클래스 큐 수) |
+| **3** | NVMe 큐 수 상한 해제 (N1·N2·N11) + MAXCMD 확인 | QEMU `max_ioqpairs=64`, `-smp 2` → **큐 64개 전부 생성·매핑** |
+| **4** | 클래스별 depth/CQ/QPRIO 차등 + CC.AMS=WRRU (§10.3) | 클래스별 지연 분포 **분리** 확인 |
+| **5** | N:1 (BULK 클래스 CQ 공유) + 인터럽트 coalescing (§10.4) | IRQ 수 감소, BULK 지연 증가·URGENT 지연 불변 |
+| **6** | 동적 activate/deactivate (§3.4) | fio 부하 중 클래스 추가/삭제, **throughput 0 구간 없음** |
+
+### 11.9 검증 환경의 한계 (반드시 인지)
+
+- 본 절의 QEMU는 `-accel tcg`(소프트웨어 에뮬레이션)이고 NVMe도 소프트웨어 모델이다. **기능·매핑·자료구조 검증에는 유효하나, IOPS/지연 수치는 실물로 전이되지 않는다.**
+- §11.6의 depth 값, 클래스 비율, replica 축 필요성은 **실물 SSD 실측으로만 결정할 수 있다.**
+- 게스트 커널이 6.1.4라 §11.1은 구조적 사실(맵 축이 CPU보다 많은 hctx를 만든다)의 확인이며, v7.2에서 해당 코드 경로가 동일함은 §1의 코드 판독으로 대조했다.
