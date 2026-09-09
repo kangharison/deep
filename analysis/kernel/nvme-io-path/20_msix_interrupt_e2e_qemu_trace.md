@@ -108,6 +108,7 @@ QEMU 트레이스 줄에는 앞에 `<스레드ID>@<시각>:`이 붙는데, 이�
 |------|-----------|
 | 10분 만에 감 잡기 | 이 길잡이 → §1(한 장 요약) → §11(타임라인) → §16(직답) |
 | 원리를 이해하기 | §2(장치가 수첩을 어디 두나) → §4(커널이 뭘 적나) → §5(장치가 어떻게 쏘나) → §6~§8(APIC·CPU가 어떻게 받나) |
+| **코드 레벨로 끝까지 따라가기** | **§11-A(레이어별 함수 그래프 — 실측 백트레이스 전체)** |
 | 직접 해보기 | §14(재현 스크립트) |
 | "진짜 그런가?" 검증 | §9(마스킹 실험) → §10(CPU가 직접 쏴보기) |
 
@@ -1537,6 +1538,666 @@ MSI가 "특별한 신호"가 아니라 **그냥 메모리 쓰기**라면, CPU가
 
 ---
 
+## 11-A. 레이어별 함수 그래프 — 전 구간 콜체인 (실측 백트레이스)
+
+§11의 타임라인을 **함수 단위로 확대**한 절이다. 각 레이어마다 실제로 gdb로 잡은
+백트레이스를 그대로 싣고, 그 아래에 데이터 값을 붙였다.
+
+### 11-A.0 이 절을 읽는 법
+
+**데이터 출처**
+
+| 레이어 | 어떻게 떴나 | 태그 |
+|--------|-------------|------|
+| 게스트 커널 (L0, L1, L5, L6, L7) | 게스트 gdbstub(`-s`)에 `gdb vmlinux` 접속 → 함수마다 breakpoint → `bt` | `[driver]` |
+| QEMU 장치·APIC·vCPU (L2, L3, L4) | 호스트에서 `gdb --args qemu-system-x86_64 …` 로 **QEMU 프로세스 자체**를 디버깅 → `bt` | `[qemu]` |
+
+> 게스트 커널에 `CONFIG_FUNCTION_TRACER`가 꺼져 있어 ftrace `function_graph`는 쓸 수 없었다.
+> 대신 각 지점에서 실제 스택을 떠서 같은 정보를 얻었다. (ftrace를 쓰려면 커널을
+> `--enable FUNCTION_GRAPH_TRACER`로 다시 빌드해야 한다)
+
+**표기 규칙**
+
+* `#N` 으로 시작하는 줄은 **gdb가 출력한 원본 백트레이스**다. gdb는 `#0`이 가장 깊은
+  프레임이므로, **아래에서 위로 읽으면 호출 순서**다.
+* 원본 아래에 붙인 트리는 **위에서 아래로 = 호출 순서**로 뒤집어 정리한 것이다.
+* `⟨inlined⟩` 는 `-O2`로 인라인되거나 tail-call 되어 **스택에 프레임이 남지 않은 함수**다.
+  소스를 읽어 보충했으며, 실행은 분명히 된다.
+* 프레임의 `at file:line` 은 gdb가 DWARF에서 뽑은 실제 위치다.
+  QEMU 바이너리는 `debug=False`로 빌드돼 DWARF가 없어 **함수 이름만** 나온다.
+
+**레이어 지도**
+
+```
+ [L0] 준비   커널이 장치의 MSI-X 테이블에 "내 주소"를 적는다        (probe / affinity 변경 / 해제)
+ ────────────────────────── 이하 I/O 1건의 생애 ──────────────────────────
+ [L1] 제출   read(2) → 블록계층 → SQ 도어벨 (MMIO write)             [driver]
+ [L2] 장치   QEMU가 커맨드 처리 → CQE 기록 → MSI 발사                [qemu]
+ [L3] APIC   0xFEE20004 쓰기 해석 → CPU5 IRR[33]=1                    [qemu]
+ [L4] vCPU   TCG 실행루프가 인터럽트 수락 → 벡터 33 반환              [qemu]
+ [L5] 진입   IDT[33] → common_interrupt → EOI(ack)                    [driver]
+ [L6] 핸들러 nvme_irq → CQE 파싱 → CQ 도어벨                          [driver]
+ [L7] 완료   블록계층 완료 → bio_endio → dd 깨어남                    [driver]
+```
+
+---
+
+### 11-A.1 [L0] 커널이 MSI-X 테이블에 주소를 적기까지 (probe 경로)
+
+부팅 때 일어나는 일이라 gdb를 붙였을 땐 이미 끝나 있다.
+**드라이버를 unbind/bind 해서 재현**했다:
+
+```sh
+echo 0000:00:04.0 > /sys/bus/pci/drivers/nvme/unbind
+echo 0000:00:04.0 > /sys/bus/pci/drivers/nvme/bind
+```
+
+**`[driver]`** 게스트 gdb — `break msi_domain_activate` 에서 잡은 백트레이스
+
+```
+#0  msi_domain_activate (domain=0xffff888004344000, irq_data=0xffff888004182a28, early=true)
+        at kernel/irq/msi.c:512
+#1  __irq_domain_activate_irq (irqd=0xffff888004182a28, reserve=true)   at kernel/irq/irqdomain.c:1767
+#2  irq_domain_activate_irq (irq_data=0xffff888004182a28, reserve=true) at kernel/irq/irqdomain.c:1790
+#3  msi_init_virq (vflags=<optimized out>, virq=24, domain=0xffff888004344000) at kernel/irq/msi.c:841
+#4  __msi_domain_alloc_irqs (domain=0xffff888004344000, dev=0xffff888004cc60c8, nvec=<optimized out>)
+        at kernel/irq/msi.c:902
+#5  msi_domain_alloc_irqs_descs_locked (domain=..., dev=0xffff888004cc60c8, nvec=1) at kernel/irq/msi.c:952
+#6  pci_msi_setup_msi_irqs (dev=0xffff888004cc6000, nvec=1, type=17)   at drivers/pci/msi/irqdomain.c:17
+#7  msix_setup_interrupts (affd=0x0, nvec=1, entries=..., base=0xffffc9000002d000, dev=0xffff888004cc6000)
+        at drivers/pci/msi/msi.c:580
+#8  msix_capability_init (affd=..., nvec=1, entries=..., dev=0xffff888004cc6000) at drivers/pci/msi/msi.c:640
+#9  __pci_enable_msix (flags=..., affd=..., nvec=1, entries=..., dev=...) at drivers/pci/msi/msi.c:827
+#10 __pci_enable_msix_range (dev=0xffff888004cc6000, entries=0x0, minvec=1, maxvec=1, affd=0x0, flags=7)
+        at drivers/pci/msi/msi.c:952
+#11 __pci_enable_msix_range (flags=7, affd=0x0, maxvec=1, minvec=1, entries=0x0, dev=0xffff888004cc6000)
+        at drivers/pci/msi/msi.c:342
+#12 pci_alloc_irq_vectors_affinity (dev=0xffff888004cc6000, min_vecs=1, max_vecs=1, flags=7, affd=0x0)
+        at drivers/pci/msi/msi.c:1021
+#13 pci_alloc_irq_vectors (flags=7, max_vecs=1, min_vecs=1, dev=0xffff888004cc6000)
+        at ./include/linux/pci.h:1907
+#14 nvme_pci_enable (dev=0xffff888004113000)   at drivers/nvme/host/pci.c:2711
+#15 nvme_reset_work (work=0xffff888004113600)  at drivers/nvme/host/pci.c:2940
+```
+
+호출 순서로 뒤집으면:
+
+```
+ nvme_reset_work                              pci.c:2940     ← 워커 스레드(kworker)
+  └→ nvme_pci_enable                          pci.c:2711
+      └→ pci_alloc_irq_vectors(dev,1,1,ALL)   pci.h:1907     ★ min=1 max=1 → 우선 admin용 1개만
+          └→ pci_alloc_irq_vectors_affinity   msi.c:1021
+              └→ __pci_enable_msix_range      msi.c:342/952
+                  └→ __pci_enable_msix        msi.c:827
+                      └→ msix_capability_init msi.c:640      ★ MSI-X Enable=1 & Function Mask=1
+                          │                                    (= 트레이스의 "enabled 1 masked 1")
+                          └→ msix_setup_interrupts             msi.c:580
+                              └→ pci_msi_setup_msi_irqs        irqdomain.c:17
+                                  └→ msi_domain_alloc_irqs_descs_locked  msi.c:952
+                                      └→ __msi_domain_alloc_irqs        msi.c:902
+                                          │  ⟨inlined⟩ irq_domain_alloc_irqs → x86_vector_alloc_irqs
+                                          │             → assign_irq_vector_any_locked
+                                          │             → irq_matrix_alloc()   ★ 여기서 vector=34, cpu=4 결정
+                                          └→ msi_init_virq(virq=24)            msi.c:841
+                                              └→ irq_domain_activate_irq       irqdomain.c:1790
+                                                  └→ __irq_domain_activate_irq irqdomain.c:1767
+                                                      └→ msi_domain_activate   msi.c:512
+                                                          └→ irq_chip_write_msi_msg  msi.c:466
+                                                              └→ __pci_write_msi_msg  drivers/pci/msi/msi.c:151
+                                                                  ├ writel(addr_lo, base+0x0)   ★ MMIO
+                                                                  ├ writel(addr_hi, base+0x4)   ★ MMIO
+                                                                  └ writel(data,    base+0x8)   ★ MMIO
+                                                                    → QEMU msix_table_mmio_write()
+```
+
+**이 그래프에서 확인되는 값**
+
+| 프레임 | 값 | 의미 |
+|--------|-----|------|
+| `#3 msi_init_virq` | `virq=24` | 이 엔트리에 할당된 Linux IRQ 번호 = `nvme0q0` |
+| `#5/#6` | `nvec=1`, `type=17` | 1차 할당은 admin 1개, type 17 = `PCI_CAP_ID_MSIX` |
+| `#7 msix_setup_interrupts` | `base=0xffffc9000002d000` | **MSI-X 테이블의 커널 가상주소**(BAR0 ioremap + 0x2000) |
+| `#12` | `flags=7` | `PCI_IRQ_ALL_TYPES` = LEGACY\|MSI\|MSIX |
+
+`nvme_setup_io_queues()`가 나중에 다시 `pci_free_irq_vectors()` → `pci_alloc_irq_vectors_affinity(…, 9, …)`
+를 부르며, 그것이 §3.1 트레이스의 3~5번째 `msix_write_config` 줄이다.
+
+#### 11-A.1b [L0'] affinity를 바꾸면 언제 테이블에 다시 쓰나 — **다음 인터럽트의 ack 시점**
+
+`echo 2 > /proc/irq/24/smp_affinity_list` 를 실행해도 그 자리에서 테이블이 안 바뀐다.
+`__pci_write_msi_msg` breakpoint가 **즉시 걸리지 않고, 다음 nvme0q0 인터럽트가 왔을 때** 걸렸다:
+
+**`[driver]`** 게스트 gdb — affinity 변경이 실제로 반영되는 순간
+
+```
+#0  __pci_write_msi_msg (entry=0xffff888005b84000, msg=0xffffc90000174ec8) at drivers/pci/msi/msi.c:152
+#1  irq_msi_update_msg (cfg=0xffff888005aa70c0, irqd=0xffff888005b64228)  at arch/x86/kernel/apic/msi.c:31
+#2  msi_set_affinity (irqd=0xffff888005b64228, mask=<tmp_mask>, force=...) at arch/x86/kernel/apic/msi.c:79
+#3  irq_do_set_affinity (data=0xffff888005b64228, mask=..., force=false)  at kernel/irq/manage.c:268
+#4  irq_move_masked_irq (idata=0xffff888005b64228)                        at kernel/irq/migration.c:80
+#5  __irq_move_irq (idata=0xffff888005b64228)                             at kernel/irq/migration.c:116
+#6  irq_move_irq (data=0xffff888005aa7080)                                at ./include/linux/irq.h:632
+#7  apic_ack_irq (irqd=0xffff888005aa7080)      at arch/x86/kernel/apic/vector.c:891
+#8  apic_ack_edge (irqd=0xffff888005aa7080)     at arch/x86/kernel/apic/vector.c:898
+#9  handle_edge_irq (desc=0xffff888005b64200)   at kernel/irq/chip.c:800
+#10 generic_handle_irq_desc (desc=0xffff888005b64200)  at ./include/linux/irqdesc.h:158
+#11 handle_irq (regs=..., desc=0xffff888005b64200)     at arch/x86/kernel/irq.c:231
+#12 __common_interrupt (regs=..., vector=34)           at arch/x86/kernel/irq.c:250
+#13 common_interrupt (regs=0xffffc900000a3e38, ...)    at arch/x86/kernel/irq.c:240
+```
+
+**그 순간 실제로 쓰는 값** (gdb `p/x *msg`):
+
+```
+address_lo = 0xfee04004      destid_0_7 = 0x4   → CPU2 (LDR 0x04)
+address_hi = 0x0             dest_mode_logical = 1, redirect_hint = 0
+data       = 0x23            vector = 0x23 = 35, delivery_mode = 0(Fixed), is_level = 0
+entry->msi_index = 0         → MSI-X 테이블 entry0 (= nvme0q0)
+```
+
+즉 **`0xFEE10004`/`0x22`(CPU4·벡터34) → `0xFEE04004`/`0x23`(CPU2·벡터35)** 로 갈아끼운다.
+
+> **왜 즉시가 아닌가**: 인터럽트가 날아오는 중에 테이블을 바꾸면 옛 벡터로 온 인터럽트를
+> 놓칠 수 있다. 그래서 x86은 변경을 `desc->pending_mask`에 적어두고,
+> **다음 인터럽트의 ack 경로(`apic_ack_edge → irq_move_irq`)에서** 안전하게 반영한다.
+> 위 백트레이스가 그 설계를 그대로 보여준다 — `vector=34`(옛 벡터)로 들어온 인터럽트를
+> 처리하다가 그 안에서 새 메시지를 써 넣는다.
+
+#### 11-A.1c [L0''] 드라이버를 떼면 — 엔트리를 0으로 지운다
+
+**`[driver]`** 게스트 gdb — `unbind` 시 `__pci_write_msi_msg`
+
+```
+#0  __pci_write_msi_msg (entry=0xffff888005b84400, msg=0xffffc90000013c98) at drivers/pci/msi/msi.c:152
+#1  irq_chip_write_msi_msg (msg=..., data=...)          at kernel/irq/msi.c:466
+#2  msi_domain_deactivate (domain=..., irq_data=...)    at kernel/irq/msi.c:527
+#3  __irq_domain_deactivate_irq (irq_data=0xffff888005b65228) at kernel/irq/irqdomain.c:1750
+#4  irq_domain_deactivate_irq (irq_data=0xffff888005b65228)   at kernel/irq/irqdomain.c:1807
+#5  __free_irq (dev_id=0xffff888005b84880, desc=0xffff888005b65200) at kernel/irq/manage.c:1986
+#6  free_irq (irq=..., dev_id=0xffff8880043ec800)       at kernel/irq/manage.c:2032
+#7  pci_free_irq (dev=..., nr=..., dev_id=0xffff8880043ec800)  at drivers/pci/irq.c:74
+#8  nvme_suspend_queue (nvmeq=...)                      at drivers/nvme/host/pci.c:1609
+#9  nvme_suspend_io_queues (dev=0xffff8880043eb000)     at drivers/nvme/host/pci.c:1618
+#10 nvme_dev_disable (dev=0xffff8880043eb000, shutdown=true)   at drivers/nvme/host/pci.c:2828
+#11 nvme_remove (pdev=...)                              at drivers/nvme/host/pci.c:3752
+#12 pci_device_remove (dev=0xffff888004cc60c8)          at drivers/pci/pci-driver.c:476
+#13 __device_release_driver (...)                       at drivers/base/dd.c:1253
+#14 device_release_driver_internal (...)                at drivers/base/dd.c:1279
+#15 device_driver_detach (dev=0xffff888004cc60c8)       at drivers/base/dd.c:1315
+#16 unbind_store (drv=<nvme_driver+120>, buf="0000:00:04.0\n", ...)  at drivers/base/bus.c:191
+#17 kernfs_fop_write_iter (...)                         at fs/kernfs/file.c:330
+```
+
+이때 쓰는 값: **`address_lo = 0x0`, `data = 0x0`, `msi_index = 8`**.
+즉 **엔트리를 0으로 덮어써서 장치가 더는 아무 데도 못 쏘게 만든다.**
+
+---
+
+### 11-A.2 [L1] 제출 — `read(2)` 에서 SQ 도어벨까지
+
+**`[driver]`** 게스트 gdb — `break nvme_queue_rqs`, 게스트에서
+`taskset -c 5 dd if=/dev/nvme0n1 bs=4096 count=1 skip=6666` 실행
+
+```
+#0  nvme_queue_rqs (rqlist=0xffffc9000043fbd0)                    at drivers/nvme/host/pci.c:1076
+#1  __blk_mq_flush_plug_list (plug=0xffffc9000043fbd0, q=0xffff888005eb8000) at block/blk-mq.c:2699
+#2  __blk_mq_flush_plug_list (plug=..., q=...)                    at block/blk-mq.c:2694
+#3  blk_mq_flush_plug_list (plug=0xffffc9000043fbd0, from_schedule=false)   at block/blk-mq.c:2755
+#4  __blk_flush_plug (plug=..., from_schedule=false)              at block/blk-core.c:1137
+#5  blk_finish_plug (plug=0xffffc9000043fb80)                     at block/blk-core.c:1161
+#6  blk_finish_plug (plug=0xffffc9000043fbd0)                     at block/blk-core.c:1158
+#7  read_pages (rac=0xffffc9000043fcb8)                           at mm/readahead.c:184
+#8  page_cache_ra_unbounded (ractl=0xffffc9000043fcb8, nr_to_read=1, ...)   at mm/readahead.c:270
+#9  do_page_cache_ra (...)                                        at mm/readahead.c:300
+#10 page_cache_sync_ra (ractl=..., req_count=1)                   at mm/readahead.c:709
+#11 page_cache_sync_readahead (req_count=1, index=6666, file=0xffff888004da5400, ...)
+                                                                  at ./include/linux/pagemap.h:1213
+#12 filemap_get_pages (iocb=..., iter=..., fbatch=...)            at mm/filemap.c:2581
+#13 filemap_read (iocb=0xffffc9000043fe98, iter=..., already_read=0)        at mm/filemap.c:2675
+#14 blkdev_read_iter (iocb=0xffffc9000043fe98, to=0xffffc9000043fe70)       at block/fops.c:598
+#15 call_read_iter (iter=..., kio=..., file=0xffff888004da5400)   at ./include/linux/fs.h:2193
+#16 new_sync_read (ppos=..., len=4096, buf=0x7fbc90474000, filp=...)        at fs/read_write.c:389
+#17 vfs_read (file=0xffff888004da5400, buf=0x7fbc90474000, count=4096, pos=...) at fs/read_write.c:470
+#18 ksys_read (fd=..., buf=0x7fbc90474000, count=4096)            at fs/read_write.c:613
+#19 do_syscall_x64 (nr=..., regs=0xffffc9000043ff58)              at arch/x86/entry/common.c:50
+#20 do_syscall_64 (regs=0xffffc9000043ff58, nr=...)               at arch/x86/entry/common.c:80
+#21 entry_SYSCALL_64 ()                                           at arch/x86/entry/entry_64.S:120
+```
+
+호출 순서로:
+
+```
+ entry_SYSCALL_64                             entry_64.S:120     ← 유저→커널 진입
+  └→ do_syscall_64 → do_syscall_x64           common.c:80/50
+      └→ ksys_read(fd, buf, 4096)             read_write.c:613   ★ dd의 read(2)
+          └→ vfs_read                         read_write.c:470
+              └→ new_sync_read → call_read_iter  read_write.c:389 / fs.h:2193
+                  └→ blkdev_read_iter          fops.c:598        ★ /dev/nvme0n1 이므로 블록 fops
+                      └→ filemap_read          filemap.c:2675    ★ 페이지 캐시 경유(O_DIRECT 아님)
+                          └→ filemap_get_pages filemap.c:2581
+                              └→ page_cache_sync_readahead(index=6666, req_count=1)  pagemap.h:1213
+                                  └→ page_cache_sync_ra          readahead.c:709
+                                      └→ do_page_cache_ra        readahead.c:300
+                                          └→ page_cache_ra_unbounded(nr_to_read=1)  readahead.c:270
+                                              └→ read_pages      readahead.c:184
+                                                  │  ⟨inlined⟩ …→ submit_bio → blk_mq_submit_bio
+                                                  │              → blk_add_rq_to_plug (플러그에 쌓기)
+                                                  └→ blk_finish_plug            blk-core.c:1158
+                                                      └→ __blk_flush_plug       blk-core.c:1137
+                                                          └→ blk_mq_flush_plug_list  blk-mq.c:2755
+                                                              └→ __blk_mq_flush_plug_list blk-mq.c:2694
+                                                                  └→ nvme_queue_rqs   pci.c:1076   ★
+                                                                      ├ ⟨inlined⟩ nvme_prep_rq_batch
+                                                                      └ ⟨inlined⟩ nvme_submit_cmds
+                                                                          ├ nvme_sq_copy_cmd()  SQ에 64B 커맨드 복사
+                                                                          └ nvme_write_sq_db()
+                                                                              └ writel(sq_tail, nvmeq->q_db)
+                                                                                = MMIO 0xfebf1030 쓰기 ★
+```
+
+> **★ 함정 1: `nvme_queue_rq` 가 아니라 `nvme_queue_rqs` 다.**
+> `break nvme_queue_rq` 를 걸면 **영원히 안 걸린다.** 커널 5.16부터 blk-mq는 플러그에 쌓인
+> 요청을 `mq_ops->queue_rqs()` 로 **한 번에** 넘긴다(`drivers/nvme/host/pci.c:1849`
+> `.queue_rqs = nvme_queue_rqs`). 단건 I/O도 플러그를 거치므로 이 경로를 탄다.
+> `nvme_queue_rq`(단수)는 `queue_rqs`가 처리 못한 요청의 fallback 경로다.
+
+이 시점의 실측 값 (gdb):
+
+```
+nvmeq->qid        = 6              ← taskset -c 5 → hctx5 → NVMe 큐 6
+nvmeq->cq_vector  = 6              ← MSI-X 테이블 엔트리 인덱스
+nvmeq->q_db       = 0xffffc900002db030   ← BAR0 ioremap(0xffffc900002da000) + 0x1030
+nvmeq->sq_dma_addr= 0x4fb0000            ← 장치가 DMA로 읽어갈 SQ 물리주소
+```
+
+---
+
+### 11-A.3 [L2] QEMU 장치 — 도어벨 수신 → CQE → MSI 발사
+
+여기부터는 **호스트 gdb가 QEMU 프로세스를 직접** 디버깅한 결과다.
+
+**`[qemu]`** `gdb --args qemu-system-x86_64 …` → `break msix_notify` → `bt`
+
+```
+#0  msix_notify ()
+#1  aio_bh_call ()
+#2  aio_bh_poll ()
+#3  aio_dispatch ()
+#4  aio_ctx_dispatch ()
+#5  ??? () at /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#6  g_main_context_dispatch () at /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#7  main_loop_wait ()
+#8  qemu_main_loop ()
+#9  qemu_default_main ()
+#10 __libc_start_call_main (main=0x55555586f790 <main>, argc=24, ...)
+#11 __libc_start_main_impl (...)
+#12 _start ()
+```
+
+호출 순서로 (⟨inlined⟩는 소스로 보충):
+
+```
+ _start → __libc_start_main → qemu_default_main
+  └→ qemu_main_loop
+      └→ main_loop_wait
+          └→ g_main_context_dispatch          (glib 이벤트 루프)
+              └→ aio_ctx_dispatch
+                  └→ aio_dispatch
+                      └→ aio_bh_poll                 ★ Bottom Half 큐 처리
+                          └→ aio_bh_call
+                              └→ nvme_post_cqes(cq)  ⟨inlined⟩  hw/nvme/ctrl.c:1485
+                                  │   · CQ에 CQE를 DMA write (pci_dma_write)
+                                  │   · cq->tail 전진, phase 토글
+                                  └→ nvme_irq_assert(n, cq) ⟨inlined⟩  hw/nvme/ctrl.c:662
+                                      └→ msix_notify(pci, vector=6)    hw/pci/msix.c:525   ★
+```
+
+> **왜 vCPU 스레드가 아니라 main loop인가**: NVMe 장치는 커맨드를 받으면 블록 백엔드에
+> 비동기 I/O를 걸고 즉시 리턴한다. I/O가 끝나면 `nvme_enqueue_req_completion()`이
+> `qemu_bh_schedule(cq->bh)`(`hw/nvme/ctrl.c:1549`)로 **Bottom Half를 예약**만 하고,
+> 실제 CQE 기록과 인터럽트 발사는 **QEMU main loop 스레드**가 한다
+> (`cq->bh = qemu_bh_new_guarded(nvme_post_cqes, cq, …)`, `hw/nvme/ctrl.c:5290`).
+> §5.4 트레이스에서 이 이벤트들의 tid가 `2703852`(main thread)였던 이유가 이것이다.
+
+---
+
+### 11-A.4 [L3] QEMU Local APIC — 메모리 쓰기가 IRR이 되기까지
+
+**`[qemu]`** 같은 실행에서 `break apic_deliver_irq` → `bt` (main loop 유래인 것만 골라냄)
+
+```
+#0  apic_deliver_irq ()
+#1  memory_region_write_accessor ()
+#2  access_with_adjusted_size ()
+#3  memory_region_dispatch_write ()
+#4  address_space_stl_le ()
+#5  aio_bh_call ()
+#6  aio_bh_poll ()
+#7  aio_dispatch ()
+#8  aio_ctx_dispatch ()
+#9  ??? () at /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#10 g_main_context_dispatch ()
+#11 main_loop_wait ()
+#12 qemu_main_loop ()
+...
+#16 _start ()
+```
+
+**#4와 #5 사이가 이 문서 전체의 핵심**이다. 호출 순서로 펼치면:
+
+```
+ aio_bh_call
+  └→ nvme_post_cqes ⟨inlined⟩
+      └→ nvme_irq_assert ⟨inlined⟩
+          └→ msix_notify(dev, 6)                        hw/pci/msix.c:525
+              ├ msix_entry_used[6] 확인
+              ├ msix_is_masked(6) 확인   ← 마스크면 여기서 PBA만 세우고 종료 (§9)
+              ├ msix_get_message(dev,6) ⟨inlined⟩       hw/pci/msix.c:118
+              │     table_entry = dev->msix_table + 6*16
+              │     msg.address = 0xFEE20004  ← [device] 테이블에서 읽은 값
+              │     msg.data    = 0x00000021
+              └→ msi_send_message(dev, msg) ⟨inlined⟩    hw/pci/msi.c:377
+                  └→ pci_msi_trigger(dev, msg) ⟨inlined⟩ hw/pci/pci.c:346
+                      └→ address_space_stl_le(&dev->bus_master_as,
+                                              0xFEE20004, 0x21, attrs, NULL)   ★ 4바이트 쓰기
+                          │   attrs.requester_id = 00:04.0   (= PCIe TLP의 Requester ID)
+                          └→ memory_region_dispatch_write
+                              └→ access_with_adjusted_size
+                                  └→ memory_region_write_accessor
+                                      └→ apic_mem_write ⟨inlined/tail-call⟩   hw/intc/apic.c:740
+                                          │  addr = 0x20004 (리전 오프셋), val = 0x21
+                                          │  분기: addr > 0xfff → MSI 경로
+                                          └→ apic_send_msi ⟨inlined⟩          hw/intc/apic.c:727
+                                              │  dest      = (0x20004 & 0xff000) >> 12 = 0x20
+                                              │  vector    = 0x21 & 0xff              = 33
+                                              │  dest_mode = (0x20004 >> 2) & 1       = 1 (logical)
+                                              │  delivery  = (0x21 >> 8) & 7          = 0 (Fixed)
+                                              │  trigger   = (0x21 >> 15) & 1         = 0 (edge)
+                                              └→ apic_deliver_irq(0x20, 1, 0, 33, 0)  hw/intc/apic.c:279  ★
+                                                  ├ trace_apic_deliver_irq  ← §5.4 로그 줄이 여기서 나온다
+                                                  ├→ apic_get_delivery_bitmask       apic.c:457
+                                                  │     for each LAPIC: dest(0x20) & log_dest(LDR)
+                                                  │     → CPU5만 매칭 (LDR 0x20)
+                                                  └→ apic_bus_deliver                apic.c:217
+                                                      └→ apic_set_irq(CPU5, 33, 0)   apic.c:402
+                                                          ├ apic_set_bit(s->irr, 33)     ★ IRR[33] = 1
+                                                          ├ apic_reset_bit(s->tmr, 33)   (edge라 TMR=0)
+                                                          └→ apic_update_irq             apic.c:379
+                                                              └ cpu_interrupt(CPU5, CPU_INTERRUPT_POLL)
+                                                                ★ 다른 스레드가 건드리므로 POLL로 깨움
+```
+
+**`memory_region_write_accessor` 아래로 `apic_mem_write` 프레임이 안 보이는 이유**:
+`apic_send_msi()`의 마지막 문장이 `apic_deliver_irq(...)` 호출이라 컴파일러가 **tail call**로
+바꿨고(`jmp`), `apic_mem_write`도 같은 이유로 프레임이 접혔다. DWARF가 없어 gdb가
+인라인 프레임을 복원하지 못한다. 실행은 분명히 이 경로다(§6.1~6.4 소스 참조).
+
+---
+
+### 11-A.5 [L4] QEMU vCPU — TCG 실행 루프가 인터럽트를 집어간다
+
+**`[qemu]`** `break apic_get_interrupt` → `bt`
+
+```
+#0  apic_get_interrupt ()
+#1  cpu_get_pic_interrupt ()
+#2  x86_cpu_exec_interrupt ()
+#3  cpu_exec_loop ()
+#4  cpu_exec_setjmp ()
+#5  cpu_exec ()
+#6  tcg_cpus_exec ()
+#7  mttcg_cpu_thread_fn ()
+#8  qemu_thread_start ()
+#9  start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#10 clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+```
+
+호출 순서로:
+
+```
+ clone3 → start_thread → qemu_thread_start
+  └→ mttcg_cpu_thread_fn            ★ vCPU5 전용 스레드 (tid 2703864)
+      └→ tcg_cpus_exec
+          └→ cpu_exec
+              └→ cpu_exec_setjmp
+                  └→ cpu_exec_loop
+                      │  번역블록(TB) 경계마다 cpu->interrupt_request 확인
+                      │  CPU_INTERRUPT_POLL → apic_poll_irq() → CPU_INTERRUPT_HARD 승격
+                      └→ x86_cpu_exec_interrupt        target/i386/tcg/sysemu/seg_helper.c:130
+                          │  EFLAGS.IF 확인 (커널이 인터럽트 허용 상태여야 함)
+                          └→ cpu_get_pic_interrupt     hw/i386/x86.c:576
+                              └→ apic_get_interrupt    hw/intc/apic.c:576   ★
+                                  ├ intno = apic_irq_pending(s)   → 33
+                                  │    · IRR 최상위 = 33
+                                  │    · PPR(0x10) 검사: (33 & 0xf0)=0x20 > 0x10 → 통과
+                                  ├ apic_reset_bit(s->irr, 33)    ★ IRR[33] = 0
+                                  ├ apic_set_bit(s->isr, 33)      ★ ISR[33] = 1  (PPR → 0x20)
+                                  └ return 33
+                                     ↓
+                          do_interrupt_x86_hardirq(env, 33, ...)   target/i386/tcg/seg_helper.c:1160
+                            · IDT[33] 읽기 → 게이트의 offset/selector/type 확인
+                            · 스택에 SS,RSP,RFLAGS,CS,RIP push (인터럽트 게이트라 IF=0)
+                            · RIP = 0xffffffff81e001f8  ★ 여기서 게스트 커널로 점프
+```
+
+여기가 **QEMU(호스트 코드) → 게스트 커널(게스트 코드) 경계**다.
+이 다음 프레임부터는 게스트 gdb로만 볼 수 있다.
+
+---
+
+### 11-A.6 [L5] 게스트 커널 — IDT 진입과 EOI(ack)
+
+**`[driver]`** 게스트 gdb — `break apic_ack_edge` → `bt`
+
+```
+#0  apic_ack_edge (irqd=0xffff888005aa7380)   at arch/x86/kernel/apic/vector.c:80
+#1  handle_edge_irq (desc=0xffff888005b64e00) at kernel/irq/chip.c:800
+#2  generic_handle_irq_desc (desc=0xffff888005b64e00) at ./include/linux/irqdesc.h:158
+#3  handle_irq (regs=<optimized out>, desc=0xffff888005b64e00) at arch/x86/kernel/irq.c:231
+#4  __common_interrupt (regs=<optimized out>, vector=33)       at arch/x86/kernel/irq.c:250
+#5  common_interrupt (regs=0xffffc9000043fb78, error_code=...) at arch/x86/kernel/irq.c:240
+```
+
+호출 순서로:
+
+```
+ (하드웨어가 IDT[33]로 점프)
+  irq_entries_start + 8                    arch/x86/entry/entry_64.S
+   │  .byte 0x6a, 0x21     = push $33      ★ 벡터 번호를 스택에 남긴다
+   └→ asm_common_interrupt                 entry_64.S (idtentry_irq)
+       │  movq %rsp,%rdi          → 1번째 인자 = pt_regs*
+       │  movq ORIG_RAX(%rsp),%rsi → 2번째 인자 = 33
+       │  movq $-1, ORIG_RAX(%rsp)  (syscall 아님 표시 → §7.3의 orig_ax=-1)
+       └→ common_interrupt(regs, error_code=33)   irq.c:240
+           └→ __common_interrupt(regs, vector=33) irq.c:250
+               │  desc = __this_cpu_read(vector_irq[33])   ★ CPU5의 33번 칸
+               │       = irq_desc(irq 30, "nvme0q6")
+               └→ handle_irq(desc, regs)          irq.c:231
+                   └→ generic_handle_irq_desc     irqdesc.h:158
+                       └→ desc->handle_irq(desc) = handle_edge_irq   chip.c:777
+                           ├ kstat_incr_irqs_this_cpu(desc)   ★ /proc/interrupts 카운터 +1
+                           ├→ desc->irq_data.chip->irq_ack(&desc->irq_data)   chip.c:800  ★ EOI 먼저!
+                           │   = irq_chip_ack_parent            arch/x86/kernel/apic/msi.c:153
+                           │      └→ apic_ack_edge              vector.c:895
+                           │          ├→ irq_complete_move()    (affinity 이동 중이면 §11-A.1b 경로)
+                           │          └→ apic_ack_irq → ack_APIC_irq()
+                           │              └ native_apic_mem_write(APIC_EOI, 0)
+                           │                = LAPIC 0xFEE000B0 에 0 쓰기 ★
+                           │                  → QEMU apic_mem_write(0xb0) → apic_eoi() → ISR[33]=0
+                           └→ handle_irq_event(desc)            chip.c:819   (다음 절)
+```
+
+**소스가 말해주는 순서** (`kernel/irq/chip.c`):
+
+```c
+	kstat_incr_irqs_this_cpu(desc);
+
+	/* Start handling the irq */
+	desc->irq_data.chip->irq_ack(&desc->irq_data);      /* ← 800행: EOI */
+
+	do {
+		...
+		handle_irq_event(desc);                     /* ← 819행: 핸들러 */
+	} while (...);
+```
+
+두 백트레이스의 프레임 #1이 각각 **chip.c:800**(ack)과 **chip.c:819**(핸들러)로 찍혔다 —
+소스 순서와 실측이 일치한다. §8.2의 LAPIC 상태 비교(ISR 33 → none)가 같은 사실의 다른 증거다.
+
+---
+
+### 11-A.7 [L6·L7] 핸들러 — CQE 파싱부터 `bio_endio` 까지
+
+**`[driver]`** 게스트 gdb — `break blk_mq_complete_request_remote` → `bt`
+
+```
+#0  blk_mq_complete_request_remote (rq=0xffff88800693f180)     at block/blk-mq.c:1170
+#1  nvme_try_complete_req (result=..., status=..., req=0xffff88800693f180)
+                                                               at drivers/nvme/host/nvme.h:701
+#2  nvme_handle_cqe (idx=..., iob=..., nvmeq=0xffff8880043ec600) at drivers/nvme/host/pci.c:1211
+#3  nvme_poll_cq (nvmeq=0xffff8880043ec600, iob=0xffffc900001a0f38) at drivers/nvme/host/pci.c:1241
+#4  nvme_irq (irq=..., data=...)                               at drivers/nvme/host/pci.c:1255
+#5  __handle_irq_event_percpu (desc=0xffff888005b64e00)        at kernel/irq/handle.c:158
+#6  handle_irq_event_percpu (desc=0xffff888005b64e00)          at kernel/irq/handle.c:193
+#7  handle_irq_event (desc=0xffff888005b64e00)                 at kernel/irq/handle.c:210
+#8  handle_edge_irq (desc=0xffff888005b64e00)                  at kernel/irq/chip.c:819
+#9  generic_handle_irq_desc (desc=0xffff888005b64e00)          at ./include/linux/irqdesc.h:158
+#10 handle_irq (regs=..., desc=0xffff888005b64e00)             at arch/x86/kernel/irq.c:231
+#11 __common_interrupt (regs=..., vector=33)                   at arch/x86/kernel/irq.c:250
+#12 common_interrupt (regs=0xffffc900000abe38, ...)            at arch/x86/kernel/irq.c:240
+```
+
+**`[driver]`** 이어서 `break bio_endio` → `bt`
+
+```
+#0  bio_endio (bio=0xffff888005981000)                 at block/bio.c:1525
+#1  blk_complete_request (req=0xffff88800693f180)      at block/blk-mq.c:822
+#2  blk_mq_end_request_batch (iob=0xffffc900001a0f38)  at block/blk-mq.c:1059
+#3  nvme_complete_batch (fn=..., iob=0xffffc900001a0f38) at drivers/nvme/host/nvme.h:732
+#4  nvme_irq (irq=..., data=...)                       at drivers/nvme/host/pci.c:1257
+#5  __handle_irq_event_percpu (desc=0xffff888005b64e00) at kernel/irq/handle.c:158
+...
+```
+
+두 백트레이스를 합치면 `nvme_irq` 안의 **두 단계**가 드러난다:
+
+```
+ handle_edge_irq                                   chip.c:819
+  └→ handle_irq_event                              handle.c:210
+      └→ handle_irq_event_percpu                   handle.c:193
+          └→ __handle_irq_event_percpu             handle.c:158
+              │  action->handler(irq, action->dev_id) 호출
+              └→ nvme_irq(irq=30, data=nvmeq)      pci.c:1251
+                  │  DEFINE_IO_COMP_BATCH(iob);    ← 스택에 완료 배치 리스트 생성
+                  │
+                  ├─【1단계】 CQ 훑기 ────────────────────────────────────
+                  └→ nvme_poll_cq(nvmeq, &iob)                pci.c:1241
+                      │  while (nvme_cqe_pending(nvmeq)) {
+                      │      ★ phase 비트 검사: cqes[cq_head].status & 1 == cq_phase
+                      │      dma_rmb();            ← phase를 읽은 뒤 나머지를 읽도록 강제
+                      ├→ nvme_handle_cqe(nvmeq, &iob, cq_head)  pci.c:1211
+                      │   ├ command_id로 request 역추적 (nvme_find_rq → blk_mq_tag_to_rq)
+                      │   ├→ nvme_try_complete_req(req, status, result)  nvme.h:701
+                      │   │   ├ rq->status = status >> 1        ← bit0(phase) 제외
+                      │   │   └→ blk_mq_complete_request_remote(rq)   blk-mq.c:1170  ★
+                      │   │       · rq->state = MQ_RQ_COMPLETE
+                      │   │       · 완료를 다른 CPU에서 해야 하면 true(IPI 예약)
+                      │   │       · 여기선 제출 CPU == 인터럽트 CPU(둘 다 CPU5) → false
+                      │   └→ blk_mq_add_to_batch(req, iob, …)  ← false였으므로 배치에 적재
+                      │      }
+                      └ nvme_ring_cq_doorbell(nvmeq) ⟨inlined⟩
+                          └ writel(cq_head, q_db + db_stride)
+                            = MMIO 0xfebf1034 쓰기 ★ (§5.4의 doorbell_cq 로그)
+                  │
+                  └─【2단계】 배치 완료 ──────────────────────────────────
+                  └→ nvme_pci_complete_batch(&iob)              pci.c:1257
+                      └→ nvme_complete_batch(iob, nvme_pci_unmap_rq)   nvme.h:732
+                          └→ blk_mq_end_request_batch(iob)      blk-mq.c:1059
+                              └→ blk_complete_request(req)      blk-mq.c:822
+                                  └→ bio_endio(bio)             bio.c:1525   ★
+                                      └ bio->bi_end_io() → 페이지 uptodate 표시
+                                        → folio_wake / wake_up_page → dd 스레드 깨어남
+```
+
+> **★ 함정 2: `nvme_pci_complete_rq` 는 이 경로에서 안 불린다.**
+> `break blk_mq_complete_request` / `break nvme_pci_complete_rq` 를 걸면 안 걸린다.
+> 커널 5.16+ NVMe는 **io_comp_batch**를 써서, CQ를 훑는 동안 완료된 요청을 리스트에
+> 모았다가 `nvme_pci_complete_batch()`로 한 번에 끝낸다
+> (`drivers/nvme/host/pci.c:1211`의 `blk_mq_add_to_batch()`가 성공하면 개별 완료 경로를 건너뛴다).
+> 인터럽트 1회에 CQE가 여러 개면 이 방식이 훨씬 싸다.
+
+---
+
+### 11-A.8 전 구간을 한 장으로
+
+```
+[driver] entry_SYSCALL_64 → do_syscall_64 → ksys_read → vfs_read → blkdev_read_iter
+             → filemap_read → …readahead… → read_pages → blk_finish_plug
+             → blk_mq_flush_plug_list → nvme_queue_rqs
+                 └ nvme_submit_cmds → nvme_write_sq_db → writel(tail=2, 0xfebf1030)
+                                                                       │
+                     ┌─────────────────────────────────────────────────┘
+                     ▼  (게스트 MMIO 쓰기 → QEMU로 트랩)
+[qemu]   memory_region_dispatch_write → nvme_mmio_write(ctrl.c:7711) → nvme_process_db(ctrl.c:7561)
+             → qemu_bh_schedule(sq->bh) → … nvme_process_sq → nvme_io_cmd(ctrl.c:4402)
+             → nvme_read(ctrl.c:3400) → blk_aio_preadv(ctrl.c:1452) ……… (비동기 블록 I/O) ………
+             → nvme_rw_cb(ctrl.c:2170) → nvme_enqueue_req_completion → qemu_bh_schedule(cq->bh)(ctrl.c:1549)
+                                                                       │
+                     ┌─────────────────────────────────────────────────┘
+                     ▼  (QEMU main loop 스레드)
+[qemu]   qemu_main_loop → main_loop_wait → g_main_context_dispatch → aio_ctx_dispatch
+             → aio_dispatch → aio_bh_poll → aio_bh_call
+                 → nvme_post_cqes           : CQE를 CQ6(0x60bc000)에 DMA write
+                 → nvme_irq_assert          : cq->irq_enabled && msix_enabled
+                 → msix_notify(dev, 6)      : 테이블 entry6 = {0xFEE20004, 0x21}
+                 → msi_send_message → pci_msi_trigger
+                 → address_space_stl_le(bus_master_as, 0xFEE20004, 0x21)   ★ 인터럽트 = 4B 쓰기
+                                                                       │
+                     ┌─────────────────────────────────────────────────┘
+                     ▼  (그 주소는 LAPIC MSI 창)
+[qemu]   memory_region_dispatch_write → access_with_adjusted_size
+             → memory_region_write_accessor → apic_mem_write(off=0x20004, val=0x21)
+                 → apic_send_msi : dest=0x20 mode=logical delivery=Fixed vec=33 trig=edge
+                 → apic_deliver_irq(0x20, 1, 0, 33, 0)
+                     → apic_get_delivery_bitmask : LDR 0x20 = CPU5 하나만 매칭
+                     → apic_bus_deliver → apic_set_irq(CPU5, 33)
+                         → IRR[33] = 1 → cpu_interrupt(CPU5, CPU_INTERRUPT_POLL)
+                                                                       │
+                     ┌─────────────────────────────────────────────────┘
+                     ▼  (vCPU5 스레드가 깨어남)
+[qemu]   mttcg_cpu_thread_fn → tcg_cpus_exec → cpu_exec → cpu_exec_loop
+             → x86_cpu_exec_interrupt → cpu_get_pic_interrupt → apic_get_interrupt
+                 → IRR[33]=0, ISR[33]=1, PPR 0x10→0x20, return 33
+             → do_interrupt_x86_hardirq(33) : IDT[33] 읽고 RIP = 0xffffffff81e001f8
+                                                                       │
+                     ┌─────────────────────────────────────────────────┘
+                     ▼  (게스트 커널 코드 실행 재개)
+[driver] irq_entries_start+8 (push $33) → asm_common_interrupt
+             → common_interrupt → __common_interrupt(vector=33)
+                 → vector_irq[33] = irq_desc(irq 30, "nvme0q6")
+             → handle_irq → generic_handle_irq_desc → handle_edge_irq
+                 ├ chip.c:800  irq_ack → apic_ack_edge → ack_APIC_irq()
+                 │             → writel(0, 0xFEE000B0)  ★ EOI → ISR[33]=0, PPR→0x10
+                 └ chip.c:819  handle_irq_event → … → nvme_irq(irq=30)
+                     ├ nvme_poll_cq → nvme_handle_cqe → nvme_try_complete_req
+                     │     → blk_mq_complete_request_remote → blk_mq_add_to_batch
+                     ├ nvme_ring_cq_doorbell → writel(head=2, 0xfebf1034)
+                     └ nvme_pci_complete_batch → blk_mq_end_request_batch
+                           → blk_complete_request → bio_endio → dd 깨어남
+```
+
+### 11-A.9 이 추적에서 새로 확인한 것
+
+| # | 내용 | 근거 |
+|---|------|------|
+| 1 | 단건 read도 **`nvme_queue_rqs`(복수형)** 경로를 탄다. `nvme_queue_rq`에 breakpoint를 걸면 안 걸린다 | §11-A.2 백트레이스 + `pci.c:1849 .queue_rqs` |
+| 2 | 완료는 **io_comp_batch**로 처리된다. `nvme_pci_complete_rq`/`blk_mq_complete_request`는 이 경로에서 호출되지 않는다 | §11-A.7 두 백트레이스 |
+| 3 | MSI affinity 변경은 **즉시 반영되지 않고, 다음 인터럽트의 ack 경로**(`apic_ack_edge → irq_move_irq`)에서 테이블에 기록된다 | §11-A.1b 백트레이스 + `msg={0xfee04004, 0x23}` |
+| 4 | QEMU에서 CQE 기록과 MSI 발사는 **vCPU 스레드가 아니라 main loop의 Bottom Half**에서 일어난다 | §11-A.3 백트레이스 + `ctrl.c:5290` |
+| 5 | `apic_send_msi`/`apic_mem_write`는 tail-call로 접혀 스택에 안 남는다. `break apic_send_msi`는 심볼이 있어도 **한 번도 안 걸린다**(인라인된 사본이 실행됨) | §11-A.4 백트레이스 |
+
+---
+
 ## 12. 대비군 — 같은 시간대의 IOAPIC 경로(ttyS0)
 
 같은 트레이스 구간에 이런 줄이 대량으로 섞여 있었다:
@@ -1713,6 +2374,75 @@ pci_nvme_mmio_start_success
 > `msix_table_mmio_write`에는 트레이스 이벤트가 없다(QEMU 8.2 기준).
 > 테이블에 무엇이 쓰였는지는 §14.1처럼 **사후에 테이블을 읽거나**, 커널 쪽
 > `msi_desc.msg`(§14.2)로 확인하는 편이 확실하다.
+
+### 14.6 레이어별 백트레이스 뜨는 법 (§11-A 재현)
+
+**게스트 커널 쪽** — 게스트 gdbstub에 붙어 함수마다 breakpoint
+
+```bash
+gdb -q linux-6.1.4/vmlinux -ex 'target remote :1234'
+(gdb) break nvme_queue_rqs                 # 제출  ※ nvme_queue_rq(단수)는 안 걸린다
+(gdb) break apic_ack_edge                  # EOI
+(gdb) break blk_mq_complete_request_remote # CQE 처리
+(gdb) break bio_endio                      # 최종 완료
+(gdb) break msi_domain_activate            # 테이블 기록(probe)  ※ unbind/bind로 재현
+(gdb) continue
+   → 게스트에서: taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 skip=6666
+(gdb) bt 25
+```
+
+**QEMU 쪽** — QEMU 프로세스 자체를 gdb로 띄운다
+
+```bash
+# 주의 1: ptrace_scope=1 환경에선 이미 돌고 있는 QEMU에 attach가 막힌다.
+#         gdb --args 로 gdb의 자식으로 띄워야 한다.
+# 주의 2: QEMU가 PIE라 run 전에 건 breakpoint는 주소가 재배치되지 않는다.
+#         반드시 start 로 한 번 멈춘 뒤 break 를 걸 것.
+# 주의 3: 게스트 콘솔을 파일로 빼고(-serial file:), initramfs가 알아서
+#         주기적으로 I/O를 내게 만들면 상호작용 없이 캡처할 수 있다.
+
+cat > qemu_bt.gdb <<'EOF'
+set pagination off
+set confirm off
+start                       ← PIE 재배치 이후로 미룬다
+break msix_notify
+commands
+silent
+printf "\n===BT:msix_notify===\n"
+bt 14
+continue                    ← 자동 재개(멈춰 있지 않게)
+end
+break apic_deliver_irq
+commands
+silent
+printf "\n===BT:apic_deliver_irq===\n"
+bt 20
+continue
+end
+continue
+EOF
+
+gdb -q -iex 'set debuginfod enabled off' -x qemu_bt.gdb \
+    --args qemu-system-x86_64 -accel tcg -smp 8 -m 2048 \
+      -kernel bzImage -initrd irfs-auto.cpio.gz \
+      -append 'console=ttyS0 nokaslr panic=-1' \
+      -drive file=nvme.img,if=none,id=nvm0,format=raw \
+      -device nvme,drive=nvm0,serial=cafebabe \
+      -serial file:console.log -display none -monitor none -no-reboot > gdb-qemu.log 2>&1
+```
+
+**걸리지 않는 breakpoint 목록** (이번에 직접 겪은 것 — 시간 낭비 방지용)
+
+| 걸어도 안 걸리는 것 | 이유 | 대신 걸 것 |
+|---------------------|------|-----------|
+| `nvme_queue_rq` | 단건 I/O도 플러그 배치 경로(`queue_rqs`)를 탄다 | `nvme_queue_rqs` |
+| `blk_mq_complete_request`, `nvme_pci_complete_rq` | io_comp_batch 경로가 이들을 건너뛴다 | `blk_mq_complete_request_remote`, `bio_endio` |
+| `apic_send_msi` (QEMU) | 심볼은 있지만 호출부에 인라인됨. out-of-line 사본은 함수 포인터용 | `apic_deliver_irq` |
+| `__pci_write_msi_msg` 을 걸고 affinity만 변경 | 변경이 **다음 인터럽트의 ack**까지 지연된다 | 변경 후 해당 장치에 I/O를 한 번 내라 |
+
+**QEMU 바이너리에 디버그 심볼이 없을 때**: 이 프로젝트의 QEMU는 `debug=False`로 빌드돼
+DWARF가 없다. `.symtab`+`.eh_frame`은 남아 있어 **함수 이름 단위 백트레이스는 되지만
+인자 값은 못 본다**. 인자까지 보려면 `meson configure -Ddebug=true` 후 재빌드해야 한다.
 
 ### 14.5 LAPIC 레지스터 오프셋 치트시트 (`apic_mem_writel` 해독용)
 
