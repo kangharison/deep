@@ -109,6 +109,7 @@ QEMU 트레이스 줄에는 앞에 `<스레드ID>@<시각>:`이 붙는데, 이�
 | 10분 만에 감 잡기 | 이 길잡이 → §1(한 장 요약) → §11(타임라인) → §16(직답) |
 | 원리를 이해하기 | §2(장치가 수첩을 어디 두나) → §4(커널이 뭘 적나) → §5(장치가 어떻게 쏘나) → §6~§8(APIC·CPU가 어떻게 받나) |
 | **코드 레벨로 끝까지 따라가기** | **§11-A(레이어별 함수 그래프 — 실측 백트레이스 전체)** |
+| **바이트 단위로 확인하기** | **§11-B(원시 덤프 해독 — 커맨드/CQE/IDT/테이블)** |
 | 직접 해보기 | §14(재현 스크립트) |
 | "진짜 그런가?" 검증 | §9(마스킹 실험) → §10(CPU가 직접 쏴보기) |
 
@@ -1801,6 +1802,39 @@ entry->msi_index = 0         → MSI-X 테이블 entry0 (= nvme0q0)
 > `.queue_rqs = nvme_queue_rqs`). 단건 I/O도 플러그를 거치므로 이 경로를 탄다.
 > `nvme_queue_rq`(단수)는 `queue_rqs`가 처리 못한 요청의 fallback 경로다.
 
+**소스: 리눅스 커널** `drivers/nvme/host/pci.c` — 그래프의 마지막 3단계
+
+```c
+static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct request **rqlist)
+{
+	spin_lock(&nvmeq->sq_lock);                    /* 큐당 락 — 큐가 CPU마다 따로라 경합 없음 */
+	while (!rq_list_empty(*rqlist)) {
+		struct request *req = rq_list_pop(rqlist);
+		struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+
+		nvme_sq_copy_cmd(nvmeq, &iod->cmd);    /* ① SQ 링에 64바이트 커맨드 복사 */
+	}
+	nvme_write_sq_db(nvmeq, true);                 /* ② 도어벨 한 번만 (배치의 이득) */
+	spin_unlock(&nvmeq->sq_lock);
+}
+
+static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+{
+	if (!write_sq) { ... }                         /* 배치 중간이면 도어벨 생략 */
+
+	if (nvme_dbbuf_update_and_check_event(nvmeq->sq_tail,
+			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei))
+		writel(nvmeq->sq_tail, nvmeq->q_db);   /* ★ MMIO — 여기서 장치가 깨어난다 */
+	nvmeq->last_sq_tail = nvmeq->sq_tail;
+}
+```
+
+**★ `nvme_submit_cmds`가 커맨드를 여러 개 복사한 뒤 도어벨은 한 번만 친다.**
+그래서 인터럽트도 1회로 묶인다 — §11-A.7의 io_comp_batch와 짝을 이루는 설계다.
+이번 실험은 4KB 단건이라 커맨드 1개 + 도어벨 1회 + 인터럽트 1회였다.
+
+**실제로 SQ에 복사된 64바이트**는 §11-B.2에 바이트 단위로 실었다.
+
 이 시점의 실측 값 (gdb):
 
 ```
@@ -1851,6 +1885,82 @@ nvmeq->sq_dma_addr= 0x4fb0000            ← 장치가 DMA로 읽어갈 SQ 물�
                                   └→ nvme_irq_assert(n, cq) ⟨inlined⟩  hw/nvme/ctrl.c:662
                                       └→ msix_notify(pci, vector=6)    hw/pci/msix.c:525   ★
 ```
+
+**소스: QEMU** `hw/nvme/ctrl.c:7561` — 게스트의 도어벨 MMIO를 받는 곳
+
+```c
+static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
+{
+    uint32_t qid;
+
+    if (unlikely(addr & ((1 << 2) - 1))) { ... return; }   /* 4바이트 정렬 강제 */
+
+    if (((addr - 0x1000) >> 2) & 1) {
+        /* Completion queue doorbell write */
+        qid = (addr - (0x1000 + (1 << 2))) >> 3;           /* CQ 도어벨: 홀수 슬롯 */
+        ...
+    } else {
+        /* Submission queue doorbell write */
+        uint16_t new_tail = val & 0xffff;
+        qid = (addr - 0x1000) >> 3;                        /* SQ 도어벨: 짝수 슬롯 */
+        ...
+        trace_pci_nvme_mmio_doorbell_sq(sq->sqid, new_tail);
+        sq->tail = new_tail;
+        ...
+        qemu_bh_schedule(sq->bh);        /* 커맨드 처리도 BH로 넘긴다 (VM exit을 짧게) */
+    }
+}
+```
+
+**주소 → 큐 번호 계산을 실측값으로 검증**
+
+```
+ 커널이 writel(1, 0xffffc900002e3030)  → 물리 0xfebf1030 → BAR0 오프셋 0x1030
+   ((0x1030 - 0x1000) >> 2) & 1 = (0x30>>2)&1 = 12 & 1 = 0   → SQ 도어벨
+   qid = (0x1030 - 0x1000) >> 3 = 0x30 >> 3 = 6              → 큐 6      ✓
+ CQ 도어벨이라면 0x1034:
+   ((0x1034 - 0x1000) >> 2) & 1 = 13 & 1 = 1                 → CQ 도어벨
+   qid = (0x1034 - 0x1004) >> 3 = 0x30 >> 3 = 6              → 큐 6      ✓
+```
+
+트레이스가 이 계산 결과를 그대로 찍는다:
+`[qemu] pci_nvme_mmio_doorbell_sq sqid 6 new_tail 1`
+
+**소스: QEMU** `hw/nvme/ctrl.c:1531` / `:1485` — 완료를 예약하고, BH에서 CQE를 쓴다
+
+```c
+static void nvme_enqueue_req_completion(NvmeCQueue *cq, NvmeRequest *req)
+{
+    trace_pci_nvme_enqueue_req_completion(nvme_cid(req), cq->cqid, ...);
+    QTAILQ_REMOVE(&req->sq->out_req_list, req, entry);
+    QTAILQ_INSERT_TAIL(&cq->req_list, req, entry);
+    qemu_bh_schedule(cq->bh);            /* ★ 여기서 끝. 인터럽트는 아직 안 쏜다 */
+}
+
+static void nvme_post_cqes(void *opaque)     /* ← cq->bh 의 콜백 (main loop에서 실행) */
+{
+    NvmeCQueue *cq = opaque;
+    ...
+    QTAILQ_FOREACH_SAFE(req, &cq->req_list, entry, next) {
+        ...
+        req->cqe.status  = cpu_to_le16((req->status << 1) | cq->phase);  /* ★ bit0 = phase */
+        req->cqe.sq_id   = cpu_to_le16(sq->sqid);
+        req->cqe.sq_head = cpu_to_le16(sq->head);
+        addr = cq->dma_addr + (cq->tail << NVME_CQES);   /* NVME_CQES=4 → 16바이트 간격 */
+        ret = pci_dma_write(PCI_DEVICE(n), addr, (void *)&req->cqe, sizeof(req->cqe));
+                                          /* ★ 호스트 메모리에 CQE를 DMA로 기록 */
+        ...
+        nvme_inc_cq_tail(cq);
+    }
+    if (cq->tail != cq->head) {
+        ...
+        nvme_irq_assert(n, cq);           /* ★ 여기서 비로소 MSI 발사 */
+    }
+}
+```
+
+`req->cqe.status = (req->status << 1) | cq->phase` 이 한 줄이
+§11-B.3에서 볼 **CQE의 마지막 2바이트 `01 00`**(= status 0, phase 1)을 만든다.
 
 > **왜 vCPU 스레드가 아니라 main loop인가**: NVMe 장치는 커맨드를 받으면 블록 백엔드에
 > 비동기 I/O를 걸고 즉시 리턴한다. I/O가 끝나면 `nvme_enqueue_req_completion()`이
@@ -2198,6 +2308,356 @@ nvmeq->sq_dma_addr= 0x4fb0000            ← 장치가 DMA로 읽어갈 SQ 물�
 
 ---
 
+## 11-B. 원시 데이터 덤프와 바이트 단위 해독
+
+§11-A가 "어떤 함수를 거치는가"였다면, 이 절은 **"그 함수들이 실제로 어떤 바이트를 만들고
+읽는가"** 다. 아래 덤프는 전부 **같은 한 번의 부팅(4회차)에서 같은 I/O 하나에 대해**
+연속으로 뜬 것이다.
+
+**이 절이 추적하는 요청 한 건**
+
+```
+ 게스트 명령:  echo 3 > /proc/sys/vm/drop_caches
+               taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 skip=9999
+ 파일 오프셋:  9999 × 4096 = 40,955,904 바이트
+ 블록 크기:    /sys/block/nvme0n1/queue/logical_block_size = 512   → LBA 79992 = 0x13878
+ 디스크 크기:  /sys/block/nvme0n1/size = 131072 섹터 = 64 MiB
+```
+
+이 요청이 각 계층에서 어떤 값으로 나타나는지 §11-B.7에 한 표로 모았다.
+
+---
+
+### 11-B.1 MSI-X 테이블 엔트리 — 접근 폭까지 확인
+
+**`[device]`** 게스트에서 `devmem` 으로 BAR0+0x2060 (= entry6) 읽기
+
+```
+[32비트 접근]
+  +0x00 = 0xFEE20004      Message Address Low
+  +0x04 = 0x00000000      Message Address High
+  +0x08 = 0x00000021      Message Data
+  +0x0c = 0x00000000      Vector Control (bit0 = Mask)
+
+[8비트 접근 — 같은 주소]
+  +0x00 = 0x00 / +0x01 = 0x00      ← 0이 나온다(!)
+
+[16비트 접근]
+  +0x00 = 0x0000                   ← 역시 0
+```
+
+**바이트/워드 접근이 0을 반환하는 이유** — QEMU가 MSI-X 테이블 MemoryRegion에
+DWORD 접근만 허용하도록 선언해 두었기 때문이다.
+
+**소스: QEMU** `hw/pci/msix.c:234`
+
+```c
+static const MemoryRegionOps msix_table_mmio_ops = {
+    .read = msix_table_mmio_read,
+    .write = msix_table_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,      /* ★ 4바이트 미만 접근은 유효하지 않다 */
+        .max_access_size = 8,
+    },
+    .impl = {
+        .max_access_size = 4,      /* 8바이트 접근은 4바이트 2번으로 쪼개 처리 */
+    },
+};
+```
+
+이는 PCI 스펙(MSI-X 테이블은 DWORD 단위로 접근)을 그대로 강제한 것이다.
+**실물 하드웨어에서도 바이트 단위로 읽으면 안 된다.** 커널의
+`__pci_write_msi_msg()`가 `writel()`(4바이트)만 쓰는 이유이기도 하다.
+
+**비트 해독** (§4.2의 필드 정의 적용)
+
+```
+ address_lo = 0xFEE2_0004
+ ┌────────────┬─────────┬────────┬───┬───┬───┬─────┐
+ │ 31..20     │ 19..12  │ 11..5  │ 4 │ 3 │ 2 │1..0 │
+ │ 0xFEE      │ 0x20    │ 0      │ 0 │ 0 │ 1 │ 00  │
+ └────────────┴─────────┴────────┴───┴───┴───┴─────┘
+   base_addr    destid    virt_    rsv RH  DM   rsv
+   (MSI 창)     = CPU5의  destid       =0  =1(logical)
+                LDR 0x20
+
+ data = 0x0000_0021
+ ┌───────┬───────┬─────┬────┬────┬────────┐
+ │ 15    │ 14    │13:12│ 11 │10:8│ 7:0    │
+ │ 0     │ 0     │ 0   │ 0  │000 │ 0x21   │
+ └───────┴───────┴─────┴────┴────┴────────┘
+  is_level active_low     DM  Fixed  vector=33
+
+ vector_ctrl = 0x0000_0000   bit0(Mask) = 0 → 마스크 해제 상태
+```
+
+---
+
+### 11-B.2 제출된 NVMe 커맨드 64바이트 — 전 필드 해독
+
+**`[driver]`** 게스트 gdb — `nvme_irq` 정지 상태에서 `x/64xb $q->sq_cmds`
+(SQ 링의 0번 엔트리 = 방금 제출한 커맨드)
+
+```
+0xffff888004ff0000:  02 00 80 01  01 00 00 00   ← sq_cmds 는 sq_dma_addr(0x4ff0000)의 직접매핑
+0xffff888004ff0008:  00 00 00 00  00 00 00 00
+0xffff888004ff0010:  00 00 00 00  00 00 00 00
+0xffff888004ff0018:  00 10 df 04  00 00 00 00
+0xffff888004ff0020:  00 00 00 00  00 00 00 00
+0xffff888004ff0028:  78 38 01 00  00 00 00 00
+0xffff888004ff0030:  07 00 00 80  07 00 00 00
+0xffff888004ff0038:  00 00 00 00  00 00 00 00
+```
+
+**필드별 해독** (NVMe 1.4 §6.9 Read command, 모든 값 little-endian)
+
+| 오프셋 | 원시 바이트 | 값 | 필드 | 의미 |
+|--------|-------------|-----|------|------|
+| `0x00` | `02` | `0x02` | **Opcode** | **Read** (NVM Command Set) |
+| `0x01` | `00` | `0x00` | FUSE / PSDT | FUSE=0(일반), **PSDT=0 → PRP 사용**(SGL 아님) |
+| `0x02` | `80 01` | `0x0180` = **384** | **Command Identifier (CID)** | 이 커맨드의 식별자 ★ |
+| `0x04` | `01 00 00 00` | `1` | **NSID** | 네임스페이스 1 |
+| `0x08` | `00 × 8` | 0 | CDW2-3 | 예약 |
+| `0x10` | `00 × 8` | 0 | **MPTR** | 메타데이터 없음 |
+| `0x18` | `00 10 df 04 …` | `0x04df1000` | **PRP1** | **데이터 버퍼의 물리주소** — 장치가 여기로 4KB를 DMA write |
+| `0x20` | `00 × 8` | 0 | **PRP2** | 4KB 한 페이지라 두 번째 PRP 불필요 |
+| `0x28` | `78 38 01 00 …` | `0x13878` = **79992** | **SLBA** | 시작 LBA ★ |
+| `0x30` | `07 00 00 80` | `0x80000007` | **CDW12** | NLB(15:0)=`7` → **8블록**(0-based), bit31 **LR**=1 |
+| `0x34` | `07 00 00 00` | `0x00000007` | **CDW13 (DSM)** | Access Frequency = 7 = **Prefetch** |
+| `0x38` | `00 × 8` | 0 | CDW14-15 | ELBST/ELBAT 미사용 |
+
+**검산 — 유저 명령과 정확히 맞는다**
+
+```
+ SLBA × 논리블록크기 = 79992 × 512 = 40,955,904 바이트
+ dd skip × bs        =  9999 × 4096 = 40,955,904 바이트   ✓ 일치
+ (NLB+1) × 512       =    8  × 512  = 4096 바이트         ✓ dd bs=4096 과 일치
+```
+
+**LR과 DSM=Prefetch는 어디서 왔나** — §11-A.2 백트레이스가 `page_cache_sync_readahead`를
+지나온 것을 기억하자. 커널이 readahead 요청에 `REQ_RAHEAD`를 달고, NVMe 드라이버가
+그것을 커맨드 필드로 번역한다.
+
+**소스: 리눅스 커널** `drivers/nvme/host/core.c:877` `nvme_setup_rw()`
+
+```c
+	if (req->cmd_flags & REQ_RAHEAD)
+		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;   /* = 7  → CDW13 = 0x07 */
+	...
+	if (req->cmd_flags & (REQ_FAILFAST_DEV | REQ_RAHEAD))
+		control |= NVME_RW_LR;                 /* = 1<<15 → CDW12 bit31 */
+```
+
+즉 **바이트 `07 00 00 80 / 07 00 00 00` 하나만 보고도 "이 요청은 readahead였다"를 알 수 있다.**
+백트레이스(§11-A.2)와 원시 바이트가 서로를 검증한다.
+
+---
+
+### 11-B.3 CQE 16바이트 — 전 필드 해독
+
+**`[driver]`** 게스트 gdb — `x/16xb $q->cqes` (CQ 링의 0번 엔트리)
+
+```
+0xffff888005c34000:  00 00 00 00  00 00 00 00
+0xffff888005c34008:  01 00 06 00  80 01 01 00
+```
+
+| 오프셋 | 원시 바이트 | 값 | 필드 | 의미 |
+|--------|-------------|-----|------|------|
+| `0x00` | `00 00 00 00` | 0 | **DW0 (Result)** | 커맨드별 결과 — Read는 사용 안 함 |
+| `0x04` | `00 00 00 00` | 0 | DW1 | 예약 |
+| `0x08` | `01 00` | `1` | **SQ Head Pointer** | 장치가 SQ를 어디까지 소비했는지 |
+| `0x0a` | `06 00` | `6` | **SQ Identifier** | **큐 6에서 나온 완료** ★ |
+| `0x0c` | `80 01` | `0x0180` = **384** | **Command Identifier** | **§11-B.2의 CID와 동일** ★★ |
+| `0x0e` | `01 00` | `0x0001` | **Status Field** | bit0 **P(Phase)=1**, bits15:1 = 0 → **SC=0, SCT=0 = 성공** |
+
+**CID 384가 세 곳에서 동시에 관측된다** — 이것이 "같은 요청"임을 증명한다:
+
+```
+ [driver] SQ 커맨드 바이트 0x02: 80 01              → CID 0x0180 = 384
+ [qemu]   pci_nvme_enqueue_req_completion cid 384   → 장치가 본 CID
+ [driver] CQE 바이트 0x0c:      80 01              → 완료에 실려 돌아온 CID
+```
+
+**Status의 bit0이 phase인 이유** — §11-A.3에 인용한 QEMU 코드
+`req->cqe.status = cpu_to_le16((req->status << 1) | cq->phase);` 가 상태를 1비트 왼쪽으로
+밀고 그 자리에 phase를 넣는다. 커널은 반대로 되돌린다:
+
+**소스: 리눅스 커널** `drivers/nvme/host/pci.c` (`nvme_cqe_pending`) / `nvme.h:701` (`nvme_try_complete_req`)
+
+```c
+static inline bool nvme_cqe_pending(struct nvme_queue *nvmeq)
+{
+	struct nvme_completion *hcqe = &nvmeq->cqes[nvmeq->cq_head];
+
+	return (le16_to_cpu(READ_ONCE(hcqe->status)) & 1) == nvmeq->cq_phase;
+	/*      ↑ bit0만 뽑아 cq_phase(=1)와 비교 → 같으면 "새 CQE" */
+}
+
+static inline bool nvme_try_complete_req(struct request *req, __le16 status, ...)
+{
+	rq->status = le16_to_cpu(status) >> 1;   /* ★ phase 비트를 밀어내고 진짜 상태만 */
+	...
+}
+```
+
+실측 `status = 0x0001` → `& 1 = 1 = cq_phase` → 새 CQE, `>> 1 = 0` → 성공.
+**bit 하나로 "이 슬롯이 갱신됐는지"를 판별하기 때문에 링버퍼에 별도 유효 플래그가 필요 없다.**
+
+---
+
+### 11-B.4 IDT 게이트 16바이트 — 벡터 33이 가리키는 곳
+
+**`[driver]`** 게스트 gdb — `x/16xb &idt_table[33]`
+
+```
+0xffffffff8375e210 <idt_table+528>:  f8 01  10 00  00 8e  e0 81
+0xffffffff8375e218 <idt_table+536>:  ff ff ff ff  00 00 00 00
+```
+
+> `idt_table + 528` : 한 게이트가 16바이트이므로 `33 × 16 = 528` ✓
+
+| 오프셋 | 바이트 | 값 | 필드 | 의미 |
+|--------|--------|-----|------|------|
+| `0x0` | `f8 01` | `0x01f8` | offset_low | 핸들러 주소 bits[15:0] |
+| `0x2` | `10 00` | `0x0010` | segment | **`__KERNEL_CS`** |
+| `0x4` | `00 8e` | `0x8e00` | bits | 아래 표 참조 |
+| `0x6` | `e0 81` | `0x81e0` | offset_middle | 주소 bits[31:16] |
+| `0x8` | `ff ff ff ff` | `0xffffffff` | offset_high | 주소 bits[63:32] |
+| `0xc` | `00 00 00 00` | 0 | reserved | |
+
+`bits = 0x8e00` 을 `struct idt_bits`(ist:3, zero:5, type:5, dpl:2, p:1)로 쪼개면:
+
+```
+ 0x8e00 = 1000 1110 0000 0000
+          │    │└┴┴┴───────── zero  (bits 7:3)  = 0
+          │    └───────────── ist   (bits 2:0)  = 0   → 별도 IST 스택 안 씀(일반 커널 스택)
+          │  ┌┴┴┴┴──────────  type  (bits 12:8) = 0xE → 64-bit Interrupt Gate
+          │  │                                          (Trap Gate 0xF와 달리 진입 시 IF=0)
+          │  └─ dpl  (bits 14:13) = 0 → 유저가 int $0x21 로 못 부른다
+          └──── p    (bit 15)     = 1 → present
+```
+
+**핸들러 주소 조립**: `0xffffffff` `81e0` `01f8` → **`0xffffffff81e001f8`**
+
+---
+
+### 11-B.5 인터럽트 진입 스텁 디스어셈블리 — 벡터 번호가 스택에 실리는 순간
+
+**`[driver]`** 게스트 gdb — `x/6i 0xffffffff81e001f0`
+
+```asm
+   0xffffffff81e001f0 <irq_entries_start+0>:   push   $0x20        ← 벡터 32
+   0xffffffff81e001f2 <irq_entries_start+2>:   jmp    0xffffffff81e00c40 <asm_common_interrupt>
+   0xffffffff81e001f7 <irq_entries_start+7>:   int3                ← 8바이트 맞추는 패딩
+   0xffffffff81e001f8 <irq_entries_start+8>:   push   $0x21        ← ★ 벡터 33 = IDT[33]이 가리키는 곳
+   0xffffffff81e001fa <irq_entries_start+10>:  jmp    0xffffffff81e00c40 <asm_common_interrupt>
+   0xffffffff81e001ff <irq_entries_start+15>:  int3
+   0xffffffff81e00200 <irq_entries_start+16>:  push   $0x22        ← 벡터 34
+   0xffffffff81e00208 <irq_entries_start+24>:  push   $0x23        ← 벡터 35
+```
+
+**소스: 리눅스 커널** `arch/x86/include/asm/idtentry.h:498`
+
+```asm
+	.align IDT_ALIGN
+SYM_CODE_START(irq_entries_start)
+    vector=FIRST_EXTERNAL_VECTOR              /* 0x20 = 32 */
+    .rept NR_EXTERNAL_VECTORS
+	UNWIND_HINT_IRET_REGS
+0 :
+	ENDBR                                 /* IBT 미사용 빌드에선 nop 으로 채워짐 */
+	.byte	0x6a, vector                  /* = push $vector (imm8, 부호확장 push) */
+	jmp	asm_common_interrupt
+	/* Ensure that the above is IDT_ALIGN bytes max */
+	.fill 0b + IDT_ALIGN - ., 1, 0xcc     /* ★ 0xcc = int3 로 패딩 → 위 디스어셈블의 int3 */
+	vector = vector+1
+    .endr
+SYM_CODE_END(irq_entries_start)
+```
+
+디스어셈블과 소스가 정확히 맞는다: **스텁 하나 = 8바이트**(`IDT_ALIGN`),
+`push`(2B) + `jmp rel32`(5B) + `int3`(1B). 그래서 **벡터 33의 스텁 = `irq_entries_start + (33-32)×8` = `+8`**.
+
+> `.byte 0x6a, vector` 로 직접 기계어를 박은 이유는 소스 주석에 있다 —
+> 어셈블러가 `push $vector`를 imm32로 인코딩해버리면 스텁이 8바이트를 넘기 때문이다.
+
+---
+
+### 11-B.6 `asm_common_interrupt` 디스어셈블리 — `orig_ax = -1` 의 정체
+
+**`[driver]`** 게스트 gdb — `x/9i 0xffffffff81e00c40`
+
+```asm
+   <asm_common_interrupt+0>:   nopl   (%rax)                      ← ENDBR 자리
+   <asm_common_interrupt+3>:   cld
+   <asm_common_interrupt+4>:   call   0xffffffff81e011c0 <error_entry>
+                                          ← 유저모드였다면 swapgs + 커널스택 전환
+   <asm_common_interrupt+9>:   mov    %rax,%rsp
+   <asm_common_interrupt+12>:  mov    %rsp,%rdi                   ← 1번째 인자 = struct pt_regs *
+   <asm_common_interrupt+15>:  mov    0x78(%rsp),%rsi             ← 2번째 인자 = orig_ax(=스텁이 push한 0x21)
+   <asm_common_interrupt+20>:  movq   $0xffffffffffffffff,0x78(%rsp)
+                                          ← ★ orig_ax 자리를 -1로 덮는다
+   <asm_common_interrupt+29>:  call   0xffffffff81da1350 <common_interrupt>
+   <asm_common_interrupt+34>:  jmp    0xffffffff81e012e0 <error_return>
+```
+
+`0x78` = 120 = `offsetof(struct pt_regs, orig_ax)` (그 앞에 8바이트 레지스터 15개).
+
+이 3줄이 §7.3에서 본 두 가지를 동시에 설명한다:
+
+```
+ [driver] gdb에서 본 pt_regs (§7.3)
+   orig_ax = 0xffffffffffffffff     ← +20 줄이 덮어쓴 -1 (syscall 아님 표시)
+ [driver] gdb에서 본 백트레이스 (§11-A.6)
+   #4 __common_interrupt (regs=..., vector=33)   ← +15 줄이 %rsi에 실은 0x21
+```
+
+**즉 벡터 번호는 "스텁이 스택에 push → asm이 %rsi로 옮김 → C 함수의 두 번째 인자"**
+경로로 전달되고, 스택의 원본 자리는 곧바로 -1로 지워진다.
+`u32 vector = (u32)(u8)error_code;` (`DEFINE_IDTENTRY_IRQ` 매크로)가 부호확장된 상위
+비트를 잘라내 33을 복원한다.
+
+---
+
+### 11-B.7 요청 하나가 각 계층에서 보이는 값 — 전 구간 대조표
+
+| # | 계층 | 관측 값 | 출처 |
+|---|------|---------|------|
+| 1 | 유저 | `dd bs=4096 count=1 skip=9999` → 오프셋 40,955,904 | 명령어 |
+| 2 | 블록/mm | `page_cache_sync_readahead(index=9999, req_count=1)` | `[driver]` §11-A.2 백트레이스 |
+| 3 | NVMe 커맨드 | opcode `0x02`(Read), **CID `0x0180`=384**, NSID 1, PRP1 `0x04df1000`, SLBA `0x13878`(79992), NLB 7(=8블록), LR=1, DSM=Prefetch | `[driver]` §11-B.2 64B 덤프 |
+| 4 | SQ 위치 | `sq_dma_addr = 0x4ff0000`, 커널 VA `0xffff888004ff0000` | `[driver]` gdb |
+| 5 | 도어벨 | `writel(1, 0xffffc900002e3030)` → 물리 `0xfebf1030` (BAR0+0x1030) | `[driver]` gdb `q_db` |
+| 6 | 장치 수신 | `pci_nvme_mmio_doorbell_sq sqid 6 new_tail 1` | `[qemu]` 트레이스 |
+| 7 | 장치 완료 | `pci_nvme_enqueue_req_completion cid 384 cqid 6 status 0x0` | `[qemu]` 트레이스 |
+| 8 | CQ 위치 | `cq_dma_addr = 0x5c34000`, 커널 VA `0xffff888005c34000` | `[driver]` gdb |
+| 9 | CQE | `SQHD=1, SQID=6, CID=0x0180, Status=0x0001`(phase=1, SC=0) | `[driver]` §11-B.3 16B 덤프 |
+| 10 | MSI 발사 | `pci_nvme_irq_msix raising MSI-X IRQ vector 6` | `[qemu]` 트레이스 |
+| 11 | 테이블 값 | entry6 = `{addr 0xFEE20004, data 0x00000021, vctrl 0}` | `[device]` §11-B.1 |
+| 12 | 버스 트랜잭션 | `address_space_stl_le(bus_master_as, 0xFEE20004, 0x21)` = 4바이트 MemWr | `[qemu]` §11-A.4 백트레이스 |
+| 13 | LAPIC 해석 | `apic_deliver_irq dest 32(0x20) dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0` | `[qemu]` 트레이스 |
+| 14 | 목적지 결정 | CPU5의 `LDR 0x20` 과 매칭 | `[qemu]` `info lapic 5` |
+| 15 | CPU 수락 | `IRR[33]→ISR[33]`, `PPR 0x10→0x20` | `[qemu]` `info lapic 5` (gdb 정지 중) |
+| 16 | IDT | `idt_table[33]` = `f8 01 10 00 00 8e e0 81 ff ff ff ff` → `0xffffffff81e001f8` | `[driver]` §11-B.4 |
+| 17 | 진입 스텁 | `irq_entries_start+8: push $0x21; jmp asm_common_interrupt` | `[driver]` §11-B.5 |
+| 18 | 벡터→IRQ | `this_cpu(vector_irq)[33]` = `irq_desc(irq 30, "nvme0q6")` | `[driver]` drgn |
+| 19 | EOI | `writel(0, 0xFEE000B0)` → `apic_mem_writel 0xb0 = 0x00000000` | `[qemu]` 트레이스 |
+| 20 | 핸들러 | `nvme_irq(irq=30, data=nvmeq)`, `qid=6, cq_vector=6` | `[driver]` gdb |
+| 21 | CQ 도어벨 | `pci_nvme_mmio_doorbell_cq cqid 6 new_head 1` | `[qemu]` 트레이스 |
+| 22 | 완료 | `bio_endio(bio=…)` → dd 반환 | `[driver]` §11-A.7 백트레이스 |
+
+**세 개의 숫자가 전 구간을 꿰뚫는다**
+
+```
+ CID 384(0x0180)  : ③ SQ 커맨드 → ⑦ QEMU 트레이스 → ⑨ CQE      (요청 식별자)
+ 큐 번호 6        : ⑥ 도어벨 sqid → ⑨ CQE SQID → ⑩ MSI-X 인덱스 → ⑳ nvmeq->qid
+ 벡터 33 / CPU5   : ⑪ 테이블 data 0x21 → ⑬ LAPIC vector 33 → ⑯⑰ IDT[33] → ⑱ irq 30
+```
+
+---
+
 ## 12. 대비군 — 같은 시간대의 IOAPIC 경로(ttyS0)
 
 같은 트레이스 구간에 이런 줄이 대량으로 섞여 있었다:
@@ -2444,6 +2904,62 @@ gdb -q -iex 'set debuginfod enabled off' -x qemu_bt.gdb \
 DWARF가 없다. `.symtab`+`.eh_frame`은 남아 있어 **함수 이름 단위 백트레이스는 되지만
 인자 값은 못 본다**. 인자까지 보려면 `meson configure -Ddebug=true` 후 재빌드해야 한다.
 
+### 14.7 원시 덤프 뜨는 법 (§11-B 재현)
+
+**장치 쪽 (게스트 셸만으로)**
+
+```sh
+# MSI-X 테이블 entry N — 반드시 32비트로 읽을 것 (8/16비트는 0이 나온다)
+for o in 0 4 8 12; do printf "+0x%02x = %s\n" $o "$(devmem $((0xfebf2000 + N*16 + o)) 32)"; done
+# PBA
+devmem 0xfebf3000 32
+# 논리 블록 크기 / 디스크 크기 (SLBA 검산용)
+cat /sys/block/nvme0n1/queue/logical_block_size    # 512
+cat /sys/block/nvme0n1/size                        # 131072 (섹터)
+```
+
+**커널 메모리 쪽 (게스트 gdb)**
+
+```
+(gdb) break nvme_irq
+(gdb) continue
+    → 게스트에서: echo 3 > /proc/sys/vm/drop_caches
+                   taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 skip=9999
+
+(gdb) set $q = (struct nvme_queue *)data
+(gdb) printf "qid=%d cq_vector=%d sq_tail=%d cq_head=%d cq_phase=%d\n", \
+         $q->qid, $q->cq_vector, $q->sq_tail, $q->cq_head, $q->cq_phase
+(gdb) printf "sq_dma=0x%llx cq_dma=0x%llx q_db=%p\n", \
+         $q->sq_dma_addr, $q->cq_dma_addr, $q->q_db
+(gdb) x/64xb $q->sq_cmds       # 제출한 NVMe 커맨드 64바이트 (§11-B.2)
+(gdb) x/16xb $q->cqes          # CQE 16바이트                (§11-B.3)
+```
+
+**IDT / 진입 코드 (게스트 gdb, I/O 없이도 가능)**
+
+```
+(gdb) x/16xb &idt_table[33]                    # 게이트 원시 16바이트  (§11-B.4)
+(gdb) p/x idt_table[33]                        # 필드로 쪼개서 보기
+(gdb) x/6i  0xffffffff81e001f0                 # 진입 스텁 3개          (§11-B.5)
+(gdb) x/9i  0xffffffff81e00c40                 # asm_common_interrupt   (§11-B.6)
+```
+
+> 주소는 `nokaslr`로 부팅했기에 빌드마다 고정이다. KASLR을 켰다면
+> `p &idt_table`, `p irq_entries_start`, `p asm_common_interrupt` 로 먼저 실제 주소를 얻어야 한다.
+
+**검산에 쓸 관계식**
+
+```
+ SLBA × logical_block_size == (dd skip) × (dd bs)
+ (NLB + 1) × logical_block_size == (dd bs)
+ SQ 도어벨 오프셋 = 0x1000 + 2*qid*(4 << CAP.DSTRD)     ← 이 장치는 DSTRD=0 → 0x1000 + 8*qid
+ CQ 도어벨 오프셋 = SQ 도어벨 + (4 << CAP.DSTRD)
+ IDT 게이트 주소  = &idt_table + vector*16
+ 진입 스텁 주소   = irq_entries_start + (vector - 0x20)*8
+ MSI-X 엔트리 주소 = BAR0 + MSIX_Table_Offset + index*16
+ PBA 비트         = PBA[index/8] 의 bit (index%8)
+```
+
 ### 14.5 LAPIC 레지스터 오프셋 치트시트 (`apic_mem_writel` 해독용)
 
 | 오프셋 | 레지스터 | 이번 트레이스에서 본 값 |
@@ -2518,7 +3034,9 @@ x86 시스템 벡터 (`arch/x86/include/asm/irq_vectors.h`):
    → `handle_edge_irq()`에서 **먼저 EOI**(LAPIC 0xB0)를 쳐 ISR을 비우고,
    그 다음 `nvme_irq()`를 호출해 CQ를 훑고 CQ 도어벨을 울린다.
 
-이 6단계의 모든 숫자가 §1 표와 §11 타임라인에 실측값으로 정리돼 있다.
+이 6단계의 모든 숫자가 §1 표와 §11 타임라인에 실측값으로 정리돼 있고,
+**함수 단위 콜체인은 §11-A(실측 백트레이스), 바이트 단위 원시 데이터는 §11-B**에 있다.
+특히 §11-B.7은 요청 하나가 22개 관측 지점에서 각각 어떤 값으로 보이는지를 한 표로 모은 것이다.
 
 ---
 
