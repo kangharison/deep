@@ -6,6 +6,9 @@
 > 대상 코드: `qemu-8.2.2/hw/nvme/ctrl.c`, `hw/pci/msix.c`, `hw/pci/msi.c`, `hw/intc/apic.c`,
 > `linux-6.1.4/drivers/nvme/host/pci.c`, `drivers/pci/msi/msi.c`, `arch/x86/kernel/apic/*`, `kernel/irq/chip.c`
 
+> **처음 읽는다면 바로 아래 「먼저 읽기 — 초심자용 길잡이」부터 보세요.**
+> 거기에 비유·용어집과, 이 문서에서 쓰는 **로그 출처 태그(`[driver]` / `[device]` / `[qemu]`)** 규칙이 있습니다.
+
 이 문서는 "SSD가 인터럽트를 쏜다"는 한 줄을, **실제로 관측한 주소·데이터·비트 값**으로 끝까지 분해한다.
 모든 숫자는 추론이 아니라 이 실험에서 찍은 값이며, 같은 값을 서로 다른 3~4개 관측점(장치 레지스터 /
 커널 자료구조 / QEMU 트레이스 / LAPIC 상태)에서 교차 검증했다.
@@ -17,9 +20,104 @@ CPU5가 IDT 33번(`irq_entries_start+8`)으로 점프해 `nvme_irq()`를 실행�
 
 ---
 
+## 먼저 읽기 — 초심자용 길잡이 (5분)
+
+### 이 문서가 답하는 질문
+
+"SSD가 인터럽트를 건다"는 문장은 실제로는 무슨 일인가?
+
+결론부터 말하면 — **SSD는 "인터럽트 신호"라는 특별한 걸 보내지 않는다.
+호스트가 미리 알려준 주소에 4바이트를 쓸 뿐이다.** 그 주소가 하필
+CPU 안의 인터럽트 접수 창구(Local APIC)가 차지하고 있는 주소라서,
+그 평범한 메모리 쓰기가 인터럽트가 된다.
+
+### 비유로 먼저
+
+```
+ ① 드라이버(리눅스 커널)
+      "나한테 연락할 땐 이 번호로 걸어 — 5번 창구, 용건번호 33번"
+      ← 이 메모를 SSD 안에 있는 수첩(MSI-X 테이블)에 적어 둔다
+ ② SSD(장치)
+      일이 끝나면 수첩을 펴서, 적힌 번호 그대로 전화를 건다
+      (= 적힌 주소에 적힌 값을 쓴다. 해석은 안 한다. 그냥 받아 적은 대로)
+ ③ Local APIC(CPU마다 하나씩 있는 교환대)
+      전화를 받아 "5번 창구 손님, 용건 33번" 이라고 CPU5를 부른다
+ ④ CPU5
+      하던 일(idle)을 멈추고, 용건번호 33번 담당자(IDT[33])에게 넘긴다
+ ⑤ 커널
+      33번 → nvme0q6 → nvme_irq() 실행 → CQ를 훑어 완료 처리
+```
+
+핵심은 **수첩에 적는 사람(드라이버)과 수첩을 읽어 거는 사람(SSD)이 다르다**는 것이다.
+그래서 이 문서는 계속 "커널이 적으려던 값"과 "장치에 실제로 적힌 값"을 나란히 놓고 비교한다.
+
+### ★ 로그 출처 표기 규칙 (중요)
+
+이 문서에는 **서로 다른 세 군데**에서 뜬 값이 섞여 있다. 헷갈리지 않도록
+데이터 블록마다 아래 태그를 붙였다.
+
+| 태그 | 누구의 값인가 | 어떻게 얻었나 | 실물 하드웨어에서도 볼 수 있나 |
+|------|--------------|--------------|------------------------------|
+| **`[driver]`** | **리눅스 커널이 자기 메모리에 들고 있는 장부** | drgn, 게스트 gdb, `/proc/interrupts` | ✅ drgn/crash로 가능 |
+| **`[device]`** | **장치(SSD) 안에 실제로 적혀 있는 값** | 게스트에서 `devmem`/sysfs `config`로 PCI config space·BAR를 읽음 | ✅ 진짜 SSD도 똑같이 읽힌다 |
+| **`[qemu]`** | **에뮬레이터만 볼 수 있는 "실제로 벌어진 일"** | QEMU `-trace` 로그, `info lapic` | ❌ 실물에선 전용 장비가 필요 |
+
+읽는 요령:
+
+* `[driver]`와 `[device]`가 **같은 값이면** → 커널이 의도한 대로 장치에 잘 적혔다는 뜻.
+  §4.4가 이 둘을 9줄 통째로 대조한 표다.
+* `[qemu]`는 그 값이 **실제로 쓰였을 때 무슨 일이 벌어졌는지**를 보여준다.
+  실물 하드웨어라면 못 보는 부분이라, 이 실험을 QEMU에서 하는 이유가 여기 있다.
+* **소스코드 블록에는 태그 대신 파일 경로**를 적었다. 경로만 봐도 어느 쪽인지 알 수 있다:
+  * `hw/nvme/…`, `hw/pci/…`, `hw/intc/…` → **QEMU** (에뮬레이션된 장치·APIC의 동작)
+  * `drivers/…`, `arch/…`, `kernel/…`, `include/linux/…` → **리눅스 커널** (드라이버 동작)
+
+QEMU 트레이스 줄에는 앞에 `<스레드ID>@<시각>:`이 붙는데, 이걸로 **"장치가 한 일"과
+"특정 CPU가 한 일"을 더 잘게 구분**할 수 있다(§0.2의 매핑표). 중요한 구간에서는
+`[qemu·SSD]`, `[qemu·vCPU5]` 처럼 한 단계 더 쪼개서 표시했다.
+
+### 최소 용어집
+
+| 용어 | 한 줄 설명 | 이 문서의 실측값 |
+|------|-----------|-----------------|
+| MMIO | 장치 레지스터를 메모리 주소처럼 읽고 쓰는 방식 | 도어벨, MSI-X 테이블 접근이 전부 MMIO |
+| BAR | 장치가 요구한 MMIO 주소 창. 위치는 펌웨어/커널이 정해준다 | BAR0 = `0xfebf0000`, 크기 16KB |
+| SQ / CQ | Submission/Completion Queue. **호스트 메모리**에 있는 링버퍼 | SQ6=`0x4fb0000`, CQ6=`0x60bc000` |
+| doorbell | "큐에 새 항목 넣었다"고 장치에 알리는 MMIO 쓰기 | BAR0+`0x1030`(SQ6), +`0x1034`(CQ6) |
+| CQE | 완료 항목 하나(16바이트) | `{sq_id=6, status=0x1}` |
+| MSI-X | 인터럽트를 **메모리 쓰기**로 보내는 PCIe 방식 | 이 문서의 주제 |
+| MSI-X 테이블 | **장치 안에 있는 배열**. 엔트리 = (주소 8B, 데이터 4B, 제어 4B) | BAR0+`0x2000`, 65칸 중 9칸 사용 |
+| PBA | Pending Bit Array. 마스크된 인터럽트가 밀려 있음을 표시하는 비트 배열 | BAR0+`0x3000` |
+| 벡터(vector) | **CPU가 아는 인터럽트 번호(0~255)**. IDT의 인덱스 | 33 |
+| IRQ 번호 | **리눅스가 붙인 논리 번호**. 벡터와 전혀 다른 값 | 30 (`nvme0q6`) |
+| Local APIC | CPU마다 하나씩 있는 인터럽트 접수 창구 | 주소창 `0xFEE00000` |
+| IRR / ISR | "접수됨" / "처리중"을 나타내는 256비트 배열 | IRR[33]=1 → ISR[33]=1 |
+| LDR | Local APIC의 논리 주소. flat 모드에선 CPU n → `1<<n` | CPU5 = `0x20` |
+| EOI | End Of Interrupt. "다 처리했다"고 APIC에 알리는 쓰기 | `0xFEE000B0`에 0 쓰기 |
+| IDT | 벡터 → 진입 코드 주소 표 | IDT[33] = `irq_entries_start+8` |
+
+> **가장 헷갈리는 두 가지**
+> 1. **벡터 33과 IRQ 30은 다른 번호다.** 벡터는 CPU/하드웨어가 쓰는 번호,
+>    IRQ는 리눅스가 내부적으로 붙인 번호다. 커널이 `vector_irq[33] → irq 30`으로 변환한다.
+> 2. **MSI-X 테이블은 장치 안에 있다.** 커널 메모리가 아니다. 커널은 MMIO로 남의 집(장치)
+>    수첩에 자기 연락처를 적어두는 것이다. 그래서 `devmem`으로 BAR를 읽으면 그 수첩이 보인다.
+
+### 어디부터 읽을까
+
+| 목적 | 읽는 순서 |
+|------|-----------|
+| 10분 만에 감 잡기 | 이 길잡이 → §1(한 장 요약) → §11(타임라인) → §16(직답) |
+| 원리를 이해하기 | §2(장치가 수첩을 어디 두나) → §4(커널이 뭘 적나) → §5(장치가 어떻게 쏘나) → §6~§8(APIC·CPU가 어떻게 받나) |
+| 직접 해보기 | §14(재현 스크립트) |
+| "진짜 그런가?" 검증 | §9(마스킹 실험) → §10(CPU가 직접 쏴보기) |
+
+---
+
 ## 0. 실험 환경과 재현 방법
 
 ### 0.1 게스트 기동
+
+**실행 명령 — 호스트에서 게스트를 띄운다**
 
 ```bash
 qemu-8.2.2/build/qemu-system-x86_64 \
@@ -47,6 +145,8 @@ qemu-8.2.2/build/qemu-system-x86_64 \
 **어느 스레드가 무엇을 했는지**가 핵심이므로 반드시 켠다.
 
 ### 0.2 host thread ↔ vCPU 매핑 (QMP `query-cpus-fast` 실측)
+
+**`[qemu]`** QMP `query-cpus-fast` — vCPU와 호스트 스레드 대응
 
 ```
 vCPU 0 thread-id 2703859      vCPU 4 thread-id 2703863
@@ -149,6 +249,8 @@ vCPU 3 thread-id 2703862      vCPU 7 thread-id 2703866
 
 게스트에서 `hexdump -C /sys/bus/pci/devices/0000:00:04.0/config`:
 
+**`[device]`** 게스트에서 `hexdump -C /sys/bus/pci/devices/0000:00:04.0/config` — 장치의 PCI config space 실물
+
 ```
 00000000  36 1b 10 00 07 05 10 00  02 02 08 01 00 00 00 00  |6...............|
 00000010  04 00 bf fe 00 00 00 00  00 00 00 00 00 00 00 00  |................|
@@ -198,6 +300,8 @@ capability 체인은 `0x40`(MSI-X) → `0x80`(PCI Express) → `0x60`(Power Mgmt
 
 `hw/nvme/ctrl.c:8006` `nvme_bar_size()`가 BAR0 레이아웃을 만든다.
 
+**소스: QEMU** `hw/nvme/ctrl.c:8006` — 장치가 BAR0 레이아웃을 정하는 코드
+
 ```c
 static uint64_t nvme_bar_size(unsigned total_queues, unsigned total_irqs,
                               unsigned *msix_table_offset,
@@ -235,6 +339,8 @@ static uint64_t nvme_bar_size(unsigned total_queues, unsigned total_irqs,
 
 `hw/nvme/ctrl.c:8104` 부근:
 
+**소스: QEMU** `hw/nvme/ctrl.c:8104` — BAR0와 MSI-X 테이블을 등록
+
 ```c
 memory_region_init(&n->bar0, OBJECT(n), "nvme-bar0", bar_size);
 memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops, n, "nvme", msix_table_offset);
@@ -257,6 +363,8 @@ ret = msix_init(pci_dev, n->params.msix_qsize,
 ### 3.1 커널이 벡터를 몇 개 요청하는가
 
 부팅 트레이스(타임스탬프 실측)를 보면 MSI-X 설정이 **두 번** 일어난다.
+
+**`[qemu]`** `-trace` — 게스트가 MSI-X capability를 건드린 순간들
 
 ```
 2703866@1788926783.173273:msix_write_config dev nvme enabled 1 masked 1   ← ① 1차 enable
@@ -289,6 +397,8 @@ MSI-X 스펙이 "테이블을 고칠 때는 Function Mask를 세워라"고 하�
 
 큐↔벡터 대응은 `pci.c:1800` (이 트리 기준):
 
+**소스: 리눅스 커널** `drivers/nvme/host/pci.c:1800`
+
 ```c
 vector = dev->num_vecs == 1 ? 0 : qid;   /* 벡터 번호 = 큐 ID */
 ...
@@ -297,6 +407,8 @@ nvmeq->cq_vector = vector;
 
 즉 **qid = MSI-X 테이블 엔트리 인덱스**다. gdb로 인터럽트 안에서 확인:
 
+**`[driver]`** 게스트 gdb — 인터럽트 핸들러 안에서 본 커널 큐 구조체
+
 ```
 (gdb) p ((struct nvme_queue *)data)->qid          → $12 = 6
 (gdb) p ((struct nvme_queue *)data)->cq_vector    → $13 = 6
@@ -304,12 +416,16 @@ nvmeq->cq_vector = vector;
 
 그리고 QEMU 쪽 큐 생성 트레이스도 같은 값을 말한다:
 
+**`[qemu]`** `-trace` — 장치가 받은 Create CQ/SQ 커맨드
+
 ```
 2703852@1788926783.197857:pci_nvme_create_cq ... addr=0x60bc000, cqid=6, vector=6, qsize=1023, qflags=3, ien=1
 2703852@1788926783.198446:pci_nvme_create_sq ... addr=0x4fb0000, sqid=6, cqid=6, qsize=1023, qflags=1
 ```
 
 커널이 gdb로 보여준 DMA 주소와 **완전히 동일**하다:
+
+**`[driver]`** 게스트 gdb — 커널이 잡아둔 큐의 DMA 주소
 
 ```
 (gdb) p/x ((struct nvme_queue *)data)->cq_dma_addr → $14 = 0x60bc000
@@ -323,7 +439,13 @@ nvmeq->cq_vector = vector;
 
 ### 3.2 x86 벡터 번호는 왜 33/34인가 — per-CPU 벡터 공간
 
+> **쉬운 말로**: "벡터 번호"는 전역 번호가 아니라 **CPU마다 따로 노는 번호**다.
+> 같은 33번이라도 CPU0에서는 nvme 큐1, CPU2에서는 디스크 컨트롤러(ata_piix)일 수 있다.
+> 그래서 NVMe 큐들이 33번과 34번으로 뒤죽박죽 섞여 보인다 — 버그가 아니다.
+
 x86에서 **인터럽트 벡터는 CPU마다 독립적인 자원**이다. drgn으로 per-CPU `vector_irq[]`를 덤프하면:
+
+**`[driver]`** drgn — CPU마다 따로 있는 "벡터 번호 → irq_desc" 표
 
 ```
 === per-CPU vector_irq[32..40] (drgn --qemu 실측) ===
@@ -353,12 +475,16 @@ x86에서 **인터럽트 벡터는 CPU마다 독립적인 자원**이다. drgn�
 
 drgn으로 확인한 APIC 드라이버:
 
+**`[driver]`** drgn — 커널이 고른 APIC 드라이버
+
 ```
 apic->name = flat | dest_mode_logical = True
 ```
 
 `CONFIG_X86_X2APIC`가 꺼져 있고 CPU가 8개 이하이므로 커널은 `apic_flat`을 고른다.
 이 모드에서 목적지 APIC ID는 **CPU 번호의 비트마스크**다.
+
+**소스: 리눅스 커널** `arch/x86/kernel/apic/apic_common.c:14`
 
 ```c
 /* arch/x86/kernel/apic/apic_common.c:14 */
@@ -392,6 +518,8 @@ QEMU가 보는 각 LAPIC의 LDR/DFR (QMP `info lapic N` 실측):
 
 `arch/x86/kernel/apic/apic.c:2556`:
 
+**소스: 리눅스 커널** `arch/x86/kernel/apic/apic.c:2556` — 커널이 MSI 메시지를 조립하는 곳
+
 ```c
 void __irq_msi_compose_msg(struct irq_cfg *cfg, struct msi_msg *msg, bool dmar)
 {
@@ -412,6 +540,8 @@ void __irq_msi_compose_msg(struct irq_cfg *cfg, struct msi_msg *msg, bool dmar)
 `cfg->vector`와 `cfg->dest_apicid`는 x86 벡터 도메인(`arch/x86/kernel/apic/vector.c`)이
 `irq_matrix_alloc()`으로 정한 값이며, drgn으로 `apic_chip_data`를 직접 떠서 확인했다:
 
+**`[driver]`** drgn — irq 30의 벡터/목적지 결정 결과
+
 ```
 irq=30 name=nvme0q6
    [level 0] chip=PCI-MSI hwirq=65542
@@ -423,6 +553,8 @@ irq=30 name=nvme0q6
 `is_managed=1`은 **managed IRQ affinity**(blk-mq가 큐↔CPU를 고정하기 위해
 `PCI_IRQ_AFFINITY`로 요청) 상태다. 반면 admin 큐는:
 
+**`[driver]`** drgn — admin 큐(irq 24)는 managed가 아니다
+
 ```
 irq=24 name=nvme0q0
        apic_chip_data: vector=34 cpu=4 ... is_managed=0 dest_apicid=0x10
@@ -433,6 +565,8 @@ admin은 `is_managed=0`(일반 affinity)이고 커널이 CPU4를 골랐다.
 ### 4.2 MSI 주소/데이터 비트 필드 (x86)
 
 `arch/x86/include/asm/msi.h:29`:
+
+**소스: 리눅스 커널** `arch/x86/include/asm/msi.h:29` — MSI 주소/데이터 비트 정의
 
 ```c
 typedef struct x86_msi_addr_lo {
@@ -473,6 +607,8 @@ typedef struct x86_msi_data {
 
 커널이 자기 비트필드로 해석한 값을 gdb로 그대로 출력하면(인터럽트 처리 도중 실측):
 
+**`[driver]`** 게스트 gdb — 커널이 자기 비트필드로 해석해 보여준 MSI 메시지
+
 ```
 (gdb) p ((struct msi_desc *)desc->irq_common_data.msi_desc)->msg
 $7 = {{address_lo = 4276224004,                       /* = 0xFEE20004 */
@@ -490,6 +626,8 @@ $7 = {{address_lo = 4276224004,                       /* = 0xFEE20004 */
 ### 4.3 테이블에 실제로 쓰는 코드
 
 `drivers/pci/msi/msi.c:151` `__pci_write_msi_msg()`:
+
+**소스: 리눅스 커널** `drivers/pci/msi/msi.c:151` — 테이블에 실제로 써 넣는 코드
 
 ```c
 void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
@@ -509,6 +647,8 @@ void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 이 `writel` 세 번이 게스트 입장에선 MMIO 스토어이고, QEMU 입장에선
 `hw/pci/msix.c:220 msix_table_mmio_write()` 호출이다:
 
+**소스: QEMU** `hw/pci/msix.c:220` — 그 쓰기를 장치가 받는 쪽
+
 ```c
 static void msix_table_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
@@ -523,10 +663,15 @@ static void msix_table_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsig
 즉 **MSI-X 테이블은 장치가 소유한 메모리이고, 호스트는 MMIO로 그 안에 "나에게 연락할 주소"를
 써 넣는다.** 이것이 질문의 "host에서 정해준 msix table의 주소"의 정확한 실체다.
 
-### 4.4 실측 — 테이블 9개 엔트리 전체 (장치 실물 vs 커널 캐시)
+### 4.4 실측 — 테이블 9개 엔트리 전체 (`[device]` 장치 실물 vs `[driver]` 커널 캐시)
+
+> 이 절이 이 문서의 심장이다. **같은 값이 장치 안에도, 커널 안에도 있어야 한다.**
+> 하나라도 어긋나면 인터럽트가 엉뚱한 CPU로 가거나 아예 안 온다.
 
 게스트에서 BAR0 물리주소를 busybox `devmem`으로 직접 읽었다
 (`CONFIG_IO_STRICT_DEVMEM=n`이라 MMIO 영역은 `/dev/mem`으로 읽을 수 있다):
+
+**`[device]`** 게스트에서 `devmem`으로 BAR0+0x2000을 직접 읽는 명령
 
 ```sh
 i=0; while [ $i -le 8 ]; do
@@ -537,7 +682,7 @@ i=0; while [ $i -le 8 ]; do
 done
 ```
 
-| entry | addr_lo (장치 실물) | addr_hi | data | vctrl | destid[19:12] | → CPU | vector | Linux IRQ / 이름 |
+| entry | `[device]` addr_lo | addr_hi | data | vctrl | destid[19:12] | → CPU | vector | Linux IRQ / 이름 |
 |-------|--------------------|---------|------|-------|---------------|-------|--------|------------------|
 | 0 | `0xFEE10004` | 0 | `0x22` | 0 | `0x10` | CPU4 | 34 | 24 / `nvme0q0` (admin) |
 | 1 | `0xFEE01004` | 0 | `0x21` | 0 | `0x01` | CPU0 | 33 | 25 / `nvme0q1` |
@@ -550,6 +695,8 @@ done
 | 8 | `0xFEE80004` | 0 | `0x21` | 0 | `0x80` | CPU7 | 33 | 32 / `nvme0q8` |
 
 같은 순간 커널 쪽 `msi_desc.msg`(drgn `--qemu` 실측):
+
+**`[driver]`** drgn — 커널이 들고 있는 msi_desc 9개
 
 ```
 irq=24 nvme0q0  msi_msg: address_lo=0xfee10004 address_hi=0x00000000 data=0x00000022  msi_index=0
@@ -569,6 +716,8 @@ irq=32 nvme0q8  msi_msg: address_lo=0xfee80004 address_hi=0x00000000 data=0x0000
 `/proc/interrupts`가 이 매핑을 다시 확인해준다 — 부팅 직후 admin 인터럽트 24회가
 **전부 CPU4에** 찍혀 있는데, 이는 entry0의 destid `0x10`(CPU4)과 정확히 일치한다:
 
+**`[driver]`** 게스트 `/proc/interrupts`
+
 ```
            CPU0  CPU1  CPU2  CPU3  CPU4  CPU5  CPU6  CPU7
  24:          0     0     0     0    24     0     0     0   PCI-MSI 65536-edge  nvme0q0
@@ -577,6 +726,8 @@ irq=32 nvme0q8  msi_msg: address_lo=0xfee80004 address_hi=0x00000000 data=0x0000
 
 트레이스로도 같은 사실이 보인다. admin 인터럽트(`vector 0`) 뒤의 CQ 도어벨은 **항상 tid 2703863
 = vCPU4**가 친다:
+
+**`[qemu]`** `-trace` — admin 인터럽트는 항상 vCPU4가 처리한다
 
 ```
 2703852@...783.209238:pci_nvme_irq_msix raising MSI-X IRQ vector 0     ← 장치(main thread)
@@ -588,6 +739,8 @@ irq=32 nvme0q8  msi_msg: address_lo=0xfee80004 address_hi=0x00000000 data=0x0000
 ### 4.5 hwirq 65542의 정체
 
 `desc->irq_data.hwirq = 65542`의 정체는 `drivers/pci/msi/irqdomain.c`:
+
+**소스: 리눅스 커널** `drivers/pci/msi/irqdomain.c`
 
 ```c
 static irq_hw_number_t pci_msi_domain_calc_hwirq(struct msi_desc *desc)
@@ -616,6 +769,10 @@ static irq_hw_number_t pci_msi_domain_calc_hwirq(struct msi_desc *desc)
 ---
 
 ## 5. 발사 — SSD가 인터럽트를 쏘는 순간
+
+> **쉬운 말로**: 여기까지가 "준비", 여기서부터가 "실행"이다.
+> SSD는 자기 수첩(MSI-X 테이블)의 6번 칸을 펴서 거기 적힌 주소 `0xFEE20004`에
+> 적힌 값 `0x21`을 쓴다. 그게 전부다. SSD는 그 주소가 무엇인지 모르고 알 필요도 없다.
 
 ### 5.1 장치 내부 경로
 
@@ -648,6 +805,8 @@ static irq_hw_number_t pci_msi_domain_calc_hwirq(struct msi_desc *desc)
 
 ### 5.2 `msix_notify()`가 하는 세 가지 검사 (`hw/pci/msix.c:525`)
 
+**소스: QEMU** `hw/pci/msix.c:525` — 장치가 인터럽트를 쏘는 진입점
+
 ```c
 void msix_notify(PCIDevice *dev, unsigned vector)
 {
@@ -670,6 +829,8 @@ void msix_notify(PCIDevice *dev, unsigned vector)
 
 `msix_get_message()`는 결국 이렇게 읽는다 (`msix.c:118`):
 
+**소스: QEMU** `hw/pci/msix.c:118` — 테이블에서 주소/데이터를 꺼내는 부분
+
 ```c
 uint8_t *table_entry = dev->msix_table + vector * PCI_MSIX_ENTRY_SIZE;
 msg.address = pci_get_quad(table_entry + PCI_MSIX_ENTRY_LOWER_ADDR);  /* 64비트 */
@@ -682,6 +843,8 @@ msg.data    = pci_get_long(table_entry + PCI_MSIX_ENTRY_DATA);
 ### 5.3 인터럽트 = bus master DMA write 한 번
 
 `hw/pci/msi.c:377` → `hw/pci/pci.c`의 기본 트리거:
+
+**소스: QEMU** `hw/pci/msi.c:377`, `hw/pci/pci.c` — 인터럽트 = DMA 쓰기
 
 ```c
 void msi_send_message(PCIDevice *dev, MSIMessage msg)
@@ -717,13 +880,16 @@ static void pci_msi_trigger(PCIDevice *dev, MSIMessage msg)
 (직전에 `drop_caches`로 페이지 캐시를 비워 실제 디바이스 읽기를 강제) 실행 중 캡처:
 
 ```
-2703864@1788927128.493233:pci_nvme_mmio_doorbell_sq sqid 6 new_tail 2
-2703864@1788927128.493679:apic_mem_writel 0x380 = 0x17d0f064
-2703852@1788927128.493979:pci_nvme_enqueue_req_completion cid 4096 cqid 6 dw0 0x0 dw1 0x0 status 0x0
-2703852@1788927128.494002:pci_nvme_irq_msix raising MSI-X IRQ vector 6
-2703852@1788927128.494008:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
-2703864@1788927128.494078:apic_mem_writel 0xb0 = 0x00000000
-2703864@1788927128.494286:pci_nvme_mmio_doorbell_cq cqid 6 new_head 2
+[qemu·vCPU5] 2703864@1788927128.493233:pci_nvme_mmio_doorbell_sq sqid 6 new_tail 2
+[qemu·vCPU5] 2703864@1788927128.493679:apic_mem_writel 0x380 = 0x17d0f064
+[qemu·SSD  ] 2703852@1788927128.493979:pci_nvme_enqueue_req_completion cid 4096 cqid 6 dw0 0x0 dw1 0x0 status 0x0
+[qemu·SSD  ] 2703852@1788927128.494002:pci_nvme_irq_msix raising MSI-X IRQ vector 6
+[qemu·APIC ] 2703852@1788927128.494008:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
+[qemu·vCPU5] 2703864@1788927128.494078:apic_mem_writel 0xb0 = 0x00000000
+[qemu·vCPU5] 2703864@1788927128.494286:pci_nvme_mmio_doorbell_cq cqid 6 new_head 2
+
+   ※ 앞의 [qemu·xxx]는 이 문서에서 붙인 표시다. 실제 로그는 <스레드ID>@<시각>: 부터 시작한다.
+      2703864 = vCPU5 스레드, 2703852 = QEMU main 스레드(=에뮬레이션된 SSD와 APIC이 도는 곳).
 ```
 
 줄별 해석:
@@ -755,11 +921,19 @@ static void pci_msi_trigger(PCIDevice *dev, MSIMessage msg)
 
 ## 6. 배달 — Local APIC
 
+> **쉬운 말로**: 방금 SSD가 쓴 4바이트를 받는 쪽 이야기다.
+> `0xFEE20004`는 RAM이 아니라 **CPU 옆에 붙은 인터럽트 접수 창구(Local APIC)**의 주소다.
+> 창구는 그 쓰기를 보고 두 가지를 읽어낸다 —
+> **주소에서 "누구에게"(CPU5), 데이터에서 "몇 번 용건"(33번)**.
+> 그리고 CPU5의 접수 장부(IRR)에 33번 도장을 찍고 CPU5를 깨운다.
+
 ### 6.1 왜 메모리 쓰기가 인터럽트가 되는가
 
 x86에서 `0xFEE00000`~`0xFEEFFFFF`는 **Local APIC이 점유한 주소 영역**이다.
 QEMU는 이 영역을 `apic-msi`라는 MemoryRegion으로 등록하고, 그 write 핸들러
 `apic_mem_write()`가 오프셋으로 두 갈래를 나눈다(`hw/intc/apic.c:740`):
+
+**소스: QEMU** `hw/intc/apic.c:740` — 0xFEE00000 영역에 쓰기가 들어왔을 때
 
 ```c
 static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
@@ -802,6 +976,8 @@ static void apic_mem_write(void *opaque, hwaddr addr, uint64_t val, unsigned siz
 
 ### 6.2 주소/데이터 → dest/vector 분해 (`hw/intc/apic.c:727`)
 
+**소스: QEMU** `hw/intc/apic.c:727` — 주소/데이터를 dest·vector로 분해
+
 ```c
 static void apic_send_msi(MSIMessage *msi)
 {
@@ -822,6 +998,8 @@ static void apic_send_msi(MSIMessage *msi)
 > 트레이스에서 `dest 32`로 보이는 값이 이 `0x20`이다.
 
 ### 6.3 논리 목적지 해석 — 누가 받을 것인가 (`apic.c:457`)
+
+**소스: QEMU** `hw/intc/apic.c:457` — 어느 CPU가 받을지 고르는 곳
 
 ```c
 static void apic_get_delivery_bitmask(uint32_t *deliver_bitmask, uint8_t dest, uint8_t dest_mode)
@@ -860,6 +1038,8 @@ static void apic_get_delivery_bitmask(uint32_t *deliver_bitmask, uint8_t dest, u
 
 ### 6.4 IRR 세팅과 vCPU 깨우기 (`apic.c:402`)
 
+**소스: QEMU** `hw/intc/apic.c:402`, `:379` — IRR을 세우고 vCPU를 깨운다
+
 ```c
 static void apic_set_irq(APICCommonState *s, int vector_num, int trigger_mode)
 {
@@ -891,6 +1071,8 @@ static void apic_update_irq(APICCommonState *s)
 
 우선순위 판정은 `apic_irq_pending()`:
 
+**소스: QEMU** `hw/intc/apic.c:358` — 우선순위 판정
+
 ```c
 irrv = get_highest_priority_int(s->irr);      /* IRR에서 가장 높은 벡터 */
 ppr  = apic_get_ppr(s);                       /* Processor Priority Register */
@@ -906,7 +1088,14 @@ return irrv;
 
 ## 7. 수령 — CPU가 벡터를 집는다
 
+> **쉬운 말로**: CPU5가 하던 일을 멈추고 접수 장부를 확인하는 단계다.
+> 접수(IRR) → 처리중(ISR)으로 도장을 옮기고, 처리하는 동안에는 더 낮은 우선순위의
+> 용건을 안 받도록 문턱(PPR)을 올린다. 그 다음 33번 용건 담당 코드로 점프한다.
+> **이 순간을 gdb로 얼어붙게 만들어 찍은 게 §7.2다** — 교과서 그림이 실제 값으로 보인다.
+
 ### 7.1 `apic_get_interrupt()` — IRR에서 ISR로 (`apic.c:576`)
+
+**소스: QEMU** `hw/intc/apic.c:576` — CPU가 벡터를 집어가는 순간
 
 ```c
 int apic_get_interrupt(DeviceState *dev)
@@ -931,12 +1120,15 @@ int apic_get_interrupt(DeviceState *dev)
 
 게스트 gdb로 `nvme0q6`의 IRQ 흐름 핸들러 진입 직전에 정지시켰다:
 
-```
-(gdb) break handle_edge_irq if desc->irq_data.irq == 30
-(gdb) continue
-   ... 게스트 콘솔에서: taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 skip=9000
+**`[driver]`** 게스트 gdb — 인터럽트 처리 도중 VM을 정지시킨다
 
-Thread 6 hit Breakpoint 1, handle_edge_irq (desc=0xffff8880060a1800) at kernel/irq/chip.c:777
+```
+[driver] (gdb) break handle_edge_irq if desc->irq_data.irq == 30
+[driver] (gdb) continue
+         ... 게스트 콘솔에서: taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 skip=9000
+
+[driver] Thread 6 hit Breakpoint 1, handle_edge_irq (desc=0xffff8880060a1800) at kernel/irq/chip.c:777
+         (Thread 6 = vCPU5. 여기서 게스트 전체가 정지한다)
 ```
 
 `Thread 6` = vCPU5(gdbstub는 1-base). **이 정지 상태에서** QMP로 LAPIC을 떴다:
@@ -963,6 +1155,8 @@ APR 0x05 TPR 0x10 DFR 0x0f LDR 0x20 PPR 0x20                        ← ★ PPR�
 
 같은 순간 백트레이스:
 
+**`[driver]`** 게스트 gdb — 정지 지점의 커널 호출 스택
+
 ```
 (gdb) bt
 #0  handle_edge_irq (desc=0xffff8880060a1800) at kernel/irq/chip.c:777
@@ -975,6 +1169,8 @@ APR 0x05 TPR 0x10 DFR 0x0f LDR 0x20 PPR 0x20                        ← ★ PPR�
 `vector=33`이 커널 프레임에 그대로 살아 있다.
 
 ### 7.3 IDT 게이트 실측
+
+**`[driver]`** 게스트 gdb — 벡터 33의 IDT 게이트
 
 ```
 (gdb) p/x idt_table[33]
@@ -1001,6 +1197,8 @@ $9 = (void *) 0xffffffff81e001f8 <irq_entries_start+8>
 
 인터럽트로 끊긴 지점(`pt_regs`)도 찍어 봤다:
 
+**`[driver]`** 게스트 gdb — 인터럽트로 끊긴 지점의 레지스터
+
 ```
 (gdb) p/x *(struct pt_regs *)0xffffc900000abe38
 $10 = {..., orig_ax = 0xffffffffffffffff, ip = 0xffffffff81030119, cs = 0x10, flags = 0x246,
@@ -1022,6 +1220,8 @@ $11 = (void *) 0xffffffff81030119 <amd_e400_idle+57>
 
 ### 8.1 벡터 → irq_desc
 
+**소스: 리눅스 커널** `arch/x86/kernel/irq.c:240`
+
 ```c
 /* arch/x86/kernel/irq.c:240 */
 DEFINE_IDTENTRY_IRQ(common_interrupt)
@@ -1039,6 +1239,8 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
 CPU5의 `vector_irq[33]` = `irq_desc(irq 30, "nvme0q6")` — §3.2 실측표 그대로다.
 정지 상태에서 그 `irq_desc`를 직접 뜯었다:
 
+**`[driver]`** 게스트 gdb — 이 인터럽트의 irq_desc 내용
+
 ```
 (gdb) p desc->irq_data.irq          → $1 = 30
 (gdb) p desc->irq_data.hwirq        → $2 = 65542
@@ -1052,6 +1254,8 @@ CPU5의 `vector_irq[33]` = `irq_desc(irq 30, "nvme0q6")` — §3.2 실측표 그
 `/proc/interrupts`의 `PCI-MSI 65542-edge nvme0q6`가 이 세 정보를 그대로 표시한 것이다.
 
 ### 8.2 EOI가 핸들러보다 **먼저** 온다 (실측으로 증명)
+
+**소스: 리눅스 커널** `kernel/irq/chip.c` — edge 인터럽트 흐름 핸들러
 
 ```c
 /* kernel/irq/chip.c handle_edge_irq() */
@@ -1083,9 +1287,9 @@ void handle_edge_irq(struct irq_desc *desc)
 **실측 A — 트레이스 순서** (§5.4 재인용):
 
 ```
-.494008  apic_deliver_irq ... vector 33      ← 배달
-.494078  apic_mem_writel 0xb0 = 0x00000000   ← EOI (핸들러보다 먼저)
-.494286  pci_nvme_mmio_doorbell_cq cqid 6    ← nvme_irq 내부
+[qemu·APIC ] .494008  apic_deliver_irq ... vector 33      ← 배달
+[qemu·vCPU5] .494078  apic_mem_writel 0xb0 = 0x00000000   ← EOI (핸들러보다 먼저!)
+[qemu·vCPU5] .494286  pci_nvme_mmio_doorbell_cq cqid 6    ← nvme_irq 내부
 ```
 
 **실측 B — 두 지점의 LAPIC 상태 비교**:
@@ -1094,6 +1298,8 @@ void handle_edge_irq(struct irq_desc *desc)
 |-----------|-----|-----|-----|
 | `handle_edge_irq` 진입 (ack 전) | **33** | (none) | **0x20** |
 | `nvme_irq` 진입 (ack 후) | **(none)** | (none) | **0x10** |
+
+**`[driver]`** 게스트 gdb + **`[qemu]`** `info lapic` — 한 단계 진행한 뒤 다시 확인
 
 ```
 (gdb) break nvme_irq
@@ -1107,6 +1313,8 @@ APR 0x05 TPR 0x10 DFR 0x0f LDR 0x20 PPR 0x10
 ```
 
 `apic_eoi()`(`hw/intc/apic.c:424`)가 ISR 최상위 비트를 지우고 PPR을 되돌린 것이다:
+
+**소스: QEMU** `hw/intc/apic.c:424` — EOI 처리
 
 ```c
 static void apic_eoi(APICCommonState *s)
@@ -1128,6 +1336,8 @@ edge라 TMR 비트가 0이므로 IOAPIC 브로드캐스트는 일어나지 않�
 > 반대로 원인을 지우기 전에 EOI를 하면 인터럽트 폭풍이 나므로 `handle_fasteoi_irq`가 쓰인다.
 
 ### 8.3 `nvme_irq()` 안에서 본 큐 상태 (실측)
+
+**`[driver]`** 게스트 gdb — nvme_irq() 안에서 본 큐와 CQE
 
 ```
 (gdb) p ((struct nvme_queue *)data)->qid              → 6
@@ -1163,39 +1373,42 @@ MSI-X 엔트리의 4번째 DWORD(Vector Control) bit0이 **Mask 비트**다. 마
 게스트에서 커널 몰래 테이블을 직접 조작해 재현했다(`devmem`으로 `0xfebf206c` = entry6 + 12):
 
 ```sh
-# ① 마스크
-echo 3 > /proc/sys/vm/drop_caches
-devmem 0xfebf206c 32 1
-   → vctrl=0x00000001  PBA=0x00000000
+# ① 마스크 — 장치 수첩의 entry6 제어필드에 1을 쓴다
+          echo 3 > /proc/sys/vm/drop_caches
+          devmem 0xfebf206c 32 1
+[device]     → vctrl=0x00000001  PBA=0x00000000
 
 # ② 마스크된 채로 CPU5에서 읽기 실행
-taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 &
-   → PBA=0x00000040        ← ★ 비트6 = pending
-   → /proc/interrupts nvme0q6 카운트 변화 없음 (483 그대로)
+          taskset -c 5 dd if=/dev/nvme0n1 of=/dev/null bs=4096 count=1 &
+[device]     → PBA=0x00000040        ← ★ 장치가 "밀린 인터럽트 있음"을 표시(비트6)
+[driver]     → /proc/interrupts nvme0q6 카운트 변화 없음 (483 그대로)
+                = 커널은 인터럽트를 한 번도 못 받았다
 
 # ③ 언마스크
-devmem 0xfebf206c 32 0
-   → vctrl=0x00000000  PBA=0x00000000
-   → /proc/interrupts nvme0q6 = 485  (+2, 밀린 것 + 후속 I/O)
+          devmem 0xfebf206c 32 0
+[device]     → vctrl=0x00000000  PBA=0x00000000     = 밀린 것이 발사되어 비워짐
+[driver]     → /proc/interrupts nvme0q6 = 485  (+2, 밀린 것 + 후속 I/O)
 ```
 
 같은 구간의 QEMU 트레이스:
 
 ```
 [마스크 구간]
-  pci_nvme_mmio_doorbell_sq sqid 6 new_tail 517
-  pci_nvme_enqueue_req_completion cid 45632 cqid 6 dw0 0x0 dw1 0x0 status 0x0
-  pci_nvme_irq_msix raising MSI-X IRQ vector 6      ← 장치는 분명히 "쐈다"
-  (여기서 끝. apic_deliver_irq 없음 = LAPIC까지 안 갔다)
+  [qemu·vCPU5] pci_nvme_mmio_doorbell_sq sqid 6 new_tail 517
+  [qemu·SSD  ] pci_nvme_enqueue_req_completion cid 45632 cqid 6 dw0 0x0 dw1 0x0 status 0x0
+  [qemu·SSD  ] pci_nvme_irq_msix raising MSI-X IRQ vector 6   ← 장치는 분명히 "쏘려고 했다"
+  (여기서 끝. apic_deliver_irq 가 없다 = LAPIC까지 가지 못했다)
 
 [언마스크 직후]
-  pci_nvme_mmio_doorbell_cq cqid 6 new_head 517     ← 핸들러가 드디어 돌았다
+  [qemu·vCPU5] pci_nvme_mmio_doorbell_cq cqid 6 new_head 517  ← 핸들러가 드디어 돌았다
 ```
 
 `pci_nvme_irq_msix`는 찍혔는데 `apic_deliver_irq`가 없다 — **`msix_notify()`가
 `msix_is_masked()`에서 걸려 `msix_set_pending()`만 하고 리턴한 것**이 로그로 증명된다.
 
 언마스크가 pending을 발사하는 코드(`hw/pci/msix.c:145`):
+
+**소스: QEMU** `hw/pci/msix.c:145` — 언마스크 시 밀린 인터럽트 발사
 
 ```c
 static void msix_handle_mask_update(PCIDevice *dev, int vector, bool was_masked)
@@ -1211,6 +1424,8 @@ static void msix_handle_mask_update(PCIDevice *dev, int vector, bool was_masked)
 ```
 
 PBA 비트 위치 계산(`msix.c:143`):
+
+**소스: QEMU** `hw/pci/msix.c:143` — PBA 비트 위치 계산
 
 ```c
 static uint8_t  msix_pending_mask(int vector)          { return 1 << (vector % 8); }
@@ -1231,9 +1446,13 @@ MSI가 "특별한 신호"가 아니라 **그냥 메모리 쓰기**라면, CPU가
 똑같이 인터럽트가 나야 한다. 게스트에서 `/dev/mem`을 통해 직접 해봤다:
 
 ```sh
-[before]  30:  0  0  0  0  0  2  0  0   PCI-MSI 65542-edge  nvme0q6
-devmem 0xfee20004 32 0x21
-[after ]  30:  0  0  0  0  0  3  0  0   PCI-MSI 65542-edge  nvme0q6
+[driver] [before]  30:  0  0  0  0  0  2  0  0   PCI-MSI 65542-edge  nvme0q6
+                                    ↑ CPU5 열
+
+         devmem 0xfee20004 32 0x21     ← CPU가 직접, LAPIC의 MSI 창에 4바이트 쓰기
+
+[driver] [after ]  30:  0  0  0  0  0  3  0  0   PCI-MSI 65542-edge  nvme0q6
+                                    ↑ 2 → 3 으로 증가
 ```
 
 **CPU5의 `nvme0q6` 카운트가 2 → 3으로 증가했다.** 커널은 이것이 SSD가 보낸 것인지
@@ -1242,11 +1461,11 @@ devmem 0xfee20004 32 0x21
 같은 순간의 QEMU 트레이스를, 진짜 장치가 쏜 것과 나란히 놓으면:
 
 ```
-2703852@1788927128.494008:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
-  ↑ tid 2703852 = QEMU main thread = 에뮬레이션된 SSD가 DMA write로 쏜 것
+[qemu·SSD  ] 2703852@1788927128.494008:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
+              ↑ tid 2703852 = QEMU main thread = 에뮬레이션된 SSD가 DMA write로 쏜 것
 
-2703865@1788927187.828197:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
-  ↑ tid 2703865 = vCPU6 = busybox devmem 프로세스가 store 명령으로 쓴 것
+[qemu·vCPU6] 2703865@1788927187.828197:apic_deliver_irq dest 32 dest_mode 1 delivery_mode 0 vector 33 trigger_mode 0
+              ↑ tid 2703865 = vCPU6 = busybox devmem 프로세스가 그냥 store 명령으로 쓴 것
 ```
 
 **두 줄이 완전히 동일하다.** 발신자만 다르고 LAPIC이 보는 것은 똑같다.
@@ -1268,36 +1487,52 @@ devmem 0xfee20004 32 0x21
 ## 11. 전체 타임라인 한 장
 
 ```
- t(µs)  주체                이벤트                                       관측 근거
- ─────────────────────────────────────────────────────────────────────────────────────
-   0    vCPU5(2703864)      dd → blk-mq hctx5 → SQ6에 커맨드 기록
-   0    vCPU5               BAR0+0x1030에 tail=2 쓰기 (SQ doorbell)      pci_nvme_mmio_doorbell_sq
-                            └ QEMU nvme_process_sq() 킥
- 746    장치(2703852)       블록 백엔드 read 완료 → CQ6에 CQE DMA write  pci_nvme_enqueue_req_completion
-                            {sq_id=6, cid=4096, status=0(phase 포함 0x1)}
- 769    장치                nvme_irq_assert → msix_notify(dev, 6)        pci_nvme_irq_msix vector 6
-                            ├ msix_entry_used[6]? yes
-                            ├ msix_is_masked(6)? no (vctrl=0, funcmask=0)
-                            └ 테이블 entry6 읽기 → {0xFEE20004, 0x21}
- 769    장치                address_space_stl_le(bus_master_as,
-                                 0xFEE20004, 0x21)  ← PCIe MemWr TLP
- 775    LAPIC(장치 스레드)  apic_mem_write(off=0x20004) → apic_send_msi   apic_deliver_irq
-                            dest=0x20 dest_mode=1 delivery=0 vec=33 trig=0
-                            ├ apic_get_delivery_bitmask: LDR 0x20 = CPU5
-                            └ apic_set_irq(CPU5, 33): IRR[33]=1
-                              → cpu_interrupt(CPU5, CPU_INTERRUPT_POLL)
- 845    vCPU5               인터럽트 수락: apic_get_interrupt()            info lapic 5:
-                            IRR[33]=0, ISR[33]=1, PPR 0x10→0x20            ISR 33 / PPR 0x20
- 845    vCPU5               IDT[33] = irq_entries_start+8                  p/x idt_table[33]
-                            → push $33 → asm_common_interrupt
-                            → common_interrupt(regs, vector=33)            bt: vector=33
- 845    vCPU5               vector_irq[33] = irq_desc(irq30 "nvme0q6")     drgn per-CPU vector_irq
-                            → handle_edge_irq()
- 845    vCPU5               chip->irq_ack → ack_APIC_irq()                 apic_mem_writel 0xb0
-                            → LAPIC 0xB0 쓰기 → ISR[33]=0, PPR→0x10        info lapic 5: ISR (none)
- 1053   vCPU5               nvme_irq → nvme_poll_cq → CQE phase 검사        gdb: cqes[0].status=0x1
-                            → CQ6 doorbell(BAR0+0x1034) head=2              pci_nvme_mmio_doorbell_cq
-                            → blk_mq_complete_request → bio_endio → dd wake
+ 표기:  [HW] = 하드웨어(장치/LAPIC)가 하는 일    [SW] = 리눅스 커널이 하는 일
+        근거 뒤의 [qemu]/[driver]/[device]는 그 사실을 어디서 확인했는지를 뜻한다.
+
+ t(µs)              무슨 일이 일어나는가                          어떻게 확인했나
+ ─────────────────────────────────────────────────────────────────────────────────────────
+   0   [SW] vCPU5   dd → blk-mq hctx5 → SQ6(0x4fb0000)에 커맨드 기록
+   0   [SW] vCPU5   BAR0+0x1030에 tail=2 쓰기 (SQ doorbell)
+                    → 이 MMIO 쓰기가 장치를 깨운다                [qemu] pci_nvme_mmio_doorbell_sq
+
+ 746   [HW] SSD     블록 read 완료 → CQ6(0x60bc000)에 CQE DMA write
+                    {sq_id=6, cid=4096, status=0x1(phase 포함)}   [qemu] pci_nvme_enqueue_req_completion
+                                                                  [driver] gdb: cqes[0]
+
+ 769   [HW] SSD     nvme_irq_assert → msix_notify(dev, vector=6)  [qemu] pci_nvme_irq_msix vector 6
+                    ├ entry6이 쓰이는 중인가? yes
+                    ├ entry6이 마스크됐나? no (vctrl=0)
+                    └ entry6 읽기 → {0xFEE20004, 0x21}            [device] devmem 0xfebf2060
+
+ 769   [HW] SSD     그 주소에 그 값을 쓴다 = PCIe MemWr TLP
+                    address_space_stl_le(bus_master_as,
+                                         0xFEE20004, 0x21)
+
+ 775   [HW] LAPIC   0xFEE00000 창이 받아서 해석                    [qemu] apic_deliver_irq
+                    dest=0x20 dest_mode=1 delivery=0 vec=33         dest 32 ... vector 33
+                    ├ dest 0x20 & 각 CPU의 LDR → CPU5만 매칭       [qemu] info lapic 5: LDR 0x20
+                    └ CPU5의 IRR[33] = 1, vCPU5 깨우기
+
+ 845   [HW] CPU5    인터럽트 수락: IRR[33]=0 → ISR[33]=1           [qemu] info lapic 5:
+                    PPR 0x10 → 0x20 (더 낮은 우선순위 차단)          ISR 33 / PPR 0x20
+                                                                  ← 게스트 gdb로 정지시켜 촬영
+
+ 845   [HW] CPU5    IDT[33] = irq_entries_start+8 로 점프          [driver] gdb: p/x idt_table[33]
+                    → push $33 → asm_common_interrupt
+
+ 845   [SW] 커널    common_interrupt(regs, vector=33)              [driver] gdb: bt (vector=33)
+                    → this_cpu vector_irq[33] = irq_desc(irq 30)   [driver] drgn: per-CPU vector_irq
+                    → handle_edge_irq()                            [driver] gdb: desc->handle_irq
+
+ 845   [SW] 커널    chip->irq_ack → ack_APIC_irq()                 [qemu] apic_mem_writel 0xb0
+                    → LAPIC 0xB0 쓰기 → ISR[33]=0, PPR→0x10        [qemu] info lapic 5: ISR (none)
+                    ★ 핸들러보다 EOI가 먼저다
+
+1053   [SW] 커널    nvme_irq → nvme_poll_cq → CQE phase 검사        [driver] gdb: cqes[0].status=0x1
+                    → CQ6 doorbell(BAR0+0x1034) head=2             [qemu] pci_nvme_mmio_doorbell_cq
+                    → blk_mq_complete_request → bio_endio
+                    → dd 깨어남
 ```
 
 ---
@@ -1305,6 +1540,8 @@ devmem 0xfee20004 32 0x21
 ## 12. 대비군 — 같은 시간대의 IOAPIC 경로(ttyS0)
 
 같은 트레이스 구간에 이런 줄이 대량으로 섞여 있었다:
+
+**`[qemu]`** `-trace` — 같은 시간대에 섞여 있던 IOAPIC 인터럽트(ttyS0)
 
 ```
 apic_deliver_irq dest 1 dest_mode 1 delivery_mode 0 vector 34 trigger_mode 0
@@ -1325,6 +1562,8 @@ apic_deliver_irq dest 1 dest_mode 1 delivery_mode 0 vector 34 trigger_mode 0
 
 **두 경로가 QEMU 안에서 실제로 같은 방식으로 합류한다.** `hw/intc/ioapic.c:134`의 주석이
 이를 명시한다:
+
+**소스: QEMU** `hw/intc/ioapic.c:134`
 
 ```c
 /* No matter whether IR is enabled, we translate
@@ -1364,6 +1603,8 @@ IOMMU의 Interrupt Remapping Table에 들어간다.** 이 실험에서 본 "주�
 
 ### 14.1 MSI-X 테이블 전체 덤프 (게스트, busybox만 필요)
 
+**`[device]`** 재현 스크립트 — 게스트에서 장치 수첩 통째로 읽기
+
 ```sh
 D=/sys/bus/pci/devices/0000:00:04.0
 # BAR0 물리주소
@@ -1385,6 +1626,8 @@ devmem 0xfebf3000 32
 > MMIO 영역은 허용된다 — RAM만 막힌다.)
 
 ### 14.2 커널 쪽 msi_desc / 벡터 매핑 (호스트에서 drgn)
+
+**`[driver]`** 재현 스크립트 — 커널 장부 통째로 읽기
 
 ```python
 # drgn --qemu qmp.sock -s linux-6.1.4/vmlinux  script.py
@@ -1419,6 +1662,8 @@ for c in range(8):                              # per-CPU 벡터 테이블
 
 ### 14.3 인터럽트 순간 정지시켜 LAPIC 찍기
 
+**`[driver]`** + **`[qemu]`** 재현 스크립트 — 인터럽트 도중 정지시켜 LAPIC 찍기
+
 ```bash
 # 터미널 A: 게스트 gdb
 gdb -q linux-6.1.4/vmlinux -ex 'target remote :1234'
@@ -1439,6 +1684,8 @@ python3 qmp.py qmp.sock '{"execute":"human-monitor-command",
 
 ### 14.4 런타임에 트레이스 이벤트 켜고 끄기 (부팅 로그 폭발 방지)
 
+**`[qemu]`** 재현 스크립트 — 트레이스 이벤트 런타임 on/off
+
 ```bash
 # APIC 이벤트는 타이머 틱까지 잡아서 매우 시끄럽다. 필요한 순간에만 켠다.
 python3 qmp.py qmp.sock \
@@ -1451,6 +1698,8 @@ python3 qmp.py qmp.sock \
 ```
 
 부팅부터 켜둘 이벤트는 `-trace events=<파일>`로 준다. 이번에 쓴 목록:
+
+**`[qemu]`** 부팅부터 켜둔 트레이스 이벤트 목록
 
 ```
 msix_write_config          pci_nvme_irq_msix           pci_nvme_irq_pin
@@ -1490,8 +1739,10 @@ x86 시스템 벡터 (`arch/x86/include/asm/irq_vectors.h`):
 
 트레이스 맨 앞을 보면 NVMe 컨트롤러가 **두 번** 초기화된다.
 
+**`[qemu]`** `-trace` — 컨트롤러가 두 번 초기화되는 구간
+
 ```
-2703859@1788926780.257175:pci_nvme_mmio_cfg wrote MMIO, config controller config=0x0
+[qemu·vCPU0] 2703859@1788926780.257175:pci_nvme_mmio_cfg wrote MMIO, config controller config=0x0
 2703859@1788926780.257767:pci_nvme_mmio_aqattr wrote MMIO, admin queue attributes=0xff003f
 2703859@1788926780.257802:pci_nvme_mmio_asqaddr ... =0x7ffdd000
 2703859@1788926780.257868:pci_nvme_mmio_cfg wrote MMIO, config controller config=0x460001
