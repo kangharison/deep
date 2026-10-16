@@ -82,7 +82,7 @@ NVMe에는 NIC의 PF↔VF 메일박스 같은 통지 채널이 없다. 그래서
 | 기능 | 위치 |
 |---|---|
 | 리셋 시 IRQ 해제 후 재할당 (새 테이블 크기를 다시 읽음) | `qemu-debug/linux-7.2/drivers/nvme/host/pci.c:3325`(disable), `:2893` `nvme_setup_irqs`, `:2944` `nvme_setup_io_queues` |
-| I/O 큐 수 = min(CPU 기반 요청, 컨트롤러 응답, 벡터-1) | `pci.c:2978`, `:3020` 부근 `max_qid = vecs-1 (+poll)` |
+| I/O 큐 수 = min(CPU 기반 요청, 컨트롤러 응답, 벡터-1) | `pci.c:2978`, `:3040` `max_qid = vecs-1 (+poll)` |
 | hctx 수 변경 | `pci.c:3168` `nvme_pci_update_nr_queues` → `blk_mq_update_nr_hw_queues` |
 | 리셋 중 진행 중 요청 → HOST_ABORTED → RETRY | `core.c:538` `nvme_cancel_request`, `core.c:403` `nvme_decide_disposition` |
 | multipath면 path error(0x371) → 다른 경로로 FAILOVER | `core.c:416`, `nvme.h:796`, `multipath.c:147` |
