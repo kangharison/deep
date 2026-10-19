@@ -478,6 +478,43 @@ remove를 없애기 위한 커널 개발 후보:
 - **K9. 부팅 시 IOV 과예약**: 커널 인자(예: `pci=sriov_reserve=<BDF>:<max_vfs>:<max_vf_bar>`)나 드라이버 quirk로 `sriov_init` 직후 IOV 리소스를 **최대 VF 수 × 최대 VF BAR**로 키운다. 그러면 `pci=realloc`이 그 크기로 상위 창(RP/스위치)을 잡는다. 선례: PowerNV는 PE 정렬 때문에 IOV 리소스를 `VF BAR × total_pe_num`으로 확장한다(`linux-7.2/arch/powerpc/platforms/powernv/pci-sriov.c:203`).
 - K8 + K9를 함께 쓰면 "부팅 때 최대치 예약 → 런타임에 장치 구성 변경 → 제자리 재판독 → VF 생성"이 **remove 없이** 닫힌다. 동적 자원(VQ/VI) 설계([[nvme-sriov-dynamic-resource-design]])와 합치면 NVMe SR-IOV 전체를 무중단 쪽으로 가져갈 수 있다.
 
+### 9.3.5 최대치를 커널에 어떻게 전달하나 (K9 구현 위치)
+
+**nvme 드라이버 안의 define이나 모듈 파라미터로는 늦다.** 실행 순서 때문이다.
+```
+pci_device_add()                                  linux-7.2/drivers/pci/probe.c:2726
+  ├ pci_fixup_device(pci_fixup_header)            :2746   헤더 quirk (sriov_init 전)
+  ├ pci_init_capabilities → pci_iov_init           :2663
+  │    └ sriov_init: TotalVFs 판독 → IOV 리소스 = VF BAR × TotalVFs   iov.c:827, :872
+  └ pcibios_device_add()                          :2760   아키텍처 훅 (PowerNV가 여기서 IOV 확장)
+fs_initcall(pcibios_assign_resources)             arch/x86/pci/i386.c:376   브리지 창 확정
+module_init(nvme_init) = device_initcall          drivers/nvme/host/pci.c:4330   nvme probe
+```
+nvme probe 시점에는 창이 이미 확정되어 사용 중이고, 사용 중인 창은 키울 수 없다(§9.3.4). 따라서 **`sriov_init` 직후, 브리지 sizing 전**에 개입해야 하고, 그 코드는 PCI 코어(또는 아키텍처 훅)에 있어야 한다.
+
+| 전달 방법 | 위치 | 장점 | 단점 |
+|---|---|---|---|
+| **A. 커널 인자** `pci=sriov_reserve=<BDF 또는 VID:DID>:<max_vfs>[:<max_vf_bar>]` | 파싱: `pci_setup()` (`drivers/pci/pci.c:6743`, `hpmmiosize=`·`resource_alignment=`와 같은 곳). 적용: `sriov_init` | 재빌드 없이 장비마다 조정, 실험에 적합 | 부트로더 설정 관리 필요 |
+| **B. 컴파일 타임 테이블 (define 성격)** VID:DID(+subsystem ID) → max_vfs/max_vf_bar | `drivers/pci/iov.c`(또는 `quirks.c`)의 정적 테이블을 `sriov_init`에서 조회. upstream이라면 IOV 전용 fixup 단계를 신설 | 제품군 고정이면 설정이 필요 없음 | 커널 재빌드, 제품마다 테이블 추가 |
+| C. 기존 fixup 매크로 (`DECLARE_PCI_FIXUP_HEADER/FINAL`) | `quirks.c` | 새 인프라 불필요 | HEADER는 `sriov_init` **전**이라 덮어써짐. FINAL은 x86 부팅에서는 할당 전에 돌지만, 핫애드나 rescan에서는 할당 **후**라 순서가 보장되지 않음 → 비권장 |
+| D. 아키텍처 훅 `pcibios_device_add` | `arch/*` (PowerNV 선례 `arch/powerpc/kernel/pci-common.c:1085`) | 타이밍이 정확함 | x86 공용 경로가 아님 |
+| E. 펌웨어 예약 | BIOS SR-IOV/MMIO 예약, ACPI, QEMU `mem-reserve` | 커널 수정 불필요 (§9.2 실측) | 펌웨어마다 다르고 세밀한 제어가 어려움 |
+| F. 장치가 처음부터 최대치를 보고 | SSD 펌웨어: TotalVFs·VF BAR를 항상 최대로 노출하고 실제 수는 NumVFs·virt-mgmt로 제어 | 커널 수정 불필요, 가장 깔끔 | 벤더 펌웨어에 의존 |
+
+A/B의 적용 스케치 (`sriov_init`, `iov.c:872` 부근):
+```c
+	iov->barsz[i] = resource_size(res);               /* 실제 VF BAR 크기 — VF 주소 계산용, 그대로 둔다 */
+	res_vfs = max(total, pci_sriov_reserve_vfs(dev)); /* A: 커널 인자, B: 정적 테이블 조회 */
+	res_bar = max(iov->barsz[i], pci_sriov_reserve_barsz(dev, i));
+	resource_set_size(res, res_bar * res_vfs);        /* 예약만 최대치로 키운다 */
+```
+- `iov->barsz[]`와 `iov->total_VFs`는 **실제 하드웨어 값**을 유지한다. VF 주소는 `시작 + i × barsz`로 계산되므로(`iov.c:377~379`) 예약만 크게 잡아도 지금 VF들은 정상이다.
+- `sriov_enable`의 검사 `vf_bar_sz * nr_virtfn > resource_size(res)`(`iov.c:685` 부근)는 큰 예약에서도 통과한다.
+- 버스 번호: `compute_max_vf_buses`(`iov.c:110`)도 TotalVFs 기준이다. 최대 VF 수가 다음 버스로 넘어갈 수 있는 장치라면 버스 예약도 같은 최대치로 계산해야 한다. QEMU NVMe처럼 ARI + Offset 1/Stride 1이면 255개까지 같은 버스에 있으므로 해당하지 않는다.
+- 이후 장치 구성이 커지면 K8(제자리 재판독)이 `total_VFs`/`barsz`를 이 예약 범위 안에서 갱신한다.
+
+QEMU 검증 방법: 장치 `sriov_max_vfs=64`, 커널 인자로 128을 예약 → `resource` 7번째 줄이 2MB가 아니라 4MB인지, `pci=realloc` 시 RP/스위치 창이 그만큼 커지는지, VF 64개 enable이 정상인지 확인한다. QEMU는 TotalVFs를 런타임에 바꿀 수 없으므로 K8은 QEMU 쪽에 테스트용 확장이 필요하다.
+
 ### 9.4 드라이버 설계에 주는 함의
 - 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
 - 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
