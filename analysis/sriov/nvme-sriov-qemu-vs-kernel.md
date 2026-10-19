@@ -300,6 +300,9 @@ nvme_probe (pci.c:3747) → nvme_pci_enable (:3193) → nvme_pci_configure_admin
 | Q2 | QEMU | VF의 OACS.VMS 광고 정리 (secondary는 VMS 비트 끄기) | `ctrl.c:9310` | 하 |
 | Q3 | QEMU | secondary 상태 변화 시 Async Event 등 호스트 통지 실험 (스펙 범위 확인 필요) | AER 경로 | 중 |
 | Q4 | QEMU | multi-PF SR-IOV: `ari-nextfn`, `sriov_vf_offset`/`sriov_vf_stride` 속성 — **구현·검증 완료**(qemu-dev `045e8fd98f`, §11.4.1~11.4.2) | `pcie.c:1238`, `ctrl.c:9180` | 하 |
+| Q5 | QEMU | NVM Subsystem Reset 에뮬레이션: `nssrs=on`이면 CAP.NSSRS 광고, NSSR 쓰기로 subsystem 전 컨트롤러 리셋 + CSTS.NSSRO — **구현·검증 완료**(qemu-dev `43e5e6baec`, §11.4.4). PCIe link-down은 미모델 | `ctrl.c:8257, 8379` | 하 |
+| K7 | 커널 nvme-pci/PCI | PF FLR 뒤 **VF 쪽 통지**: `pci_reset_function(PF)`는 PF 드라이버만 `reset_prepare/done`을 받아 VF의 config(command, MSI-X)가 조용히 0이 된다. PF `reset_done`에서 VF들을 reset/re-probe하거나 PCI 코어가 VF config도 저장·복원 (§11.4.4-5) | `nvme_reset_done` pci.c:3866, `pci_restore_iov_state` iov.c:1118 | 중 |
+| K8 | 커널 nvme core | NSSR 뒤 **같은 subsystem의 다른 컨트롤러 리셋 예약**: 지금은 ioctl을 낸 컨트롤러도 바로 LIVE로 돌아가고, 나머지는 각자 타임아웃이 나야 복구된다 (§11.4.4-4) | `nvme_pci_subsystem_reset` pci.c:1702, `nvme_should_reset` pci.c:1824 | 중 |
 | X1 | 양쪽 | K1+K4+Q1을 묶어 "VF 단위 자원·성능 격리"를 커널 정책으로 관리 | — | 상 |
 
 추천 출발점: **K1 → K4 → K2** 순. K1만으로도 "echo N > sriov_numvfs 한 번에 VF가 바로 쓸 수 있게 되는" 체감 변화가 있고, QEMU 수정 없이 검증 가능하다.
@@ -654,7 +657,127 @@ C의 RP·USP·DSP 창이 모두 3MB로 맞춰졌다. 창 크기는 **모든 PF�
 - 커널은 PF0의 VF가 Offline이 된 것을 **알아채지 못한다.** VF 드라이버 상태가 `live`로 남아 있다가 다음 I/O나 admin 명령에서야 실패한다 → K4(PF 리셋 후 재-Online)와 K5(VF Offline 인지)가 multi-PF에서도 PF 단위로 필요하다는 근거.
 
 #### 11.4.3 남은 한계
-- bus reset·NSSR처럼 **모든 PF에 걸치는 이벤트**는 아직 실험하지 않았다(다음 단계). QEMU의 NSSR은 subsystem의 모든 컨트롤러를 리셋하는지, secondary bus reset 시 두 PF의 secondary가 모두 Offline이 되는지 확인이 필요하다.
+- bus reset·NSSR·FLR처럼 **리셋 범위가 다른 이벤트**는 §11.4.4에서 실측했다. NSSR은 원래 QEMU가 지원하지 않아(CAP.NSSRS=0) Q5로 구현했지만, 실제 장치처럼 PCIe link가 내려가는 동작은 에뮬레이션하지 않는다.
 - QEMU는 TotalVFs·Offset·Stride를 장치 생성 시 고정한다. 스펙상 Offset/Stride는 NumVFs나 ARI Capable Hierarchy 비트에 따라 바뀔 수 있지만, 여기서는 상수다.
 - flexible 자원 풀은 PF별 독립이다(§11.2). PF 간 풀 공유는 에뮬레이션하지 않는다.
 
+#### 11.4.4 모든 PF에 걸치는 리셋 실측 — bus reset / NSSR / FLR
+**구성**: 시나리오 A(PF0 `03:00.0,ari-nextfn=64`, PF1 `03:08.0`, DSP `02:00.0`, 같은 `nvme-subsys`). 두 PF 모두 VF 2개 enable → 첫 secondary 2개에 VQ 2·VI 1 할당 + Online → VF를 nvme에 바인딩한 상태에서 시작한다. 이때 secondary는 PF0 SCID 1,2 / PF1 SCID 6,7이 Online이고, 커널 컨트롤러 6개(nvme0 PF0, nvme1 PF1, nvme2·3 PF0의 VF, nvme4·5 PF1의 VF)가 모두 `live`이다.
+
+**도구**: 게스트 init `deep/scripts/sriov/mpf-reset-init.sh`(커널 인자 `mpf_test=pfbus|sbr|sbrraw|nssr|flr`), 실행은 `run-mpf.sh A`에 `INITRD=irfs-rst.cpio.gz EXTRA="mpf_test=<시험> nvme_core.admin_timeout=10 nvme_core.io_timeout=10"`를 준다. NSSR은 `QPROP=",nssrs=on" QARGS="-trace pci_nvme_mmio_nssr"`를 더 준다. 각 시험은 따로 부팅하고 이벤트 뒤에 아래 순서로 본다.
+1. 5초 뒤 snapshot: 커널 컨트롤러 state, PF의 커널 `sriov_numvfs`, 장치 config(PF IOV Control `0x128`, NumVFs `0x130`, command), VF config(command, MSI-X Message Control).
+2. `nvme list-secondary`로 secondary 상태와 VQ/VI 할당을 본다.
+3. probe: 컨트롤러마다 admin Identify 1개를 보낸다. "다음 명령"이 들어올 때 커널이 무엇을 하는지 보려는 것이다.
+4. 15초 뒤 다시 snapshot을 찍는다.
+
+QEMU는 qemu-dev `43e5e6baec`(Q5, NSSR 에뮬레이션)이다.
+
+##### 결과 요약
+| 이벤트 | 트리거 | PF0 secondary | PF1 secondary | 장치 config | 커널이 아는 시점 | 최종 커널 상태 |
+|---|---|---|---|---|---|---|
+| PF `reset_method=bus` | `echo bus > 03:00.0/reset_method` | — | — | — | 쓰기 거부 `-EINVAL` | 변화 없음(아래 1) |
+| **SBR, 커널 조율** | `echo 1 > 02:00.0/reset_subordinate` | **Offline**, VQ/VI 0 | **Offline**, VQ/VI 0 | 커널이 저장·복원(IOV ctrl `0019`/`0009`, NumVFs 2) | 즉시(`reset_done`) | PF 2개 live, **VF 4개 dead** (0.2초 안) |
+| **SBR, 커널 모름** | DSP Bridge Control `0x0002→0x0042→0x0002` 직접 쓰기 | (PF가 죽어 조회 불가) | (조회 불가) | **두 PF 모두 command·IOV ctrl·NumVFs = 0, VF 4개 소멸**(config `ffff`) | 다음 admin 명령 타임아웃(10초) | **6개 모두 dead**, 커널 `sriov_numvfs`는 2로 남음 |
+| NSSR (기본 QEMU) | `nvme subsystem-reset /dev/nvme0` | — | — | — | `NVM Subsystem Reset not supported` (`-ENOTTY`) | 변화 없음 |
+| **NSSR (`nssrs=on`)** | 위와 같음 | **Offline**, VQ/VI 0 | **Offline**, VQ/VI 0 | 그대로(VF cmd `0406`, MSI-X `8000`) | 컨트롤러마다 자기 다음 명령이 타임아웃 났을 때 | PF 2개 live, **VF 4개 dead** |
+| **PF0 FLR** | `echo flr > reset_method; echo 1 > reset` | **Offline**, VQ/VI 0 | **Online 유지** | PF0 IOV는 복원, **PF0 VF의 cmd `0406→0000`, MSI-X `8000→0000`** / PF1 VF는 그대로 | PF0은 즉시, PF0의 VF는 다음 명령 타임아웃 | nvme0 live, **nvme2·3 dead**, PF1 쪽 3개 live |
+
+모든 경우에 공통인 점이 있다. **secondary가 Offline으로 바뀌면 QEMU는 그 secondary의 VQ/VI 할당을 0으로 되돌린다.** `nvme_virt_set_state(.., false)`가 `nvme_update_virt_res(.., 0)`을 부르기 때문이다(`qemu-11.1.2/hw/nvme/ctrl.c:7332`). 그래서 커널이 VF를 다시 살리려면 Online 전환만으로는 부족하고 **자원 재할당부터 다시** 해야 한다(K4 범위). 실제로 리셋된 VF는 커널의 재초기화 시점에 `CSTS=0x2`(CFS) 또는 `0x12`(CFS|NSSRO)를 보이고, `Device not ready; aborting initialisation` → `Disabling device after reset failure: -19`를 거쳐 `dead`가 된다(`drivers/nvme/host/pci.c:3487`).
+
+##### 1. PF `reset_method=bus` — 커널이 거부
+```
+before: PF0 reset_method: flr bus
+echo bus > reset_method  → nvme 0000:03:00.0: Unsupported reset method 'bus'   (write error: Invalid argument)
+```
+`pci_parent_bus_reset`(`drivers/pci/pci.c:4865`)은 **버스에 자기 말고 다른 장치가 하나라도 있으면** `-ENOTTY`를 돌려준다. multi-PF에서는 PF1과 VF들이 같은 버스에 있으므로 PF 단위 bus reset은 성립하지 않는다. 그런데 `reset_method`는 처음에 `flr bus`를 보였다. 리셋 방법 목록은 장치를 추가할 때 한 번만 probe되는데, 그때는 PF0이 버스에 혼자였기 때문이다. 이 목록이 PF1·VF가 추가된 뒤에도 갱신되지 않고 남은 것이다. 이후 `echo 1 > reset`은 목록 첫 항목인 FLR로 수행되어 결과가 아래 5와 같았다.
+
+##### 2. DSP `reset_subordinate` — 커널이 조율하는 SBR
+```
+DSP reset_subordinate rc=0
+nvme0: 4/0/0 default/read/poll queues            ← PF0 reset_done → 재초기화 성공
+nvme1: 4/0/0 default/read/poll queues            ← PF1 동일
+nvme2..5: Device not ready; aborting initialisation, CSTS=0x2
+nvme2..5: Disabling device after reset failure: -19
+secondary PF0: 1 Offline q0 i0 | 2 Offline q0 i0 ...   PF1: 6 Offline q0 i0 | 7 Offline q0 i0 ...
+```
+- QEMU 쪽 경로는 다음과 같다. Bridge Control의 SBR 비트가 0→1로 바뀌면 `bus_cold_reset(sec_bus)`가 실행된다(`hw/pci/pci_bridge.c:276`). 그 결과 버스 아래 모든 함수가 리셋된다. PF마다 `nvme_pci_reset` → `nvme_ctrl_reset(FUNCTION)`이 돌아 자기 secondary를 모두 Offline으로 만들고, `pcie_sriov_pf_reset`이 VF Enable·NumVFs를 0으로 만들어 VF를 해제한다(`hw/pci/pcie_sriov.c:446`). **두 PF의 secondary가 모두 Offline**이 되는 것이 확인됐다.
+- 커널 쪽 경로는 `pci_try_reset_bridge`(`drivers/pci/pci.c:5691`)이다. 버스 아래 모든 장치(PF와 VF 모두)에 대해 config 저장 → `reset_prepare` → SBR → config 복원 → `reset_done` 순으로 진행한다. PF의 IOV 상태는 `pci_restore_iov_state`(`drivers/pci/iov.c:1118`)가 되살리므로 VF가 다시 생기고 VF의 config도 복원된다. 이후 6개 컨트롤러 모두 `nvme_reset_done`(`pci.c:3866`)에서 재초기화된다. 결과는 PF는 성공, VF는 secondary가 Offline이라 CFS로 실패이다.
+- 커널은 리셋을 직접 일으켰으므로 **즉시** 알고, 타임아웃을 기다리지 않는다. 그래도 VF를 살리지 못한다. 재초기화 순서를 보면 PF가 먼저 live가 되지만 PF 드라이버가 secondary를 다시 Online으로 돌리는 경로가 없기 때문이다. K4가 있으면 이 경우는 바로 해결된다. PF의 `reset_done`이 VF의 `reset_done`보다 먼저 끝난다는 보장이 필요하다.
+
+##### 3. Bridge Control 직접 쓰기 — 커널이 모르는 SBR
+```
+DSP 0000:02:00.0 Bridge Control=0x0002, raw SBR (bit6): set -> 0x0042, clear -> 0x0002
+after +5s: nvme0..5 state=live (6개 모두)
+  PF 03:00.0: kernel numvfs=2 | dev IOV ctrl=0000 NumVFs=0000 cmd=0000
+  PF 03:08.0: kernel numvfs=2 | dev IOV ctrl=0000 NumVFs=0000 cmd=0000
+  VF 03:00.1/.2, 03:08.1/.2: config 읽기 ffff (함수 없음)
+nvme0: I/O tag 18 opcode 0x6 (Admin Cmd) QID 0 timeout, reset controller
+nvme0: enabling device (0000 -> 0002)
+nvme0: Device not ready; aborting initialisation, CSTS=0x0
+nvme2..5: Unable to change power state from D3cold to D0, device inaccessible → Disabling device after reset failure: -22
+```
+- 커널이 저장·복원을 하지 않으므로 SBR 뒤에는 장치가 리셋 직후 상태 그대로다. PF BAR, command, SR-IOV가 모두 0이고 VF는 존재하지 않는다. 반면 커널 자료구조는 VF 2개 × 2, 컨트롤러 6개 `live`로 남는다.
+- 복구 경로를 보면, PF는 admin 타임아웃 → `nvme_reset_work` → `pci_enable_device`가 command의 memory 비트만 켠다. BAR는 0으로 남으므로 CSTS를 0으로 읽고 dead가 된다. VF는 config 접근 자체가 실패해 D3cold로 판정되고 dead가 된다.
+- **6개 모두 dead**이며 PF 자체도 살아나지 않는다. 실제 하드웨어에서는 이런 경우를 link-down/AER(Advanced Error Reporting)/DPC(Downstream Port Containment)가 감지해 `pci_error_handlers` 경로로 처리한다. QEMU의 xio3130 DSP는 SBR로 그런 이벤트를 만들지 않으므로 이 실험은 "알림 없는 리셋"의 최악 사례에 해당한다.
+
+##### 4. NSSR — QEMU 미지원 → Q5 구현 후 실측
+**기본 QEMU**는 CAP.NSSRS=0이다. 커널은 `ctrl->subsystem = NVME_CAP_NSSRC(cap)`(`core.c:3749`)가 0이므로 `nvme_reset_subsystem`(`nvme.h:747`)에서 `-ENOTTY`를 돌려주고, nvme-cli는 `NVM Subsystem Reset not supported`를 출력한다. 장치에는 아무 일도 없다. 원래 QEMU는 NSSR 레지스터 쓰기를 받아도 trace만 남겼다.
+
+**Q5 (qemu-dev `43e5e6baec`)**:
+| 변경 | 내용 | 위치 |
+|---|---|---|
+| `nssrs=<bool>` | 기본 off. on이면 CAP.NSSRS=1 (VF는 PF params를 복사하므로 VF도 광고) | `hw/nvme/ctrl.c:9452, 9863` |
+| NSSR 쓰기 | 값이 `0x4e564d65`("NVMe")이고 NSSRS이면 `nvme_subsys_reset` 호출. subsystem의 `ctrls[]`에 등록된 **모든 컨트롤러**(PF, VF)에 대해 `nvme_ctrl_reset(FUNCTION)` 후 CSTS.NSSRO=1 | `ctrl.c:8257, 8379` |
+| CSTS.NSSRO | 컨트롤러 리셋(CC.EN 1→0, FLR)이 일어나도 유지되고 호스트가 1을 써야만 지워진다(W1C) | `ctrl.c:8040, 8362` |
+| 미모델 | 실제 장치에서 NSSR이 일으키는 PCIe link-down. config(BAR, MSI-X, NumVFs)는 그대로 둔다 | — |
+
+```
+nvme subsystem-reset /dev/nvme0 → rc=0
+pci_nvme_mmio_nssr NVM subsystem reset by cntlid 0, 10 controllers reset
+after +5s: nvme0..5 state=live (6개 모두), VF cmd 0406 / MSI-X 8000 그대로
+[22.7] nvme0: controller is down; will reset: CSTS=0x10, PCI_STATUS=0x10   → 4/0/0 queues (복구)
+[33.0] nvme1: controller is down; will reset: CSTS=0x10                   → 복구
+[43.2] nvme2: controller is down; will reset: CSTS=0x12 → Device not ready, CSTS=0x12 → dead
+[53.3] nvme3 / [63.5] nvme4 / [73.6] nvme5: 같은 경로로 dead
+secondary PF0: 1..4 Offline q0 i0   PF1: 6..9 Offline q0 i0
+```
+- **QEMU NSSR 범위**: `10 controllers reset` = PF 2개 + VF 객체 8개(PF마다 TotalVFs=4만큼 미리 realize되어 subsystem에 등록되어 있다). 두 PF의 secondary가 **모두 Offline**이 되었다. 즉 NSSR은 PCI 위치와 관계없이 **subsystem 단위**로 퍼진다. 코드가 `subsys->ctrls[]`만 순회하므로 다른 DSP 아래 PF가 같은 subsystem에 있어도 같이 리셋될 것이다(미실측).
+- **커널 경로**: `nvme_pci_subsystem_reset`(`pci.c:1702`)은 RESETTING → NSSR 쓰기 → CONNECTING → LIVE로 상태만 한 바퀴 돌린 뒤 CSTS를 한 번 읽는다. 주석에 적힌 의도는 "pcie read error 유발"이다. 실제 장치라면 link-down으로 이 읽기가 실패하고 AER/DPC 복구가 시작된다. QEMU에는 link-down이 없으므로 읽기는 정상 값(`0x10`)을 돌려주고 ioctl을 낸 컨트롤러도 **바로 live로 돌아온다.**
+- 그 뒤에는 **컨트롤러마다 자기 다음 명령이 타임아웃 나야** `nvme_should_reset`(`pci.c:1824`)이 CSTS.NSSRO를 보고 리셋한다. 여기서는 snapshot의 `list-secondary`와 probe가 컨트롤러에 명령을 하나씩 순서대로 보냈고 `admin_timeout=10`이라 10초 간격으로 처리됐다. 명령이 가지 않는 idle 컨트롤러는 **계속 `live`인 줄 알고 남는다.** I/O가 걸려 있는 경로는 기본 `io_timeout` 30초 동안 멈춘 뒤에야 복구에 들어간다. PF1은 PF0과 같은 subsystem인데도 **커널 쪽에서 subsystem 단위로 묶어 처리하는 로직이 없다**(K8).
+- VF는 CSTS=`0x12`(CFS|NSSRO)로 끝나 dead가 된다. 이유는 SBR과 같다(secondary Offline + VQ/VI 0).
+
+##### 5. PF0 FLR — PF0과 그 VF만
+```
+PF0 reset_method=flr → reset rc=0
+nvme0: 4/0/0 default/read/poll queues     ← PF0만 reset_prepare/done
+after +5s: nvme0..5 state=live
+  PF 03:00.0: dev IOV ctrl=0019 NumVFs=0002            ← 커널이 복원
+    VF 03:00.1/.2: cmd=0000 msix ctrl=0000              ← VF 자신의 config는 복원되지 않음
+  PF 03:08.0: IOV ctrl=0009 NumVFs=0002
+    VF 03:08.1/.2: cmd=0406 msix ctrl=8000              ← 영향 없음
+secondary PF0: 1 Offline q0 i0 | 2 Offline q0 i0   PF1: 6 Online q2 i1 | 7 Online q2 i1
+[24.3] nvme2: Admin Cmd timeout, reset controller → Device not ready, CSTS=0x2 → dead
+[34.4] nvme3: 같은 경로로 dead
+nvme4, nvme5 (PF1의 VF): cntlid 6, 7 정상 응답
+```
+- QEMU 쪽: FLR 비트 쓰기 → `pcie_cap_flr_write_config` → `pci_device_reset(PF0)`(`hw/pci/pcie.c:959`)가 실행된다. 리셋은 `nvme_pci_reset`(`ctrl.c:9919`)과 `pcie_sriov_pf_reset`(VF 해제)으로 이어진다. 범위는 **PF0과 PF0의 VF뿐**이고 PF1 secondary는 Online과 할당(q2 i1)을 그대로 유지한다. §11.4.2의 `nvme reset`(CC.EN 기반 Controller Reset)과 secondary 영향 범위는 같다. 차이는 FLR이 PCI 계층까지 리셋하므로 **VF의 PCI 함수도 해제·재생성된다**는 점이다.
+- 커널 쪽: `pci_reset_function(PF0)`은 **PF0 하나만** 저장·복원한다. PF0의 IOV 상태 복원으로 VF가 다시 생기지만 **VF 드라이버는 `reset_prepare/done`을 받지 않는다.** 그 결과 VF의 command(memory/bus master)와 MSI-X Enable이 0인 채로 남는다. VF 컨트롤러는 `live`로 보이지만 인터럽트도 MMIO 디코드도 꺼져 있다. 다음 명령이 타임아웃 난 뒤에야 `nvme_reset_work`가 `pci_enable_device`로 config를 다시 세운다. 그런데 이번에는 secondary Offline 때문에 CFS가 나서 dead가 된다.
+- 즉 PF FLR 뒤 VF가 다시 쓸 수 있게 되려면 두 가지가 모두 필요하다. (a) VF PCI 상태 재설정(K7), (b) secondary 재할당·Online(K4).
+
+##### 부수 관찰: ARI Capable Hierarchy는 PF0에만
+PF0의 IOV Control은 `0x0019`(VF Enable | VF MSE | ARI Capable Hierarchy), PF1은 `0x0009`로 ARI 비트가 없다. 커널 `sriov_init`(`drivers/pci/iov.c:815~825`)은 같은 버스에 SR-IOV PF가 이미 있으면 그 PF를 따라가고 ARI 비트를 새로 켜지 않는다. 그래서 첫 PF만 ARI Capable Hierarchy를 켠다. 스펙도 이 비트는 가장 낮은 번호의 PF에서만 의미가 있다고 정한다. QEMU는 PF마다 이 비트를 쓸 수 있게(`wmask`) 두지만 Offset/Stride가 고정이라 결과에는 차이가 없다.
+
+##### 정리 — 리셋 범위 행렬
+```
+                         QEMU에서 Offline 되는 secondary     커널이 아는가     커널 최종 상태 (VF)
+PF Controller Reset      PF 자신 것만                        모름 (VF는 live)   다음 명령에서 dead      (§11.4.2)
+PF FLR                   PF 자신 것만 + VF PCI 함수 재생성     PF만 앎            다음 명령에서 dead      (5)
+PF bus reset             —                                   커널이 거부         —                       (1)
+DSP SBR (조율)            모든 PF                              전부 앎            즉시 dead               (2)
+DSP SBR (raw)             모든 PF + PF config 소실              모름               PF 포함 전부 dead        (3)
+NSSR                     subsystem 전체 (PCI 위치 무관)         ioctl 주체만 잠깐   PF는 복구, VF는 dead,
+                                                                                  컨트롤러마다 타임아웃 하나씩 (4)
+```
+결론적으로 **어떤 리셋이든 VF가 살아남는 경우는 없다.** 지금 커널은 "secondary가 Offline이 되었다"는 사실을 VF의 CFS로만 간접 확인하고 그 시점에 포기한다. multi-PF에서는 리셋 범위가 PF 하나(FLR, Controller Reset), 버스(SBR), subsystem(NSSR)으로 다르므로, 커널 측 복구도 같은 단위로 설계해야 한다.
+- PF 단위: K4(자원 재할당 + Online)와 K7(VF PCI 재설정).
+- subsystem 단위: K8(같은 subsystem의 컨트롤러 일괄 리셋 예약)과, 그 뒤에 PF마다 K4.
