@@ -496,7 +496,7 @@ nvme probe 시점에는 창이 이미 확정되어 사용 중이고, 사용 중�
 |---|---|---|---|
 | **A. 커널 인자** `pci=sriov_reserve=<BDF 또는 VID:DID>:<max_vfs>[:<max_vf_bar>]` | 파싱: `pci_setup()` (`drivers/pci/pci.c:6743`, `hpmmiosize=`·`resource_alignment=`와 같은 곳). 적용: `sriov_init` | 재빌드 없이 장비마다 조정, 실험에 적합 | 부트로더 설정 관리 필요 |
 | **B. 컴파일 타임 테이블 (define 성격)** VID:DID(+subsystem ID) → max_vfs/max_vf_bar | `drivers/pci/iov.c`(또는 `quirks.c`)의 정적 테이블을 `sriov_init`에서 조회. upstream이라면 IOV 전용 fixup 단계를 신설 | 제품군 고정이면 설정이 필요 없음 | 커널 재빌드, 제품마다 테이블 추가 |
-| C. 기존 fixup 매크로 (`DECLARE_PCI_FIXUP_HEADER/FINAL`) | `quirks.c` | 새 인프라 불필요 | HEADER는 `sriov_init` **전**이라 덮어써짐. FINAL은 x86 부팅에서는 할당 전에 돌지만, 핫애드나 rescan에서는 할당 **후**라 순서가 보장되지 않음 → 비권장 |
+| C. 기존 fixup 매크로 (`DECLARE_PCI_FIXUP_HEADER/FINAL`) | `quirks.c` | 새 인프라 불필요 | HEADER는 `sriov_init` **전**이라 덮어써짐. FINAL은 x86 부팅에서는 할당 전에 돌지만, 핫애드나 rescan에서는 할당 **후**라 순서가 보장되지 않음(`drivers/acpi/pci_root.c:739~756`) → 비권장 |
 | D. 아키텍처 훅 `pcibios_device_add` | `arch/*` (PowerNV 선례 `arch/powerpc/kernel/pci-common.c:1085`) | 타이밍이 정확함 | x86 공용 경로가 아님 |
 | E. 펌웨어 예약 | BIOS SR-IOV/MMIO 예약, ACPI, QEMU `mem-reserve` | 커널 수정 불필요 (§9.2 실측) | 펌웨어마다 다르고 세밀한 제어가 어려움 |
 | F. 장치가 처음부터 최대치를 보고 | SSD 펌웨어: TotalVFs·VF BAR를 항상 최대로 노출하고 실제 수는 NumVFs·virt-mgmt로 제어 | 커널 수정 불필요, 가장 깔끔 | 벤더 펌웨어에 의존 |
