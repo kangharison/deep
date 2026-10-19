@@ -299,6 +299,7 @@ nvme_probe (pci.c:3747) → nvme_pci_enable (:3193) → nvme_pci_configure_admin
 | Q1 | QEMU | VF별 QoS: secondary마다 IOPS/BW 한도(throttle-group 연동) 또는 SQ 중재(WRR/우선순위) — 커널 측 격리 실험의 기반 | `nvme_process_sq` 계열 | 중상 |
 | Q2 | QEMU | VF의 OACS.VMS 광고 정리 (secondary는 VMS 비트 끄기) | `ctrl.c:9310` | 하 |
 | Q3 | QEMU | secondary 상태 변화 시 Async Event 등 호스트 통지 실험 (스펙 범위 확인 필요) | AER 경로 | 중 |
+| Q4 | QEMU | multi-PF SR-IOV: `ari-nextfn`, `sriov_vf_offset`/`sriov_vf_stride` 속성 — **구현·검증 완료**(qemu-dev `045e8fd98f`, §11.4.1~11.4.2) | `pcie.c:1238`, `ctrl.c:9180` | 하 |
 | X1 | 양쪽 | K1+K4+Q1을 묶어 "VF 단위 자원·성능 격리"를 커널 정책으로 관리 | — | 상 |
 
 추천 출발점: **K1 → K4 → K2** 순. K1만으로도 "echo N > sriov_numvfs 한 번에 VF가 바로 쓸 수 있게 되는" 체감 변화가 있고, QEMU 수정 없이 검증 가능하다.
@@ -584,3 +585,76 @@ Multi-PF = 한 장치(같은 버스·같은 상위 브리지 창)에 PF가 여�
 - 결과: 게스트 커널에 **PF0(03:00.0)과 그 VF(03:00.1~)만 보이고 PF1(03:08.0)은 열거되지 않음.**
 - 원인: QEMU `pcie_ari_init`이 ARI Next Function Number를 0으로 고정한다(`qemu-11.1.2/hw/pci/pcie.c:1227`, 호환용 플래그일 때만 1). 커널의 `next_ari_fn`은 사슬이 끝난 것으로 판단한다.
 - QEMU 개발 후보 **Q4**: NVMe에 ARI next-function 지정(PF0 → PF1 사슬)과 VF Offset/Stride 설정 속성을 추가해 진짜 multi-PF SR-IOV를 에뮬레이션한다. 현재는 `NVME_VF_OFFSET 1`/`STRIDE 1` 고정(`hw/nvme/ctrl.c:231~233`)이라 PF0의 VF와 PF1 번호가 겹치지 않도록 PF1을 멀리 배치해야 한다. 대안으로 PF를 서로 다른 downstream 포트에 두면 "같은 subsystem의 별개 장치"가 되므로 NVMe 계층 실험(리셋 범위, cntlid, multipath)은 가능하지만 PCI 계층(같은 창, ARI 사슬)은 재현되지 않는다.
+
+#### 11.4.1 Q4 구현 — `ari-nextfn`, `sriov_vf_offset`, `sriov_vf_stride` (qemu-dev `045e8fd98f`)
+| 변경 | 내용 | 위치 |
+|---|---|---|
+| PCIe 공통 | `pcie_ari_init_nextfn(dev, offset, nextfn)` 추가. 기존 `pcie_ari_init`은 이 함수를 0(또는 호환 플래그 시 1)로 호출하므로 다른 장치 동작은 그대로 | `qemu-11.1.2/hw/pci/pcie.c:1225, 1238` |
+| `ari-nextfn=<ARI fn>` | PF의 ARI Next Function Number. 기본 0 = 사슬 끝. `sriov_max_vfs` 필수, 자기 ARI 함수 번호(=devfn)보다 커야 함. VF는 PF params를 복사하지만 항상 0을 광고(VF는 Offset/Stride로 찾으므로 필드 미사용) | `hw/nvme/ctrl.c:8830~8858, 9180` |
+| `sriov_vf_offset` / `sriov_vf_stride` | SR-IOV cap의 First VF Offset / VF Stride. 기본 1/1(기존 `NVME_VF_OFFSET`/`NVME_VF_STRIDE` 대체). offset 0, (VF>1일 때) stride 0은 거부 | `hw/nvme/ctrl.c:8842~8851, 9097` |
+| 겹침/범위 검사 | 새로 만들지 않고 기존 두 검사를 그대로 씀: `pcie_sriov_pf_init_common`의 `VF addr overflows`(마지막 VF devfn ≥ 256), QEMU 버스의 slot 점유 검사(`PCI: slot 0 function 1 not available for nvme, in use by nvme`) | `hw/pci/pcie_sriov.c:108` |
+
+ARI 함수 번호는 8비트 devfn 그대로다. `addr=0x8.0` → ARI fn 64, `addr=0x10.0` → 128, `addr=0x0.1` → 1. VF n의 RID = PF devfn + offset + n×stride.
+
+거부 실측:
+```
+nvme,...,ari-nextfn=8 (sriov 없음)        → ari-nextfn requires sriov_max_vfs
+sriov_vf_offset=0                         → sriov_vf_offset must be non-zero
+sriov_vf_stride=0 (sriov_max_vfs=2)       → sriov_vf_stride must be non-zero when sriov_max_vfs > 1
+addr=0x0.2,ari-nextfn=1                   → ari-nextfn must be greater than this function's ARI function number
+offset=200,stride=60 (VF 2개)             → VF addr overflows
+PF0 0x0.0(기본 1/1, VF 4개) + PF1 0x0.1    → PCI: slot 0 function 1 not available for nvme, in use by nvme
+```
+마지막 경우는 PF0의 VF0이 devfn 1을 먼저 점유했기 때문이다. QEMU는 VF 객체를 PF realize 때 미리 만들기 때문에 겹침이 장치 생성 시점에 드러난다.
+
+#### 11.4.2 게스트 실측 (linux-7.2, Q4 적용 후)
+공통 구성: q35, `pcie-root-port(hotplug=off)` → `x3130-upstream` → `xio3130-downstream(hotplug=off)`, `nvme-subsys` 하나, 두 PF 모두 `serial=mpf0`, PF마다 namespace 1개(nsid 1, 2), 커널 인자 `pci=realloc`. 스크립트: `deep/scripts/sriov/run-mpf.sh`(A/B/C/BAD), 게스트 init `deep/scripts/sriov/mpf-init.sh`(nvme-cli 2.8 irfs 복사본). 게스트 동작: 두 PF 모두 `sriov_drivers_autoprobe=0` → `sriov_numvfs` → 첫 secondary 2개에 virt-mgmt(VQ 2, VI 1, Online) → VF 2개를 `driver_override=nvme`로 바인딩 → PF0 `nvme reset`.
+
+| 시나리오 | PF0 / PF1 속성 | 열거 결과 | VF RID |
+|---|---|---|---|
+| **A** (원래 문제 구성) | PF0 `addr=0x0.0,ari-nextfn=64` / PF1 `addr=0x8.0` (기본 offset/stride) | **03:00.0, 03:08.0 둘 다 열거** (Q4 전에는 03:08.0 없음) | PF0 → 03:00.1, .2 / PF1 → 03:08.1, .2 |
+| **B** (조밀 배치) | PF0 `0x0.0,ari-nextfn=1,offset=2,stride=2` / PF1 `0x0.1,offset=2,stride=2` | 03:00.0, 03:00.1 | PF0 → 03:00.2, .4 / PF1 → 03:00.3, .5 (교차) |
+| **C** (창 합산) | PF0 `0x0.0,ari-nextfn=128` / PF1 `0x10.0`, 각 `sriov_max_vfs=64` | 03:00.0, 03:10.0 | 각 PF **64개 enable 성공** |
+
+PF별 sysfs와 config (A):
+```
+PF 03:00.0 (nvme1): totalvfs=4 offset=1 stride=1 vf_device=10
+  ARI cap@0x100: hdr=1201000e (ID 0x0e, ver 1, next cap 0x120=SR-IOV)  cap=4000 → NFN=0x40(64)
+  resource 8번째 줄(IOV BAR0): 0xfe808000-0xfe817fff (64KB = 16KB × 4)
+PF 03:08.0 (nvme0): totalvfs=4 offset=1 stride=1
+  ARI cap=0000 → NFN=0 (사슬 끝, 기본값 유지 확인)
+  resource 8번째 줄: 0xfe818000-0xfe827fff (64KB)
+```
+B는 PF0 `cap=0100`(NFN=1), PF1 `cap=0000`, 두 PF 모두 `offset=2 stride=2`. C는 PF0 `cap=8000`(NFN=128).
+
+cntlid / secondary (A, B 동일):
+```
+nvme1 03:00.0 cntlid=0   (PF0)  secondary SCID 1,2,3,4 (VFN 1~4)
+nvme2 03:00.1 cntlid=1   nvme3 03:00.2 cntlid=2
+nvme0 03:08.0 cntlid=5   (PF1)  secondary SCID 6,7,8,9
+nvme4 03:08.1 cntlid=6   nvme5 03:08.2 cntlid=7
+```
+QEMU subsystem이 PF마다 "자기 cntlid + VF 수"를 연속 예약하는 것(§11.2)이 그대로 보인다. C에서는 PF1 cntlid=65, SCID 0x42~0x81. namespace는 공유되어 `/dev/nvme0n1`, `/dev/nvme0n2` 두 개만 생기고(multipath head), 6개 컨트롤러가 경로가 된다.
+
+**DSP 창이 두 PF의 IOV 합을 담는지:**
+| 시나리오 | IOV 합 | DSP(02:00.0) mem 창 | 배치 |
+|---|---|---|---|
+| A/B (VF 4개 × 16KB × 2 PF) | 128KB + PF BAR 2×16KB | `fe800000-fe9fffff`(2MB, 펌웨어 기본 그대로) | PF0 BAR, PF1 BAR, PF0 IOV, PF1 IOV 순으로 한 창 안 |
+| **C** (VF 64개 × 16KB × 2 PF) | **2MB** + PF BAR 2×16KB | 펌웨어 2MB 창 부족 → `pci=realloc` 4번째 시도(`max bus depth: 3 pci_try_num: 4`)에서 **`50000000-502fffff`(3MB)** | `50000000` PF0 BAR / `50004000-50103fff` PF0 IOV(1MB) / `50104000` PF1 BAR / `50108000-50207fff` PF1 IOV(1MB) |
+C의 RP·USP·DSP 창이 모두 3MB로 맞춰졌다. 창 크기는 **모든 PF의 TotalVFs 기준 IOV 합 + PF BAR**을 1MB 단위로 올린 값이고, 중간 시도에서 `VF BAR 0 [mem size 0x00100000]: can't assign; no space`가 두 PF 모두에 대해 찍힌 뒤 최종 성공한다. 즉 §11.3-2의 "상위 창 크기는 모든 PF 예약의 합"이 실측으로 확인됐다.
+
+**PF0 `nvme reset` 영향 (A, B, C 동일):**
+| | 리셋 전 | PF0 리셋 후 |
+|---|---|---|
+| PF0 secondary (SCID 1,2) | Online | **Offline** |
+| PF1 secondary (SCID 6,7 / C는 0x42,0x43) | Online | **Online 유지** |
+| 커널 컨트롤러 state (nvme2/3 = PF0의 VF) | live | **live로 남음** |
+
+- PF 컨트롤러 리셋은 그 PF의 secondary만 Offline으로 만든다(QEMU `ctrl.c:8073`은 자기 `sec_ctrl_list`만 순회). 같은 장치·같은 subsystem의 다른 PF는 영향 없다.
+- 커널은 PF0의 VF가 Offline이 된 것을 **알아채지 못한다.** VF 드라이버 상태가 `live`로 남아 있다가 다음 I/O나 admin 명령에서야 실패한다 → K4(PF 리셋 후 재-Online)와 K5(VF Offline 인지)가 multi-PF에서도 PF 단위로 필요하다는 근거.
+
+#### 11.4.3 남은 한계
+- bus reset·NSSR처럼 **모든 PF에 걸치는 이벤트**는 아직 실험하지 않았다(다음 단계). QEMU의 NSSR은 subsystem의 모든 컨트롤러를 리셋하는지, secondary bus reset 시 두 PF의 secondary가 모두 Offline이 되는지 확인이 필요하다.
+- QEMU는 TotalVFs·Offset·Stride를 장치 생성 시 고정한다. 스펙상 Offset/Stride는 NumVFs나 ARI Capable Hierarchy 비트에 따라 바뀔 수 있지만, 여기서는 상수다.
+- flexible 자원 풀은 PF별 독립이다(§11.2). PF 간 풀 공유는 에뮬레이션하지 않는다.
+
