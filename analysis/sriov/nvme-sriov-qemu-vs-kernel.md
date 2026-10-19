@@ -543,3 +543,44 @@ QEMU 검증 방법: 장치 `sriov_max_vfs=64`, 커널 인자로 128을 예약 �
 ### 10.3 정리
 - user space 드라이버로 바꿔도 **"remove 없이 VF 늘리기"의 전제(부팅 시 최대치 예약)는 그대로**다. 오히려 VF 생성이 반드시 커널 `pci_enable_sriov`를 거치므로 커널 쪽 K8/K9가 user space 사용자에게도 필요하다.
 - 동적 VQ/VI 측면에서는 SPDK가 polling 덕분에 VI 문제를 피하고 재연결 정책으로 자가 복구(P3)에 유리하다. 반면 VQ 증가는 재-attach 없이는 반영하지 못한다. 커널은 정반대 성향이다(VQ 증가는 자동 반영, 복구 정책은 약함).
+
+---
+
+## 11. Multi-PF 장치
+
+Multi-PF = 한 장치(같은 버스·같은 상위 브리지 창)에 PF가 여러 개 있고, PF마다 자기 SR-IOV capability(TotalVFs, VF Offset/Stride, VF BAR)와 NVMe primary controller를 가진 구성이다. 듀얼 포트 SSD처럼 PF마다 다른 호스트에 연결되는 경우도 있다.
+
+### 11.1 PCI 계층
+| 항목 | 동작 | 근거 |
+|---|---|---|
+| PF 발견 | ARI가 켜진 포트 아래에서는 커널이 **PF0 ARI capability의 Next Function Number 사슬**을 따라 PF를 찾는다. VF는 이 사슬에 없다 | `linux-7.2/drivers/pci/probe.c:2798` `next_ari_fn` |
+| ARI Capable Hierarchy | 첫 PF만 설정하고, 이후 PF는 기존 PF를 찾으면 ARI 비트 없이 쓴다(스펙상 가장 낮은 번호 PF에서만 유효) | `iov.c:815~823` |
+| IOV 공간 | **PF마다 따로** `VF BAR × TotalVFs`를 잡지만 모두 **같은 상위 브리지 창** 안에 있어야 한다 → 필요량 = Σ(PF BAR) + Σ(PF별 VF BAR × TotalVFs) | `iov.c:872` |
+| VF RID/버스 | PF별 VF = PF RID + Offset + n×Stride. PF끼리 겹치지 않게 Offset을 정하는 것은 장치의 책임이다. 커널은 같은 버스 PF들의 최대 VF 버스 수로 버스 범위를 예약한다 | `iov.c:1144` `pci_iov_bus_range`, `:110` |
+| Function Dependency Link | PF끼리 의존 관계면 `dep_link` sysfs를 만들고, 대상이 PF인지만 확인한다 | `iov.c:705~719` |
+| PF 하나만 bus reset | **불가.** 같은 버스에 다른 함수(다른 PF 또는 활성 VF)가 있으면 `pci_parent_bus_reset`이 `-ENOTTY` → PF 단위 리셋은 FLR에 의존한다. bus reset은 모든 PF와 VF를 함께 리셋한다 | `linux-7.2/drivers/pci/pci.c:4873` |
+
+### 11.2 NVMe 계층
+- PF마다 별도의 primary controller다. flexible 자원 풀(CNS 0x14)과 secondary 목록(CNS 0x15)이 PF별로 독립이고, virt-mgmt의 CNTLID도 자기 secondary만 대상으로 한다(QEMU `nvme_sctrl_for_cntlid`는 자기 `sec_ctrl_list`만 검색).
+- 같은 NVM subsystem을 공유하면 cntlid 공간과 namespace를 공유한다. QEMU는 PF마다 자기 뒤에 VF 수만큼 cntlid를 연속 예약한다(`hw/nvme/subsys.c:60~96`). 그래서 shared namespace는 PF와 VF 전부에서 multipath 경로가 된다. QEMU 실측: subsystem 안 컨트롤러는 serial이 같아야 한다(다르면 `invalid controller serial`).
+- 리셋 범위:
+  | 리셋 | 영향 |
+  |---|---|
+  | PF 컨트롤러 리셋(CC.EN) / PF FLR | 그 PF의 secondary만 Offline (QEMU `ctrl.c:8073`은 자기 목록만 순회). 실측: PF0 `nvme reset` → PF0의 SCID 1,2가 Offline |
+  | 링크 / secondary bus reset, AER fatal 복구 | 장치의 **모든 PF와 모든 VF** |
+  | NVM Subsystem Reset (NSSR) | subsystem의 모든 컨트롤러(모든 PF와 VF) |
+
+### 11.3 설계에 주는 함의
+- 지금까지의 설계(P1 자원 관리자, K1 `sriov_configure`, K4 PF 리셋 복원)는 `nvme_dev` 즉 **PF 단위**라 그대로 적용된다.
+- 추가로 필요한 것:
+  1. **PF 간 공통 이벤트 조율**: bus reset·AER fatal·NSSR은 모든 PF의 VF를 한꺼번에 Offline시킨다. 각 PF의 K4 복원이 동시에 돌아도 되도록 PF별 잠금과 재시도가 필요하고, 같은 subsystem의 PF끼리 순서(예: 낮은 PF부터)를 정해 두면 디버깅이 쉽다.
+  2. **K9 과예약은 PF 단위 인자**여야 한다(`pci=sriov_reserve=<PF BDF>:...`를 PF마다). 상위 창 크기는 모든 PF 예약의 합으로 정해진다.
+  3. **K8 제자리 재판독도 PF 단위**: 다른 PF가 I/O 중이어도 해당 PF의 VF만 끄고 재판독할 수 있다. 공통 브리지 창은 건드리지 않는다.
+  4. 벤더에 따라 PF들이 flexible 풀을 공유하는 장치가 있을 수 있다. 그런 경우 PF 간 자원 중재가 필요하다(스펙 범위 확인 필요, 미검증).
+  5. 듀얼 포트(호스트별 PF)라면 각 호스트가 자기 PF만 보므로 예약과 복원도 호스트별로 독립이다. 다만 NSSR이나 subsystem 공유 namespace는 호스트 간 영향을 준다.
+
+### 11.4 QEMU로 재현할 때의 한계 (실측)
+- 구성: `xio3130-downstream` 아래 `nvme,addr=0x0.0`(PF0)와 `nvme,addr=0x8.0`(PF1), 같은 `nvme-subsys`, 각각 `sriov_max_vfs=4`.
+- 결과: 게스트 커널에 **PF0(03:00.0)과 그 VF(03:00.1~)만 보이고 PF1(03:08.0)은 열거되지 않음.**
+- 원인: QEMU `pcie_ari_init`이 ARI Next Function Number를 0으로 고정한다(`qemu-11.1.2/hw/pci/pcie.c:1227`, 호환용 플래그일 때만 1). 커널의 `next_ari_fn`은 사슬이 끝난 것으로 판단한다.
+- QEMU 개발 후보 **Q4**: NVMe에 ARI next-function 지정(PF0 → PF1 사슬)과 VF Offset/Stride 설정 속성을 추가해 진짜 multi-PF SR-IOV를 에뮬레이션한다. 현재는 `NVME_VF_OFFSET 1`/`STRIDE 1` 고정(`hw/nvme/ctrl.c:231~233`)이라 PF0의 VF와 PF1 번호가 겹치지 않도록 PF1을 멀리 배치해야 한다. 대안으로 PF를 서로 다른 downstream 포트에 두면 "같은 subsystem의 별개 장치"가 되므로 NVMe 계층 실험(리셋 범위, cntlid, multipath)은 가능하지만 PCI 계층(같은 창, ARI 사슬)은 재현되지 않는다.
