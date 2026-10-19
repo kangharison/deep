@@ -456,6 +456,28 @@ SupPgSize=0x553 SysPgSize=0x1(4K) VF BAR0=0x40000004 (64bit, non-prefetchable)
 - 감소면 `pci_sriov_set_totalvfs(min)`으로 자동 제한하고, 증가면 "SR-IOV 구성 변경 감지: 재열거(remove/rescan) 또는 재부팅 필요" 경고를 남긴다.
 - NVMe 쪽 secondary 수(CNS 0x15)와 TotalVFs가 다르면 작은 쪽으로 제한한다.
 
+### 9.3.4 목표: remove 없이 운영하기
+
+원칙: **부팅 때 앞으로 필요할 최대치까지 예약하고, 이후에는 그 예약 안에서만 움직인다.** 커널에는 사용 중인 브리지 창을 런타임에 키우는 수단이 없다.
+- 런타임 창 재배치는 Resizable BAR 경로(`pci_resize_resource` → `pci_do_resource_release_and_resize` → `pbus_reassign_bridge_resources`, `linux-7.2/drivers/pci/setup-bus.c:2308, 2377`)뿐이다. 이 경로도 **할당된 자식 리소스가 있는 창은 풀지 않는다**("was not released (still contains assigned resources)"). PF BAR0나 같은 스위치의 다른 SSD가 쓰는 창은 키울 수 없다.
+- 핫플러그 여유(`pci=hpmmiosize` 등)는 `is_hotplug_bridge`인 브리지에만 더해진다(`setup-bus.c:1432`). 핫플러그 off 환경에서는 효과가 없다.
+
+| 상황 | remove 없이 가능? | 방법 |
+|---|---|---|
+| TotalVFs·VF BAR가 하드웨어 고정 (일반적인 SSD, TotalVFs는 HwInit) | **가능** | 펌웨어 SR-IOV 예약 또는 `pci=realloc`으로 한 번 부팅(§9.3.1 실측). 이후 NumVFs 변경은 예약 안 |
+| 장치 구성이 바뀌지만 **최대 구성으로 부팅할 수 있음** | **가능** | 최대 구성으로 부팅해 예약 → 런타임에는 줄이기만. 단 아래 K8 필요 |
+| 부팅 예약보다 **커져야 함** | **현재 커널로는 불가** | 부팅 시 여유 예약(K9) 없이는 창을 키울 방법이 없음 |
+
+주의 — "줄이기만"에도 함정이 있다:
+- VF i의 BAR 주소는 커널이 `IOV 리소스 시작 + i × (캐시된 VF BAR 크기)`로 계산한다(`linux-7.2/drivers/pci/iov.c:377~379` `pci_iov_add_virtfn`).
+- 하드웨어는 자기의 새 VF BAR 크기로 디코딩한다. 그래서 부팅 후 VF BAR 크기가 바뀌었는데 커널이 다시 읽지 않으면 **VF 1번부터 주소가 어긋난다.**
+- TotalVFs만 줄어든 경우는 `pci_sriov_set_totalvfs`로 제한하면 된다. VF BAR 크기 변화는 반드시 커널이 다시 읽어야 한다.
+
+remove를 없애기 위한 커널 개발 후보:
+- **K8. SR-IOV capability 제자리 재판독**: VFs가 꺼진 상태(VFE=0, MSE=0)에서 PF를 떼지 않고 TotalVFs/InitialVFs/Offset/Stride/VF BAR 크기를 다시 읽는다. 새 요구량(VF BAR × TotalVFs)이 **이미 할당된 IOV 리소스 안에 들어가면** `iov->total_VFs`, `iov->barsz[]`, 리소스 크기만 갱신한다. 넘으면 실패 + 안내. PF 드라이버(nvme)는 바인딩된 채로 PF BAR0와 I/O를 유지한다. VF Resizable BAR의 `pci_iov_vf_bar_set_size`가 "예약은 그대로, 크기만 변경"하는 것과 같은 철학이다.
+- **K9. 부팅 시 IOV 과예약**: 커널 인자(예: `pci=sriov_reserve=<BDF>:<max_vfs>:<max_vf_bar>`)나 드라이버 quirk로 `sriov_init` 직후 IOV 리소스를 **최대 VF 수 × 최대 VF BAR**로 키운다. 그러면 `pci=realloc`이 그 크기로 상위 창(RP/스위치)을 잡는다. 선례: PowerNV는 PE 정렬 때문에 IOV 리소스를 `VF BAR × total_pe_num`으로 확장한다(`linux-7.2/arch/powerpc/platforms/powernv/pci-sriov.c:203`).
+- K8 + K9를 함께 쓰면 "부팅 때 최대치 예약 → 런타임에 장치 구성 변경 → 제자리 재판독 → VF 생성"이 **remove 없이** 닫힌다. 동적 자원(VQ/VI) 설계([[nvme-sriov-dynamic-resource-design]])와 합치면 NVMe SR-IOV 전체를 무중단 쪽으로 가져갈 수 있다.
+
 ### 9.4 드라이버 설계에 주는 함의
 - 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
 - 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
