@@ -385,6 +385,25 @@ echo 0000:00:03.1 > /sys/bus/pci/drivers_probe # → nvme1
 4. **창의 종류도 중요하다.** NVMe BAR(PF·VF 모두)는 64bit **non-prefetchable**이라 브리지의 32bit non-pref 창(4GB 아래)을 쓴다. VF 수 × VF BAR가 크면 4GB 아래의 귀한 MMIO 공간을 먹는다. 실측에서도 재배치된 창은 `0x40000000`대(32bit 영역)였다.
 5. **버스 번호도 같은 성격의 제약이다.** VF Offset/Stride에 따라 VF가 다음 버스 번호로 넘어가면 브리지의 subordinate 범위 안에 있어야 한다. 아니면 `can't enable %d VFs (bus %02x out of range ...)` (`iov.c:693` 부근, 미검증 — QEMU NVMe는 ARI + Offset 1/Stride 1이라 255개까지 같은 버스에 들어간다).
 
+### 9.3.1 PCIe 스위치 아래 SSD, 핫플러그 off (실측)
+토폴로지: `pcie-root-port(hotplug=off)` → `x3130-upstream` → `xio3130-downstream(hotplug=off)` → nvme PF (`03:00.0`), VF BAR 합계 2MB.
+핫플러그가 꺼져 있으면 펌웨어나 커널이 핫플러그용 여유 공간(`pci=hpmmiosize` 등)을 예약하지 않는다. 그래서 창이 필요한 만큼만 잡힌다.
+
+| 방법 | RP / USP / DSP mem 창 | VF |
+|---|---|---|
+| 기본 부팅 | 셋 다 `fe800000-fe9fffff`(2MB). 커널이 "Some PCI device resources are unassigned, try booting with pci=realloc" 출력 | 4개도 실패 (`not enough MMIO resources`) |
+| **스위치 USP remove → rescan** | RP 창(2MB)은 그대로 → USP/DSP에 3MB 필요 → `can't assign; no space` → 오히려 1MB(`fe800000-fe8fffff`)로 축소 | **여전히 실패** |
+| **`pci=realloc`** | `max bus depth: 3 pci_try_num: 4` → 4번째 시도에서 셋 다 `40000000-402fffff`(3MB) | **4개, 64개 모두 성공** |
+
+해석:
+- remove/rescan은 **제거한 브리지의 부모 창에 여유가 있을 때만** 통한다. 스위치를 remove해도 그 위 루트 포트 창이 빡빡하면 실패한다. 이때는 여유가 있는 레벨(여기서는 루트 포트)까지 올라가서 remove해야 한다(§9.2에서 루트 포트 remove는 성공). 현장에서 "스위치 remove/rescan으로 됐다"는 것은 루트 포트 창이 원래 넉넉했다는 뜻이다.
+- `pci=realloc`은 부팅 중 할당 실패 시 최대 `버스 깊이 + 1`번 재시도한다. 2번째까지는 말단 브리지 창만, 3번째부터는 하위 트리 전체의 창을 풀고 상위부터 다시 잡는다(`drivers/pci/setup-bus.c:2182` `pci_assign_unassigned_root_bus_resources`). 그래서 다단 스위치도 한 번에 TotalVFs 기준으로 맞춘다.
+- `pci=realloc`이 **통하지 않는** 경우:
+  1. 최상위 호스트 브리지 창(ACPI `_CRS`) 자체가 모자랄 때. 특히 NVMe BAR는 non-prefetchable이라 4GB 아래 창만 쓸 수 있다.
+  2. 부팅 **후**에 장치의 SR-IOV 구성(TotalVFs, VF BAR 크기, SR-IOV cap 노출 여부)이 바뀔 때. 예를 들어 벤더 도구로 모드를 바꾸고 리셋한 경우에는 부팅 시 계산이 낡은 값이 되므로 재열거(remove/rescan 또는 재부팅)가 필요하다.
+  3. 펌웨어가 부팅 구성 보존(`preserve_config`, ACPI `_DSM`)을 요구하는 플랫폼. 이때 자동 realloc은 꺼진다(`setup-bus.c:1837`). 명시적 `pci=realloc`의 효과는 플랫폼에 따라 확인이 필요하다(미검증).
+  4. 부팅 중 다른 장치의 BAR 주소도 바뀔 수 있다. 펌웨어가 쓰던 장치(EFI 프레임버퍼 등)에 영향을 줄 수 있어서 배포판 기본값이 꺼져 있는 것이다.
+
 ### 9.4 드라이버 설계에 주는 함의
 - 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
 - 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
