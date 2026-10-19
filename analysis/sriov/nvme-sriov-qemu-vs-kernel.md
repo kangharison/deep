@@ -404,6 +404,58 @@ echo 0000:00:03.1 > /sys/bus/pci/drivers_probe # → nvme1
   3. 펌웨어가 부팅 구성 보존(`preserve_config`, ACPI `_DSM`)을 요구하는 플랫폼. 이때 자동 realloc은 꺼진다(`setup-bus.c:1837`). 명시적 `pci=realloc`의 효과는 플랫폼에 따라 확인이 필요하다(미검증).
   4. 부팅 중 다른 장치의 BAR 주소도 바뀔 수 있다. 펌웨어가 쓰던 장치(EFI 프레임버퍼 등)에 영향을 줄 수 있어서 배포판 기본값이 꺼져 있는 것이다.
 
+### 9.3.2 최대치는 어디서 읽나 — TotalVFs와 VF BAR 크기
+
+예약 크기는 **VF BAR 크기 × TotalVFs**다. 두 값이 enumeration 이후 커지지 않는다면 VF를 몇 개로 바꾸든 문제가 없다.
+
+| 무엇 | 하드웨어 원본 (PCIe SR-IOV Ext Cap, ID 0x0010) | 커널 캐시 / 사용자 공간 |
+|---|---|---|
+| TotalVFs | cap+0x0E (RO, HwInit) | `sriov_totalvfs` (드라이버가 `pci_sriov_set_totalvfs`로 낮춘 값일 수 있음) |
+| InitialVFs | cap+0x0C | — |
+| NumVFs | cap+0x10 | `sriov_numvfs` |
+| VF Offset / Stride | cap+0x14 / +0x16 | `sriov_offset` / `sriov_stride` |
+| VF Device ID | cap+0x1A | `sriov_vf_device` |
+| Supported / System Page Size | cap+0x1C / +0x20 | — (VF BAR는 System Page Size 단위로 정렬됨) |
+| VF BAR0~5 | cap+0x24~0x38 (크기는 sizing으로 측정) | `resource` 파일 8~13번째 줄(IOV 리소스 7~12) = **VF BAR × TotalVFs**, `lspci -vvv`의 SR-IOV 블록 |
+| VF Resizable BAR | Ext Cap ID 0x24 | `pci_iov_vf_bar_get_sizes()` |
+| NVMe 쪽 상한 | Identify CNS 0x14 (VQFRSM/VIFRSM), CNS 0x15 (secondary 수) | `nvme primary-ctrl-caps`, `nvme list-secondary` |
+
+게스트 실측 (q35 + 스위치 + `pci=realloc`, PF `03:00.0`):
+```
+sriov_totalvfs=64  sriov_numvfs=0  sriov_offset=1  sriov_stride=1  sriov_vf_device=10
+resource 7: 0x40000000-0x401fffff (2MB = 32KB × 64)
+ext cap @0x100 id=0x000e(ARI) → @0x120 id=0x0010(SR-IOV)
+InitialVFs=64 TotalVFs=64 NumVFs=0 VFOffset=1 VFStride=1 VFDID=0x0010
+SupPgSize=0x553 SysPgSize=0x1(4K) VF BAR0=0x40000004 (64bit, non-prefetchable)
+```
+(busybox만 있을 때: `od -A n -t u2 -j $((0x120+0x0e)) -N 2 /sys/bus/pci/devices/<PF>/config`. lspci가 있으면 `lspci -vvv -s <PF>`.)
+
+커널이 이 값을 언제 읽는지가 핵심이다.
+- `sriov_init()`가 TotalVFs를 **enumeration 때 한 번** 읽는다(`linux-7.2/drivers/pci/iov.c:827`, 저장 `:882`). 호출 경로는 `pci_device_add → pci_iov_init`(`probe.c:2663`)뿐이다.
+- 장치 리셋 후에는 `sriov_restore_state`(`iov.c:960`)가 Control·VF BAR 주소·System Page Size·NumVFs를 **써 넣기만** 하고 TotalVFs와 VF BAR 크기는 다시 읽지 않는다.
+- 따라서 부팅 후 장치가 TotalVFs나 VF BAR 크기를 바꾸면 **커널은 옛 값으로 동작한다.** `nr_virtfn > iov->total_VFs`면 `-EINVAL`(`iov.c:672`), 예약 공간을 넘으면 `not enough MMIO resources`.
+
+### 9.3.3 동적으로 바뀌는 경우의 대처
+
+| 경우 | 공간 문제 | 대처 |
+|---|---|---|
+| NumVFs만 변경 (TotalVFs 이내) | 없음 | 그대로 사용 |
+| 드라이버가 상한을 낮춤 (`pci_sriov_set_totalvfs`, `iov.c:1261`) | 없음 (예약은 HW TotalVFs 기준 유지) | 그대로 사용 |
+| VF Resizable BAR로 VF BAR 크기 변경 (`pci_iov_vf_bar_set_size`, `iov.c:1345`) | 예약은 그대로 → 커진 BAR × VF 수가 예약을 넘으면 enable 실패 | `pci_iov_vf_bar_get_sizes(dev, resno, num_vfs)`로 **고정 예약 안에서 (VF 수 × 크기)를 고른다** (커널이 의도한 방식) |
+| 장치 TotalVFs·VF BAR가 **감소** (벤더 설정 + 리셋) | 없음. 다만 커널 캐시가 실제보다 큼 | `pci_sriov_set_totalvfs`로 새 값에 맞춰 제한하거나 재열거 |
+| 장치 TotalVFs·VF BAR가 **증가** | 있음 | 아래 절차 |
+
+증가 시 절차 (뒤로 갈수록 영향 범위가 크다):
+1. **예방이 최선이다.** 장치를 **최대 SR-IOV 구성으로 둔 상태에서 부팅**해 그 기준으로 예약(펌웨어 SR-IOV 옵션 / `mem-reserve` / `pci=realloc`)하고, 실제 사용 수는 런타임에 NumVFs·`pci_sriov_set_totalvfs`·NVMe virt-mgmt로 줄인다. "최대로 잡고 소프트웨어로 줄인다."
+2. **PF만 재열거**: VF 사용 중지 → `sriov_numvfs=0` → PF 드라이버 사용 중지 → `echo 1 > <PF>/remove` → `echo 1 > <DSP>/rescan`(또는 `/sys/bus/pci/rescan`). `sriov_init`이 다시 돌면서 새 TotalVFs/VF BAR를 읽는다. **바로 위 브리지(DSP) 창 안에 들어갈 때만** 성공한다.
+3. **브리지 재열거**: 안 들어가면 부모 창에 여유가 있는 가장 낮은 브리지(DSP → 스위치 USP → RP)까지 remove → rescan. **그 아래의 모든 장치(같은 스위치의 다른 SSD 포함)가 함께 제거된다**(§9.3.1 실측: 부모 창이 빡빡하면 실패).
+4. **재부팅 + `pci=realloc`**: 호스트 브리지까지 빡빡하면 새 구성 상태로 재부팅해 처음부터 다시 잡는다.
+
+드라이버(nvme-pci)에 넣을 만한 보호 장치 (설계 후보 K7):
+- PF probe/reset 끝에서 **live TotalVFs(cap+0x0E)와 캐시(`iov->total_VFs`)를 비교**하고, VF BAR는 VFs가 꺼져 있을 때만 sizing해 비교한다.
+- 감소면 `pci_sriov_set_totalvfs(min)`으로 자동 제한하고, 증가면 "SR-IOV 구성 변경 감지: 재열거(remove/rescan) 또는 재부팅 필요" 경고를 남긴다.
+- NVMe 쪽 secondary 수(CNS 0x15)와 TotalVFs가 다르면 작은 쪽으로 제한한다.
+
 ### 9.4 드라이버 설계에 주는 함의
 - 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
 - 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
