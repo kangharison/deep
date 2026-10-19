@@ -518,3 +518,28 @@ QEMU 검증 방법: 장치 `sriov_max_vfs=64`, 커널 인자로 128을 예약 �
 ### 9.4 드라이버 설계에 주는 함의
 - 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
 - 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
+
+---
+
+## 10. User space 드라이버(SPDK + vfio-pci)라면 이 문제들이 없나?
+
+결론: **PCI 주소 공간(BAR/브리지 창/TotalVFs 예약) 문제는 똑같다.** 누가 장치를 구동하든 BAR와 브리지 창은 커널 PCI 코어가 배정하기 때문이다. 차이가 나는 것은 NVMe 동작 계층(인터럽트, 큐 수, 복구 정책)뿐이다.
+
+### 10.1 PCI 계층 — 동일
+- VF 생성은 user space에서 직접 할 수 없다. vfio-pci는 SR-IOV 확장 capability를 **읽기 전용**으로 노출한다(`linux-7.2/drivers/vfio/pci/vfio_pci_config.c:87, 324` — `ecap_perms`가 readfn만 있음). 그래서 VF는 커널 sysfs `sriov_numvfs` → `vfio_pci_sriov_configure`(`drivers/vfio/pci/vfio_pci.c:209`, 모듈 인자 `enable_sriov=1` 필요) → `vfio_pci_core_sriov_configure`(`vfio_pci_core.c:2350`) → **`pci_enable_sriov`** 경로로만 생긴다. §9의 `not enough MMIO resources for SR-IOV`가 그대로 적용된다.
+- uio_pci_generic은 `sriov_configure`가 없다. config space를 직접 써서 VFE를 켜면 커널은 VF `pci_dev`를 만들지 않고 VF BAR도 배정하지 않아 동작하지 않는다.
+- 따라서 TotalVFs 기준 예약, `pci=realloc`, remove/rescan 필요성, K8/K9 모두 user space 드라이버에도 똑같이 해당한다.
+
+### 10.2 NVMe 계층 — 다른 점
+| 항목 | 커널 nvme-pci | SPDK (vfio-pci 위) | 근거 |
+|---|---|---|---|
+| VI(MSI-X) 증가 시 `-ERANGE`로 dead | 발생 (실측) | **기본 polling 모드면 무관**(`enable_interrupts=false`). 인터럽트 모드면 vfio도 같은 PCI/MSI 코어 도메인으로 할당하므로 같은 문제가 예상됨(미검증). vfio는 MSI-X 테이블 크기를 `vfio_pci_core_enable`(`vfio_pci_core.c:587`, 651줄)에서 open 때마다 다시 읽는다 | 커널 실측 §설계문서 1, SPDK 코드 |
+| VQ 증가 반영 | 리셋 시 `blk_mq_update_nr_hw_queues`로 반영 (실측 1→3) | **반영 안 됨.** `opts.num_io_queues = min(응답, opts.num_io_queues)`로 자기 설정을 덮어써서(`spdk-study/lib/nvme/nvme_ctrlr.c:5901`) 한 번 줄면 리셋해도 다시 늘지 않는다. 늘리려면 detach 후 재-attach. 앱이 qpair를 직접 다시 만들어야 함 | 코드 (미검증) |
+| VQ 감소 | 리셋 시 hctx 축소 | 줄어든 수만큼 qid 풀(`free_io_qids`, `:5920`)이 작아짐 → 초과 qpair는 재연결 실패 → 앱이 처리 | 코드 |
+| Offline VF (CAP=0) 초기화 | CAP.TO=0 → 즉시 실패 → dead (실측) | ready timeout도 `CAP.TO × 500ms`(`nvme_ctrlr.c:2597`)라 즉시 실패하는 것은 같다. 다만 bdev_nvme에 **재연결 정책**(`reconnect_delay_sec`, `ctrlr_loss_timeout_sec`)이 있어 실패 후에도 I/O를 보류하고 주기적으로 재시도할 수 있다(`module/bdev/nvme/bdev_nvme.c:1977`). 기본값은 0(비활성, `:403~404`) | 코드 (PCIe VF 오프라인 복구는 미검증) |
+| PF 측 virt-mgmt | 없음 (nvme-cli passthrough) | 헬퍼 API는 없지만 앱이 raw admin 명령으로 직접 발행 가능 | §4.3 |
+| PF 리셋 → VF Offline | VF dead | 장치 동작은 같음. 재연결 정책을 켜면 Online 복귀 뒤 회복할 여지가 있음 | — |
+
+### 10.3 정리
+- user space 드라이버로 바꿔도 **"remove 없이 VF 늘리기"의 전제(부팅 시 최대치 예약)는 그대로**다. 오히려 VF 생성이 반드시 커널 `pci_enable_sriov`를 거치므로 커널 쪽 K8/K9가 user space 사용자에게도 필요하다.
+- 동적 VQ/VI 측면에서는 SPDK가 polling 덕분에 VI 문제를 피하고 재연결 정책으로 자가 복구(P3)에 유리하다. 반면 VQ 증가는 재-attach 없이는 반영하지 못한다. 커널은 정반대 성향이다(VQ 증가는 자동 반영, 복구 정책은 약함).
