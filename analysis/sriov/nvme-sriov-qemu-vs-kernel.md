@@ -352,3 +352,39 @@ echo 0000:00:03.1 > /sys/bus/pci/drivers_probe # → nvme1
 | Linux nvme wait_ready | `qemu-debug/linux-7.2/drivers/nvme/host/core.c:2691` |
 | Linux CNS / opcode 정의 | `qemu-debug/linux-7.2/include/linux/nvme.h:561~576`, `:1325` |
 | SPDK 스펙 정의 | `spdk-study/include/spdk/nvme_spec.h:2827, 3308, 3313, 3524, 4327, 4368` |
+
+---
+
+## 9. VF BAR 공간과 상위 브리지 창 — "VF를 늘리면 메모리가 모자라나?"
+
+### 9.1 결론
+- **VF BAR 공간은 NumVFs가 아니라 TotalVFs 기준으로 enumeration 때 한 번에 잡는다.** `sriov_init`에서 IOV 리소스 크기 = VF BAR 크기 × TotalVFs (`qemu-debug/linux-7.2/drivers/pci/iov.c:872`).
+  → 그 공간을 확보하는 데 성공했다면 **NumVFs를 TotalVFs까지 늘리는 동안 브리지 창이 더 필요해지는 일은 없다.**
+- **`sriov_enable` 시점에는 공간을 새로 할당하지 않는다.** IOV 리소스가 할당돼 있지 않으면(`res->parent == NULL`) `not enough MMIO resources for SR-IOV`(-ENOMEM)로 끝난다 (`iov.c:685~690`). 이 경우에는 **VF 1개도 켤 수 없다.**
+- 문제는 **부팅 시 펌웨어가 상위 브리지 창을 VF BAR 없이 PF BAR 기준으로만 잡은 경우**다. 커널은 기본적으로 펌웨어 배치를 유지하고, `CONFIG_PCI_REALLOC_ENABLE_AUTO`도 꺼져 있다(이 트리 `.config`). 그래서 IOV BAR가 할당되지 않은 채 남는다.
+
+### 9.2 실측 (QEMU q35, PF를 `pcie-root-port` 아래에 배치)
+설정: `nvme,max_ioqpairs=130,msix_qsize=65,sriov_max_vfs=64,sriov_vq_flexible=128,sriov_vi_flexible=64,sriov_max_vq_per_vf=64,sriov_max_vi_per_vf=1024`
+→ VF BAR 32KB × 64 = **2MB** (`VF BAR 0 [mem 0x00000000-0x001fffff 64bit]: contains BAR 0 for 64 VFs`)
+
+| 방법 | 루트 포트 mem 창 | VF BAR | `echo 4 > sriov_numvfs` |
+|---|---|---|---|
+| 기본 부팅 (SeaBIOS 배치 유지) | `fe800000-fe9fffff` (2MB, PF BAR만 고려) | `can't assign; no space` | **실패** `not enough MMIO resources for SR-IOV` |
+| 기본 부팅 + `echo 1 > /sys/bus/pci/rescan`만 | 변화 없음 | 미할당 | **실패** |
+| 기본 부팅 + 루트 포트 `remove` → `rescan` | `40000000-403fffff` (4MB로 재배치) | `assigned` | **성공**, 64개까지 (bus 01에 함수 65개) |
+| 커널 인자 `pci=realloc` | 부팅 중 `40000000-403fffff`로 재배치 | `assigned` | **성공** (remove/rescan 불필요) |
+| 펌웨어 예약 힌트 `pcie-root-port,...,mem-reserve=8M` | `fe200000-fe9fffff` (8MB) | 부팅 시 `assigned` | **성공** |
+
+### 9.3 해석과 권장 순서
+1. **펌웨어가 미리 예약하게 한다.** 실장비에서는 BIOS의 "SR-IOV Support" 옵션이고, QEMU에서는 루트 포트의 `mem-reserve`/`pref64-reserve`다. 이것이 가장 안전하다.
+2. **안 되면 `pci=realloc`.** 부팅 중 브리지 창을 다시 잡는다. 부팅 시점이라 사용 중인 장치가 없다. 커널을 `CONFIG_PCI_REALLOC_ENABLE_AUTO=y`로 빌드하면 IOV 미할당을 감지했을 때 자동으로 켜진다(`drivers/pci/setup-bus.c:1827` `pci_realloc_detect`).
+3. **remove/rescan은 최후 수단이다.**
+   - rescan만으로는 이미 할당된 브리지 창을 키우지 않는다(실측).
+   - **브리지째 remove해야 하므로 PF도 함께 제거된다.** PF의 namespace와 I/O가 모두 사라지므로 루트 FS가 그 SSD에 있으면 불가능하다.
+   - 상위 창(호스트 브리지 또는 상위 스위치)에 빈 공간이 있어야 한다. 없으면 그 상위 레벨까지 remove해야 한다.
+4. **창의 종류도 중요하다.** NVMe BAR(PF·VF 모두)는 64bit **non-prefetchable**이라 브리지의 32bit non-pref 창(4GB 아래)을 쓴다. VF 수 × VF BAR가 크면 4GB 아래의 귀한 MMIO 공간을 먹는다. 실측에서도 재배치된 창은 `0x40000000`대(32bit 영역)였다.
+5. **버스 번호도 같은 성격의 제약이다.** VF Offset/Stride에 따라 VF가 다음 버스 번호로 넘어가면 브리지의 subordinate 범위 안에 있어야 한다. 아니면 `can't enable %d VFs (bus %02x out of range ...)` (`iov.c:693` 부근, 미검증 — QEMU NVMe는 ARI + Offset 1/Stride 1이라 255개까지 같은 버스에 들어간다).
+
+### 9.4 드라이버 설계에 주는 함의
+- 동적 자원 설계(`[[nvme-sriov-dynamic-resource-design]]`)의 VQ/VI 변경은 **VF BAR 크기를 바꾸지 않는다.** QEMU VF BAR는 VQFRSM/VIFRSM 최대치로 고정되어 있다(`hw/nvme/ctrl.c:9152`). 그래서 런타임 자원 변경 때문에 브리지 창이 부족해지는 일은 없다.
+- 대신 `sriov_configure`(K1)는 `not enough MMIO resources`일 때 원인(IOV BAR 미할당)과 해결책(`pci=realloc`, 펌웨어 예약)을 로그로 안내하면 좋다.
