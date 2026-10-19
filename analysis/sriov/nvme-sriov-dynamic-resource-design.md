@@ -101,6 +101,7 @@ NVMe에는 NIC의 PF↔VF 메일박스 같은 통지 채널이 없다. 그래서
 - 현상: `pci_setup_msix_device_domain()`(`drivers/pci/msi/irqdomain.c:272`)은 도메인이 이미 있으면 `true`를 바로 반환한다. 이 도메인은 **첫 enable 때의 hwsize로 만들어져 장치가 제거될 때까지 유지**된다(주석 "preserved until the device is removed"). 그래서 테이블이 커진 뒤 index ≥ 옛 hwsize를 할당하면 `kernel/irq/msi.c:125`에서 `-ERANGE`가 난다.
 - 수정안: MSI-X가 꺼져 있는 상태에서 `pci_setup_msix_device_domain`이 기존 도메인의 hwsize(`msi_domain_get_hwsize`)와 새 hwsize가 다르면 `msi_remove_device_irq_domain()` 후 다시 만든다. 범용 PCI 코어 수정이라 linux-pci 쪽 리뷰 대상이다.
 - 축소(4→1)는 index가 범위 안이라 코드상 문제가 없어 보인다(미검증).
+- **적용 범위 (실측 2026-10-19)**: 이 버그는 **드라이버가 바인딩된 채로** 리셋하면서 VI를 키울 때만 생긴다. MSI 장치 데이터는 devres로 관리되어 드라이버 unbind 시 `msi_device_data_release`가 도메인을 지운다(`kernel/irq/msi.c:287, 318`). 그래서 unbind → Offline → 재할당(VI 1→3) → Online → bind 경로는 정상 probe(`2/0/0 queues`)됐다. 즉 R1(재생성) 경로는 안전하고, P0-1은 R2(제자리 리사이즈) 전용 전제 조건이다. ([[nvme-sriov-multipf-lifecycle]] §4.1)
 - 참고: upstream의 `sriov_vf_msix_count` API(`drivers/pci/iov.c:248`)는 VF에 드라이버가 붙어 있으면 `-EBUSY`를 반환한다. 즉 upstream 설계는 "바인딩된 VF의 벡터 수 변경"을 의도적으로 막는다. live 변경은 NVMe 전용 경로로 가야 하고, 이 도메인 수정은 그 경로의 전제 조건이다.
 - 대안(코어 수정 없이): VI를 VF 생성 시 최대치로 고정하고 VQ만 동적으로 바꾼다(시나리오 B처럼 안전). 단, 벡터 수가 I/O 큐 상한을 정하므로(`I/O 큐 ≤ VI-1`) 실제 큐 증가 폭이 제한된다.
 
