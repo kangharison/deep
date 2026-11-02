@@ -1,6 +1,6 @@
 # NVMe 커스텀 드라이버 검증 플랫폼(nvmeval) — 요구사항 및 설계
 
-> 상태: 설계 초안 v0.2 (2026-11-02). 구현 전 단계. 실측 결과는 아직 없다.
+> 상태: 설계 초안 v0.3 (2026-11-02). 구현 전 단계. 실측 결과는 아직 없다.
 > 환경: 호스트에 KVM이 없다(`/dev/kvm` 없음, vmx 플래그 없음). 그래서 QEMU는 **TCG로 실행**한다. QEMU `v11.1.2`(qemu-dev), Linux `v7.2` 기준.
 > 관련: [[vssd-vs-vfio-user-sim]] · [[nvme-sriov-dynamic-resource-design]] · [[nvme-sriov-multipf-lifecycle]] · [[nvme-sriov-qemu-vs-kernel]] · [[nvme-queue-mgmt-design]] · [[nvme-more-queues-than-cpus-and-nto1-sqcq]] · [[20_msix_interrupt_e2e_qemu_trace]]
 
@@ -19,6 +19,8 @@
 | VF | PF와 **같은 게스트**에 바인딩한다 (현재 기준) |
 | 트리거 방식 | sysfs가 아니라 **trigger를 직접 주입**한다. 테스트가 드라이버 함수를 원하는 시점에 직접 호출한다(§5) |
 | 호스트 | 호스트 커널은 수정하지 않는다. sudo 없이 동작해야 한다 |
+| **실사용 환경 (OA PC)** | 게스트는 **CentOS Stream 9 userspace + 직접 빌드한 Linux v7.2**, QEMU **11.1**. 모든 바이너리에 debug symbol이 있고 kallsyms를 확인할 수 있다 (사용자 확인, 2026-11-02) |
+| 개발 환경 (이 서버) | Ubuntu 24.04, Python 3.12, QEMU 11.1.2(qemu-dev), Linux v7.2. TCG 전용. drgn은 `company/drgn-study` 소스 빌드 |
 
 ---
 
@@ -279,12 +281,23 @@ def test_compact_rollback_on_delete_sq_fail(vm, qmp, agent, views, seq):
 
 ---
 
+## 7.1 실사용 환경이 주는 제약 (CentOS Stream 9)
+
+| 항목 | 영향 | 결정 |
+|---|---|---|
+| CentOS 9 기본 Python은 **3.9** | 게스트 agent는 게스트의 python3로 실행된다. 개발 서버는 3.12다 | **게스트 agent는 Python 3.9 호환, stdlib만 사용**(fcntl, ctypes, json, select, socket). 호스트 패키지도 3.9 이상을 목표로 한다(`match` 문, PEP 695 사용 금지) |
+| 게스트가 실제 rootfs를 가진다 | 9p hostroot + chroot 트릭이 필요 없다 | agent, bpftrace, fio, nvme-cli를 게스트에 설치해 쓴다. 9p는 **쓰기 가능한 산출물 공유 하나만** 둔다 |
+| 커널 config는 CentOS config 기반으로 v7.2를 빌드 | RHEL 계열 config는 BPF/BTF/KPROBES/KALLSYMS_ALL이 켜져 있는 것이 일반적이다. `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`은 확인이 필요하다 | M1에서 `nvmeval doctor`가 게스트 `/proc/config.gz` 또는 `/boot/config-*`를 읽어 필요한 항목을 자동 점검한다 |
+| debug symbol 존재 | drgn이 vmlinux와 모듈 DWARF를 바로 쓸 수 있다. 타입 기반 읽기가 가능하다 | adapter의 필드 경로는 C 표현식 문자열로 두고 drgn이 해석한다 |
+| QEMU 11.1 (개발은 11.1.2) | 같은 minor 버전이라 hw/nvme 패치가 거의 그대로 적용될 것으로 예상한다 | 패치는 `v11.1.0` 기준으로도 rebase를 확인한다 |
+| 개발 서버 게스트와 일치 | 지금 개발 서버 게스트는 initramfs + busybox라 실환경과 다르다 | **개발 서버에도 CentOS Stream 9 게스트 이미지(qcow2)를 만들어** 같은 v7.2 kernel을 `-kernel`로 부팅한다. rootfs는 virtio-blk에 두어 NVMe 장치와 분리한다 |
+
 ## 8. 수정이 필요한 곳
 
 | 위치 | 작업 | 비고 |
 |---|---|---|
 | `qemu-debug/qemu-11.1.2` (qemu-dev) | Q6: `query-nvme-queues`, Q7': `nvme-fault-*` 규칙 엔진, trace event 보강 | patch series로 OA PC에 이식 |
-| 게스트 커널 config | `BPF_SYSCALL`, `BPF_EVENTS`, `DEBUG_INFO_BTF`, `KPROBES`, `KALLSYMS_ALL`, `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`, `VIRTIO_CONSOLE`, `9P_FS` | OA PC 커널에도 같은 설정 필요 |
+| 게스트 커널 config | `BPF_SYSCALL`, `BPF_EVENTS`, `DEBUG_INFO_BTF`, `KPROBES`, `KALLSYMS_ALL`, `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`, `VIRTIO_CONSOLE`, `9P_FS` | CentOS config 기반에서 누락된 항목만 추가 (§7.1) |
 | `nvmeval/guest/stub` | `nvmeval_stub.ko` | 드라이버는 수정하지 않음 |
 | 호스트 | `nvmeval` 패키지 | `qemu.qmp`, `drgn`, `pytest` |
 
@@ -306,8 +319,8 @@ def test_compact_rollback_on_delete_sq_fail(vm, qmp, agent, views, seq):
 
 ## 10. 미결 사항
 
-1. OA PC 환경: KVM 사용 가능 여부, 커널 버전(7.2 기준인지), QEMU 버전. QEMU 패치를 이식할 수 있는지가 여기에 달려 있다.
-2. qmgmt trigger 진입 함수가 `noinline`이고 kallsyms에 보이는지.
+1. ~~OA PC 환경~~ → 해결: v7.2 + CentOS Stream 9 + QEMU 11.1, debug symbol 있음. **남은 것: OA PC에서 KVM 사용 여부** (TCG로도 동작하게 설계하므로 필수는 아니다).
+2. ~~kallsyms 노출~~ → 해결: 확인 가능. 남은 것: inline으로 사라진 내부 단계가 있는지(trigger나 checkpoint 대상이면 `noinline` 필요).
 3. bitmap 단위: qid당 1비트인지, VF별로 bitmap이 따로 있는지. adapter와 INV-V1 정의에 필요하다.
 4. drain 판정 기준: `blk_mq_quiesce_tagset` + tag iterator인지, qmgmt 자체 카운터인지. S1 검사에 쓸 이벤트 소스가 정해진다.
-5. 게스트 rootfs: 지금의 initramfs + 9p chroot 방식을 유지할지, 디스크 이미지 rootfs로 바꿀지. VF가 추가되면 NVMe 장치가 늘어나므로, rootfs를 NVMe에 두지 않는 것이 좋다.
+5. ~~게스트 rootfs~~ → 결정: CentOS Stream 9 qcow2를 virtio-blk에 둔다 (§7.1).
