@@ -1,26 +1,34 @@
-# NVMe 커스텀 드라이버 검증 플랫폼(nvmeval) — 요구사항 및 설계
+# NVMe 커스텀 드라이버 검증 플랫폼(nvmeval) — 요구사항 및 아키텍처 설계
 
-> 상태: 설계 초안 v0.3 (2026-11-02). 구현 전 단계. 실측 결과는 아직 없다.
-> 환경: 호스트에 KVM이 없다(`/dev/kvm` 없음, vmx 플래그 없음). 그래서 QEMU는 **TCG로 실행**한다. QEMU `v11.1.2`(qemu-dev), Linux `v7.2` 기준.
+> 상태: **설계 v0.4 (2026-11-02), 리뷰 요청용**. 구현 전 단계라 아직 실측한 것은 없다. 단, 코드 근거는 표시해 두었다.
+> 기준 소스: QEMU `v11.1.2`(qemu-dev 브랜치), Linux `v7.2`. 근거 위치는 `qemu-debug/<트리>/<경로>:<라인>` 형식으로 적는다.
 > 관련: [[vssd-vs-vfio-user-sim]] · [[nvme-sriov-dynamic-resource-design]] · [[nvme-sriov-multipf-lifecycle]] · [[nvme-sriov-qemu-vs-kernel]] · [[nvme-queue-mgmt-design]] · [[nvme-more-queues-than-cpus-and-nto1-sqcq]] · [[20_msix_interrupt_e2e_qemu_trace]]
+
+### 리뷰어 안내
+- 각 결정에는 상태를 붙였다. **[확정]**은 사용자가 결정한 것, **[제안]**은 설계자가 제안하고 사용자가 큰 틀에 동의한 것, **[미결]**은 아직 정하지 않은 것이다.
+- 특히 검토가 필요한 부분은 §13 "알려진 위험과 검토 포인트"에 모아 두었다.
+- 검증 대상 드라이버(qmgmt)의 실제 코드는 이 문서 작성 환경에 **없다**. 문서에 나오는 드라이버 심볼, 필드, ioctl 이름은 모두 **가상의 예시**다.
 
 ---
 
 ## 0. 전제와 범위
 
-| 항목 | 결정 |
-|---|---|
-| 검증 대상 | 커스텀 nvme-pci 드라이버. 1차는 host 드라이버(`drivers/nvme/host`) 수정분이고, 이후 PCI/MSI, blk-mq 등 커널의 다른 부분으로 넓어질 수 있다 |
-| 1차 대상 기능 | **queue mgmt (qmgmt)**: IO SQ/CQ 동적 생성·삭제, compaction, non-managed IRQ 재배치. 목적은 SR-IOV와 multi-function SSD 지원 |
-| 개발 위치 | qmgmt 구현은 **회사 OA PC에만 있다**. 이 서버에서는 **플랫폼만** 개발한다. 따라서 드라이버 고유 심볼과 필드 이름은 adapter 설정으로 분리한다(§7) |
-| 언어 | Python 3. 예외는 커널에 넣어야 하는 trigger stub 모듈(C)과 QEMU 패치(C)뿐이다 |
-| 실행 | TCG. 타이밍과 성능은 검증하지 않는다. 판정은 **상태 일관성과 순서 관계**로만 한다 |
-| 재현성 | 스냅샷과 icount는 범위 밖이다. 시드 고정과 산출물 보존만 한다 |
-| VF | PF와 **같은 게스트**에 바인딩한다 (현재 기준) |
-| 트리거 방식 | sysfs가 아니라 **trigger를 직접 주입**한다. 테스트가 드라이버 함수를 원하는 시점에 직접 호출한다(§5) |
-| 호스트 | 호스트 커널은 수정하지 않는다. sudo 없이 동작해야 한다 |
-| **실사용 환경 (OA PC)** | 게스트는 **CentOS Stream 9 userspace + 직접 빌드한 Linux v7.2**, QEMU **11.1**. 모든 바이너리에 debug symbol이 있고 kallsyms를 확인할 수 있다 (사용자 확인, 2026-11-02) |
-| 개발 환경 (이 서버) | Ubuntu 24.04, Python 3.12, QEMU 11.1.2(qemu-dev), Linux v7.2. TCG 전용. drgn은 `company/drgn-study` 소스 빌드 |
+| 항목 | 내용 | 상태 |
+|---|---|---|
+| 목적 | 개발 중인 커스텀 nvme-pci 드라이버 기능을 호스트에서 검증한다. 수단은 QEMU 게스트 조작과 QEMU 가상 NVMe 장치(vssd) 조작이다 | 확정 |
+| 검증 대상 범위 | 1차는 host 드라이버(`drivers/nvme/host`) 수정분이다. 이후 커널의 다른 부분(PCI/MSI, blk-mq 등)으로 넓어질 수 있다 | 확정 |
+| 1차 대상 기능 | **queue mgmt (qmgmt)**: IO SQ/CQ 동적 생성·삭제, compaction, non-managed IRQ 재배치. 목적은 SR-IOV와 multi-function SSD 지원이다 (§2) | 확정 |
+| 이후 대상 | 개발 중인 다른 기능들. 플러그인으로 추가한다 | 확정 (목록은 미결) |
+| 코드 위치 | qmgmt 구현은 **회사 OA PC에만 있다**. 이 서버에서는 **플랫폼만** 개발한다 | 확정 |
+| **API 차이** | OA PC 드라이버의 API와 custom field는 이 서버의 코드와 **다르다**. [[nvme-queue-mgmt-design]]에 적힌 ioctl/구조체와도 다를 수 있다. 플랫폼 코어는 어떤 드라이버 심볼도 가정하지 않는다 (§6) | 확정 |
+| 언어 | Python. 예외는 커널 trigger stub 모듈(C)과 QEMU 패치(C)뿐이다 | 확정 |
+| 실행 가속 | 개발 서버에는 KVM이 없어 **TCG**로 실행한다(`/dev/kvm` 없음, vmx 플래그 없음). 타이밍과 성능은 검증하지 않는다. 판정은 **상태 일관성과 순서 관계**로만 한다 | 확정 |
+| 재현성 | 스냅샷과 icount/record-replay는 범위 밖이다. 시드 고정과 산출물 보존만 한다 | 확정 |
+| VF 배치 | PF와 **같은 게스트**에 바인딩한다 (현재 기준) | 확정 |
+| 트리거 방식 | sysfs가 아니라 **trigger를 직접 주입**한다. 테스트가 드라이버 함수나 UAPI를 원하는 시점에 직접 호출한다 (§7) | 확정 |
+| 호스트 안전 | 호스트 커널은 수정하지 않는다. sudo 없이 동작해야 한다 | 확정 |
+| **실사용 환경 (OA PC)** | 게스트: CentOS Stream 9 userspace + 직접 빌드한 Linux **v7.2**. QEMU **11.1**. 모든 바이너리에 debug symbol이 있고 kallsyms를 확인할 수 있다 | 확정 (KVM 여부는 미결) |
+| 개발 환경 (이 서버) | Ubuntu 24.04, Python 3.12, QEMU 11.1.2(qemu-dev, 자체 패치 2개: multi-PF SR-IOV, NSSR), Linux v7.2 | 확정 |
 
 ---
 
@@ -30,26 +38,30 @@
 
 | ID | 요구사항 |
 |---|---|
-| FR-1 | VM 생명주기: 표준 cmdline 생성(q35, smp 8, QMP unix 소켓, gdbstub, `-device vmcoreinfo`, 9p hostroot, virtio-serial, pvpanic), 기동, 종료, 산출물 수집 |
-| FR-2 | **Trigger 주입**: 드라이버 내부 함수(예: compaction 진입점)를 게스트 커널의 sleep 가능한 process context에서 직접 호출한다. 동기와 비동기를 모두 지원한다 |
-| FR-3 | 명령 주입: ioctl NVMe passthrough(Admin/IO), io_uring passthrough(`/dev/ng*`) |
-| FR-4 | 관측: eBPF(kprobe, tracepoint)로 드라이버와 blk-mq 이벤트를 스트리밍한다. QEMU trace event로 장치 쪽 admin/IO 처리를 기록한다 |
-| FR-5 | 상태 스냅샷: drgn으로 driver view와 IRQ view를, QMP로 device view를 읽는다(§3) |
-| FR-6 | Checkpoint: 지정한 커널 심볼에서 게스트를 정지시키고, 세 view 스냅샷과 불변식 평가를 마친 뒤 재개한다 (gdbstub) |
-| FR-7 | 장치 오류 주입: "트리거 조건 → 동작" 규칙을 QMP로 등록하고 해제한다. 예: N번째 Delete SQ에 오류 status 반환, Create CQ 성공 직후 CFS 설정 (§6) |
-| FR-8 | 순서 제약 검사: qmgmt 절차의 순서 제약(§4)을 이벤트 스트림으로 검사한다 |
-| FR-9 | 장애 감지: panic(`GUEST_PANICKED`), hang(watchdog), 타임아웃을 감지하면 시리얼 로그와 drgn 덤프를 남긴다 |
-| FR-10 | 시나리오: pytest로 작성한다. 기능은 플러그인(`features/<name>/`)으로 추가한다 |
+| FR-1 | **VM 생명주기**: profile로 QEMU cmdline을 만들고 기동·종료·산출물 수집을 한다. 기본 구성은 q35, smp 8, QMP unix 소켓, gdbstub, `-device vmcoreinfo`, virtio-serial, pvpanic, 9p 산출물 공유 |
+| FR-2 | **Trigger 주입**: 두 가지 경로를 지원한다. (a) 드라이버 UAPI ioctl. (b) 드라이버 내부 함수를 게스트 커널의 sleep 가능한 process context에서 직접 호출. 동기와 비동기를 모두 지원한다 |
+| FR-3 | **명령 주입**: NVMe passthrough ioctl(Admin/IO), io_uring passthrough(`/dev/ng*`) |
+| FR-4 | **관측**: 게스트 eBPF(kprobe, tracepoint)로 이벤트를 스트리밍한다. QEMU trace event로 장치 쪽 명령 처리를 기록한다 |
+| FR-5 | **상태 스냅샷**: driver view와 IRQ view는 drgn, device view는 QMP로 읽고, 모두 **정규 스키마**(§4)로 변환한다 |
+| FR-6 | **Checkpoint**: 지정한 커널 심볼에서 VM을 정지시키고, 세 view 스냅샷과 판정을 마친 뒤 재개한다 (gdbstub) |
+| FR-7 | **장치 오류 주입**: "트리거 조건 → 동작" 규칙을 QMP로 등록·해제한다 (§8) |
+| FR-8 | **판정**: 스냅샷 기반 불변식(invariant)과 이벤트 기반 순서 제약(sequence)의 두 축으로 판정한다 (§5) |
+| FR-9 | **장애 감지**: panic(QMP `GUEST_PANICKED`), hang(watchdog), 타임아웃을 감지하면 시리얼 로그와 drgn 덤프를 남긴다 |
+| FR-10 | **시나리오**: pytest로 작성한다. 기능은 플러그인(`features/<name>/`)으로 추가한다 |
+| FR-11 | **adapter 검증과 생성**: 세션 시작 시 adapter의 필드 경로, 타입, 심볼, 구조체 크기를 DWARF와 대조해 맞지 않으면 즉시 실패한다. DWARF에서 adapter 초안을 만드는 도구를 제공한다 (§6) |
 
 ### 1.2 비기능 요구사항
 
 | ID | 요구사항 |
 |---|---|
-| NFR-1 | **이식성**: 이 서버에서 개발한 플랫폼이 OA PC에서 설정 파일 교체만으로 돌아가야 한다. QEMU 패치는 patch series, stub 모듈은 out-of-tree 빌드로 관리한다 |
-| NFR-2 | **드라이버 비의존 코어**: core/backends/views에는 qmgmt 고유 심볼이 없어야 한다 |
+| NFR-1 | **이식성**: 이 서버에서 개발한 플랫폼이 OA PC에서 profile과 adapter 교체만으로 돌아가야 한다 |
+| NFR-2 | **드라이버 비의존 코어**: `nvmeval/` 패키지에는 드라이버 고유 심볼, 필드, ioctl 번호가 하나도 없어야 한다 |
 | NFR-3 | **장치 백엔드 추상화**: 지금은 vssd(QMP)를 쓴다. 나중에 SSD sim + vfio-user([[vssd-vs-vfio-user-sim]])로 같은 시나리오를 돌릴 수 있어야 한다 |
-| NFR-4 | 산출물: 테스트마다 `artifacts/<test>/`에 serial.log, qmp-events.jsonl, ebpf.jsonl, qemu-trace.log, snapshots/*.json, verdict.json을 남긴다 |
-| NFR-5 | 자체 검증: qmgmt가 없는 upstream 드라이버만으로도 코어, 오류 주입, 공통 불변식을 이 서버에서 검증할 수 있어야 한다 |
+| NFR-4 | **Python 버전**: 게스트 agent는 Python **3.9** 호환이고 stdlib만 쓴다(CentOS Stream 9 기본). 호스트 패키지도 3.9 이상을 목표로 한다 |
+| NFR-5 | **산출물**: 테스트마다 `artifacts/<run>/<test>/`에 serial.log, qmp-events.jsonl, events.jsonl(정규 이벤트), qemu-trace.log, snapshots/*.json, verdict.json을 남긴다 |
+| NFR-6 | **자체 검증**: qmgmt 없이 upstream 드라이버만으로도 코어, 오류 주입, 공통 불변식을 이 서버에서 검증할 수 있어야 한다. 판정 엔진은 VM 없이 합성 데이터로 단위 테스트할 수 있어야 한다 |
+| NFR-7 | **판정 신뢰성**: 관측 누락(eBPF 이벤트 손실 등)이 있으면 결과를 PASS가 아니라 **INCONCLUSIVE**로 보고한다 (§5.4) |
+| NFR-8 | **회사 코드 분리**: 회사 드라이버 정보를 담는 `features/`와 `adapters/`는 외부 경로에서 불러올 수 있어야 한다 (§10, 미결 Q2) |
 
 ---
 
@@ -60,12 +72,12 @@
         │  hctx → qid 매핑 (가변)
         ▼
  ┌─ qmgmt 계층 ───────────────────────────────────────────────┐
- │  sq_bitmap / cq_bitmap   (nvmeq->flags와 별개)             │
+ │  sq/cq 관리 bitmap  (nvmeq->flags와 별개)                   │
  │  생성/삭제, compaction(qid 재배치), IRQ 재배치              │
  └────────────────────────────────────────────────────────────┘
         │
         ▼
- NVMe IO SQ/CQ (qid 1..NSQA/NCQA, 스펙상 최대 65535)
+ NVMe IO SQ/CQ (qid 1..NSQA/NCQA, 스펙상 최대 65535). N:1 SQ→CQ 매핑 가능
         │  CQ.iv → MSI-X vector
         ▼
  non-managed IRQ (affinity를 런타임에 irq_set_affinity로 변경)
@@ -74,253 +86,513 @@
  PF / VF (Virtualization Mgmt 0x1C로 VQ/VI 재분배)
 ```
 
-전제가 되는 절차(사용자 설계, 2026-11-02 확인):
+전제가 되는 절차 [확정, 사용자 설계]:
 1. block quiesce → **drain(inflight 0)**. inflight가 남아 있으면 진행하지 않는다.
-2. 대상 SQ 삭제 → 대상 CQ 삭제 → sq/cq bitmap 비트 해제.
+2. 대상 SQ 삭제 → 대상 CQ 삭제 → sq/cq bitmap 비트 해제. CQ를 공유하는 SQ가 있으면 그 SQ들을 모두 삭제한 뒤에 CQ를 삭제한다.
 3. **compaction은 대상 SQ/CQ pair가 모두 삭제된 뒤에만** 진행한다.
 4. CQ 생성(iv 지정) → SQ 생성 → bitmap 비트 설정.
 5. IRQ도 같은 drain 구간 안에서 해제·재할당·affinity 변경을 한다.
 6. hctx 매핑 갱신 → unquiesce.
 
+이 절차의 목적은 **자원(queue, vector, bitmap)을 갱신하는 동안 다른 경로가 그 자원을 건드리지 못하게 제약하는 것**이다. 플랫폼은 이 제약이 실제로 지켜지는지를 검증한다.
+
 ---
 
-## 3. 세 관점 교차 검증 (3-view oracle)
+## 3. 아키텍처 개요
 
-같은 사실을 독립된 세 곳에서 읽고 대조한다. 정규화된 dataclass로 만들어 비교한다.
+### 3.1 구성도
 
-| View | 내용 | 수단 | 출처 |
+```
+┌─────────────────────── Host: nvmeval (단일 프로세스, asyncio) ───────────────────────┐
+│  Scenario (pytest)          "trigger → 관측 → 판정"                                  │
+│     │                                                                                │
+│  ┌──▼───────────────┐   ┌──────────────┐   ┌───────────────────────────────┐          │
+│  │ Feature plugins  │   │ Fault plans  │   │ Oracle                        │          │
+│  │ qmgmt/sriov/...  │   │ (테스트 범위)│   │  · Invariant (스냅샷 기반)    │          │
+│  └──┬───────────────┘   └──────┬───────┘   │  · Sequence  (이벤트 기반)    │          │
+│     │                          │           │  · Phase window               │          │
+│     │                          │           └──────▲───────────────▲────────┘          │
+│  ┌──▼──────────────────────────▼──────┐   ┌──────┴──────┐  ┌──────┴───────┐           │
+│  │ Control plane                       │   │ State model │  │ Event bus    │           │
+│  │ trigger · passthru · fault · stop   │   │ (정규 스키마)│  │ (정규 이벤트)│           │
+│  └──┬──────────┬─────────┬────────────┘   └──▲──────────┘  └──▲───────────┘           │
+│     │          │         │            views + adapter      event normalizers          │
+│  ┌──▼───┐  ┌───▼──┐  ┌───▼───┐  ┌──────────┴─────┐  ┌──────────┴──────────┐           │
+│  │ QMP  │  │ gdb  │  │ agent │  │ drgn            │  │ eBPF / QEMU trace   │           │
+│  └──┬───┘  └──┬───┘  └───┬───┘  └──┬─────────────┘  └──┬──────────────────┘           │
+└─────┼─────────┼──────────┼─────────┼────────────────────┼─────────────────────────────┘
+      ▼         ▼          ▼         ▼                    ▼
+   QEMU (vssd + fault engine)    Guest kernel (driver + nvmeval_stub.ko) / guest agent
+```
+
+계층은 셋으로 나뉘고, 판정 로직은 맨 위 계층에만 있다.
+- **통신(backends)**: 외부 시스템과 주고받기만 한다. 판정하지 않는다.
+- **변환(views, event normalizers)**: 원본 데이터를 정규 스키마와 정규 이벤트로 바꾼다.
+- **판정(oracle)**: 정규 형식만 입력으로 받는다.
+
+### 3.2 아키텍처 결정 목록
+
+| ID | 결정 | 상태 | 근거 / 대안 |
 |---|---|---|---|
-| **Driver** | qid별 nvmeq 상태, `sq_bitmap`/`cq_bitmap`, hctx→qid 매핑, `cq_vector`, quiesce 상태, inflight 수 | drgn `--qemu` (QMP unix 소켓 + vmcoreinfo) | 게스트 메모리 |
-| **Device** | `sq[]`/`cq[]` 존재 여부, size, cqid, iv, head/tail, IEN. MSI-X 테이블(addr/data/mask). VF별 VQ/VI 할당 | **신규 QMP `query-nvme-queues`** | QEMU `NvmeCtrl` |
-| **IRQ** | `irq_desc` affinity와 effective_affinity, CPU별 카운트, managed 여부, MSI 메시지 destination APIC ID | drgn, agent(procfs) | 게스트 커널 |
-
-공통 불변식은 drain 구간 밖에서는 항상 성립해야 한다.
-
-| ID | 불변식 |
-|---|---|
-| INV-Q1 | driver의 `sq_bitmap` = device의 SQ 집합, driver의 `cq_bitmap` = device의 CQ 집합 |
-| INV-Q2 | 모든 SQ의 cqid는 존재하는 CQ를 가리킨다. 모든 CQ의 iv는 활성(unmasked) MSI-X 엔트리를 가리킨다 |
-| INV-Q3 | 모든 hctx가 live qid 하나 이상에 매핑되고, 삭제된 qid로 가는 매핑은 없다 |
-| INV-Q4 | bitmap과 nvmeq->flags(ENABLED 등)가 서로 모순되지 않는다 |
-| INV-I1 | CQ.iv의 MSI destination이 해당 IRQ의 effective_affinity에 속한다 ([[20_msix_interrupt_e2e_qemu_trace]] 방식) |
-| INV-I2 | 재배치 이후 IRQ 카운트는 새 cpumask에 속한 CPU에서만 증가한다 |
-| INV-I3 | 해제된 vector에 매달린 IRQ handler가 없다 (IRQ 누수 없음) |
-| INV-IO | 제출 수 = 완료 수, fio verify 실패 0건, 오류 주입 시나리오가 아닌데 생긴 I/O error 0건 |
-| INV-V1 | PF와 VF의 VQ/VI 합계 ≤ flexible 자원 상한. 0x1C 결과와 device view가 일치한다 |
+| D1 | **정규 상태 스키마를 플랫폼의 중심 계약으로 둔다.** 흐름은 `드라이버 → adapter → 정규 스키마 → 판정`이다. 구조는 core 스키마 + feature 확장 네임스페이스(`ext`) | 제안 | 드라이버 API가 계속 바뀐다. 판정이 드라이버 필드를 직접 읽으면 드라이버가 바뀔 때마다 판정 코드도 고쳐야 한다. 대안 "feature마다 독자 스키마"는 공통 불변식(INV-Q*)을 재사용할 수 없어 기각 (§4) |
+| D2 | **판정은 두 축으로 한다.** Invariant(상태)와 Sequence(순서)를 phase window로 잇는다 | 제안 | drain 구간 안에서는 상태가 일시적으로 불일치하는 것이 정상이다. 그래서 구간 안은 순서로, 구간 밖은 상태로 판정한다 (§5) |
+| D3 | **전역 시계에 의존하지 않는다.** 출처 내부 순서, cid 인과 조인, stub 마커, checkpoint 정지로 순서를 정한다 | 제안 | 게스트 ktime과 QEMU 시각을 맞출 수 없다. TCG에서는 시간 비율도 일정하지 않다 (§5.3) |
+| D4 | **게스트 agent는 얇게 둔다.** 실행과 스트림 전달만 하고, 판정 로직은 모두 호스트에 둔다 | 제안 | 게스트는 Python 3.9이고 OA PC에 배포해야 한다. 바뀌는 부분(판정, adapter)을 호스트에 모은다 |
+| D5 | **호스트는 단일 asyncio 루프로 실행한다.** drgn(동기 API)은 전용 스레드에서 돌린다 | 제안 | 경쟁 시나리오("fio 부하 + 비동기 trigger + N번째 Delete SQ fault")를 한 곳에서 조율해야 한다. 대안인 멀티프로세스는 조율 비용이 커서 기각 |
+| D6 | **feature는 플러그인으로 조합한다.** 구성: `{triggers, 스키마 ext, adapter 키, invariants, sequence rules, scenarios}` | 제안 | sriov는 VF마다 qmgmt를 재사용한다. 그래서 스키마의 최상위 단위를 function(PF/VF)으로 둔다 |
+| D7 | **fault의 수명은 테스트에 묶는다.** 테스트가 끝나면 자동 해제하고 발동 이력을 산출물에 남긴다. 장치(QEMU), 커널(fault_inject), gdb 주입을 같은 `FaultPlan` 인터페이스로 다룬다 | 제안 | fault 규칙이 남아 있으면 다음 테스트가 오염된다 |
+| D8 | **환경 차이는 profile로 흡수한다.** `profile = {qemu 경로, kernel, rootfs, adapter, accel, features 경로}` | 제안 | 개발 서버와 OA PC에서 코드는 같고 설정만 다르게 한다 |
+| D9 | **trigger 채널은 UAPI ioctl과 stub 직접 호출을 함께 쓴다** | 제안 | UAPI 경로 검증과 내부 단계 분리 검증이 모두 필요하다 (§7) |
+| D10 | **장치 오류 주입은 QEMU 규칙 엔진 + 신규 QMP 명령으로 한다** | 확정 (방향) | 기본 QMP로는 NVMe 프로토콜 수준의 오류를 넣을 수 없다 (§8) |
 
 ---
 
-## 4. 순서 제약 (sequence constraints)
+## 4. 정규 상태 스키마 (D1)
 
-qmgmt 절차를 시간 순서 속성으로 표현하고, 이벤트 스트림에서 검사한다. 이벤트는 다음 세 곳에서 받는다.
-- 게스트 eBPF: qmgmt 함수 kprobe, `block_rq_*`, quiesce/unquiesce
-- QEMU trace: `pci_nvme_create_sq`/`cq`, `pci_nvme_del_sq`/`cq`, `pci_nvme_irq_*`
-- checkpoint 스냅샷
+### 4.1 계층 구조
+
+```
+Snapshot                                   ← 한 시점, 한 view의 전체 상태
+ ├─ meta: view(driver|device|irq), source, snap_seq, vm_state(running|stopped),
+ │        phase(현재 phase window 이름 또는 None), checkpoint(이름 또는 None)
+ └─ functions{fn_id → Function}            ← PF/VF 단위. fn_id = PCI BDF 문자열
+      ├─ ctrl:    ControllerState           (enabled, csts{rdy,cfs,shst}, cc, is_vf, parent_fn, nr_vfs)
+      ├─ sqs:     {qid → SQ}                (cqid, size, state, prio, head, tail)
+      ├─ cqs:     {qid → CQ}                (iv, size, ien, state, head, tail)
+      ├─ vectors: {v   → Vector}            (irq, affinity, effective, dest_apic, masked, managed)
+      ├─ hctx:    {hctx_idx → Hctx}         (qids[], cpus[], quiesced, inflight)
+      └─ ext:     {"qmgmt": QmgmtExt, "sriov": SriovExt, ...}   ← feature 확장 네임스페이스
+```
+
+- **최상위 단위는 function이다.** VF와 multi-PF를 처음부터 넣어 두면 sriov feature가 qmgmt 판정을 VF마다 그대로 재사용할 수 있다.
+- **core에 넣는 기준**: NVMe 스펙이나 커널 공통 개념(SQ, CQ, vector, hctx)이고, **두 개 이상의 view에서 관측할 수 있는** 필드만 core에 둔다. 교차 검증의 대상이 core다.
+- **ext에 넣는 기준**: 한 view에서만 보이는 드라이버 고유 상태다(예: qmgmt 관리 bitmap). ext는 feature가 dataclass로 선언하고 `schema.ext.register("qmgmt", QmgmtExt)`로 등록한다. 다른 feature의 ext는 읽기만 할 수 있다.
+- **qid 0(admin queue)도 sqs/cqs에 포함한다.** 판정 규칙에서 IO queue만 볼 때는 필터로 거른다.
+
+### 4.2 view별 채우는 필드
+
+| 필드 | Driver (drgn + adapter) | Device (QMP) | IRQ (drgn / procfs) |
+|---|---|---|---|
+| `ctrl.csts`, `ctrl.cc` | ✅ 드라이버가 마지막에 읽은 값 | ✅ 레지스터 값 | – |
+| `sqs[qid].cqid/size` | ✅ | ✅ | – |
+| `sqs[qid].head/tail` | ✅ 드라이버가 아는 값 | ✅ 장치가 아는 값 | – |
+| `cqs[qid].iv` | ✅ | ✅ | – |
+| `vectors[v].irq/affinity/effective/managed` | △ (드라이버가 기록한 irq 번호) | – | ✅ |
+| `vectors[v].dest_apic/masked` | – | ✅ MSI-X 테이블 | ✅ MSI 메시지 |
+| `hctx[*]` | ✅ | – | – |
+| `ext.qmgmt.*` (bitmap 등) | ✅ | – | – |
+| `ext.sriov.*` (VQ/VI 할당) | ✅ | ✅ | – |
+
+### 4.3 값의 의미 규칙
+
+| 값 | 의미 | 판정에서의 처리 |
+|---|---|---|
+| 필드 없음 / 키 없음 | 해당 객체가 **존재하지 않는다**(예: 삭제된 SQ) | 존재 여부 비교 대상 |
+| `Unknown` (센티넬) | 이 view가 **관측할 수 없다** | 비교에서 제외한다. 규칙이 그 필드를 필수로 요구하면 INCONCLUSIVE |
+| `None` | 관측했고, 값이 "없음"이다 (예: 할당되지 않은 irq) | 일반 값으로 비교 |
+
+이 구분을 두지 않으면 "device view가 hctx를 모른다"와 "hctx가 없다"를 구별할 수 없어 판정이 틀어진다.
+
+### 4.4 스냅샷 일관성
+
+| 모드 | 방법 | 일관성 | 용도 |
+|---|---|---|---|
+| **stopped** | QMP `stop`이나 gdb breakpoint로 VM을 정지시킨 뒤 세 view를 읽는다 | 세 view가 같은 시점이다. 단 아래 주의 사항이 있다 | 불변식 판정의 기본 |
+| running | VM을 실행한 채로 읽는다 | 필드끼리 시점이 어긋난 값(torn read)이 나올 수 있다 | 모니터링, 디버깅용. **판정에는 쓰지 않는다** |
+
+**stopped 모드 주의 사항** (코드 근거):
+- QEMU의 `do_vm_stop()`은 vCPU를 멈춘 뒤 `bdrv_drain_all()`을 호출한다(`qemu-debug/qemu-11.1.2/system/cpus.c:296~320`). gdbstub breakpoint로 정지할 때도 같은 경로를 탄다. 근거: `vm_stop(RUN_STATE_DEBUG)`(`qemu-debug/qemu-11.1.2/gdbstub/system.c:119`).
+- 따라서 정지 시점에 **장치는 진행 중이던 블록 I/O를 완료해 CQ 엔트리를 쓰고 interrupt를 올렸지만, 게스트 드라이버는 아직 처리하지 않은 상태**가 있을 수 있다. 즉 device view가 driver view보다 앞서 있을 수 있다.
+- 처리 방침: CQ head/tail, 미처리 CQE 수 같은 "진행 정도" 필드는 정확히 같을 것을 요구하지 않는다. 대신 **"장치가 같거나 앞서 있다"는 순서 관계로 비교**한다. queue 존재 여부, cqid, iv, size 같은 구성 필드는 정확히 같아야 한다.
+- doorbell이 기록됐지만 장치가 아직 처리하지 않은 admin 명령이 있을 수 있다. 그래서 device view에 admin SQ head/tail을 포함시켜, 판정할 때 "처리 대기 중인 admin 명령 수"를 함께 본다.
+
+---
+
+## 5. 판정 (D2, D3)
+
+### 5.1 Invariant 축: 스냅샷 기반
+
+규칙 정의 형태:
+```python
+@invariant("INV-Q1", scope="function", phases=OUTSIDE_DRAIN,
+           needs=["driver.ext.qmgmt.sq_bitmap", "device.sqs"])
+def sq_bitmap_matches_device(drv: Function, dev: Function) -> Verdict:
+    want = set(drv.ext["qmgmt"].sq_bitmap)               # 드라이버가 할당했다고 믿는 qid
+    have = {q for q in dev.sqs if q != 0}                # 장치에 실제로 있는 IO SQ
+    return expect_equal(want, have, detail="sq bitmap vs device SQ set")
+```
+
+- `scope`: function, controller, global 중 하나. function scope 규칙은 PF/VF마다 자동으로 반복 적용된다.
+- `phases`: 이 규칙이 적용되는 phase window. drain 구간 안에서는 공통 불변식이 비활성이다.
+- `needs`: 필요한 필드 목록. 하나라도 `Unknown`이면 INCONCLUSIVE를 반환한다.
+- 결과는 PASS / FAIL / INCONCLUSIVE 셋 중 하나이고, 비교한 값과 출처 스냅샷 id를 담는다.
+
+평가 시점: (1) 테스트 시작 직후의 기준선, (2) 각 phase window가 끝난 직후, (3) checkpoint, (4) 테스트 종료. 모두 stopped 스냅샷으로 평가한다.
+
+공통 불변식 (drain 구간 밖에서 항상 성립):
+
+| ID | 불변식 | 비교 view |
+|---|---|---|
+| INV-Q1 | driver의 SQ 할당 집합(qmgmt면 bitmap) = device의 SQ 집합. CQ도 마찬가지 | driver ↔ device |
+| INV-Q2 | 모든 SQ의 cqid는 존재하는 CQ를 가리킨다. 모든 CQ의 iv는 활성(unmasked) MSI-X 엔트리를 가리킨다 | device (+ driver) |
+| INV-Q3 | 모든 hctx가 live qid 하나 이상에 매핑되고, 삭제된 qid로 가는 매핑은 없다 | driver ↔ device |
+| INV-Q4 | 드라이버 내부 표현끼리 모순이 없다 (qmgmt bitmap ↔ nvmeq->flags 등. 구체 규칙은 feature가 정의) | driver |
+| INV-Q5 | 구성 필드(cqid, size, iv)가 driver와 device에서 같다 | driver ↔ device |
+| INV-I1 | CQ.iv의 MSI destination이 해당 IRQ의 effective_affinity에 속한다 ([[20_msix_interrupt_e2e_qemu_trace]] 방식) | device ↔ irq |
+| INV-I2 | 재배치 이후 IRQ 카운트는 새 cpumask에 속한 CPU에서만 증가한다 (두 스냅샷의 차분) | irq |
+| INV-I3 | 해제된 vector에 매달린 IRQ handler가 없다 (IRQ 누수 없음) | driver ↔ irq |
+| INV-IO | 제출 수 = 완료 수, fio verify 실패 0건, 오류 주입 시나리오가 아닌데 생긴 I/O error 0건 | agent |
+| INV-V1 | PF와 VF의 VQ/VI 합계 ≤ flexible 자원 상한. 0x1C 결과와 device view가 일치한다 | driver ↔ device |
+
+### 5.2 Sequence 축: 이벤트 기반
+
+정규 이벤트의 형식:
+```
+Event{ src(guest_bpf|qemu_trace|stub|agent|qmp), src_seq, kind, fn_id, qid?, cid?, vector?, args{}, status? }
+```
+- kind 예시: `AdminSubmit`, `AdminComplete`, `DevCreateSQ`, `DevDeleteSQ`, `DevCreateCQ`, `DevDeleteCQ`, `Quiesce`, `Unquiesce`, `IrqAlloc`, `IrqFree`, `IrqAffinity`, `BitmapSet`, `BitmapClear`, `TriggerEnter`, `TriggerExit`, `FaultFired`, `CtrlReset`
+- 원본(bpftrace 출력, QEMU trace 줄)을 정규 이벤트로 바꾸는 normalizer는 출처별로 하나씩 둔다. 드라이버 고유 이벤트(`BitmapSet` 등)의 kprobe 위치는 adapter가 정한다.
+
+qmgmt 순서 제약:
 
 | ID | 제약 |
 |---|---|
-| S1 | `Delete SQ(q)`가 장치에 도착한 시점에는 q에 매핑된 hctx가 모두 quiesce 상태이고 `inflight(q) = 0`이다 |
-| S2 | `Delete CQ(q)`는 `Delete SQ(q)`가 성공한 뒤에만 온다. CQ를 공유하는 SQ가 남아 있으면 안 된다 |
-| S3 | compaction 진입 시 대상 q는 `sq_bit = 0 ∧ cq_bit = 0`이고, device에도 SQ/CQ가 없다 |
-| S4 | vector v의 `free_irq`나 affinity 변경은 v를 쓰는 live CQ가 없을 때만, 또는 해당 CQ가 drain된 상태에서만 일어난다 |
-| S5 | `Create CQ(q, iv)` 전에 iv가 할당되어 있다. `Create SQ(q)`는 `Create CQ(cqid)`가 성공한 뒤에만 온다 |
-| S6 | bitmap 비트 변화는 quiesce부터 unquiesce까지의 구간 안에서만 일어난다 |
-| S7 | unquiesce 직후 §3의 공통 불변식이 모두 성립한다 |
-| E1 | 절차 중 admin 명령이 실패하면(오류 주입 포함), 복구가 끝난 뒤 INV-Q1~Q4와 INV-I3이 성립한다. 즉 부분 상태와 누수가 없다 |
-| E2 | 절차 중 CFS나 컨트롤러 리셋이 발생하면, 리셋 완료 후 bitmap이 재구성된 장치 상태와 일치한다 |
+| S1 | `DevDeleteSQ(q)` 시점에 q에 매핑된 hctx가 모두 quiesce 상태이고 `inflight(q) = 0`이다 |
+| S2 | `DevDeleteCQ(c)`는 c를 cqid로 가진 모든 SQ의 `DevDeleteSQ`가 성공한 뒤에만 온다 (N:1 매핑 고려) |
+| S3 | compaction 진입(`TriggerEnter` 또는 adapter가 정한 kprobe) 시 대상 q는 `sq_bit = 0 ∧ cq_bit = 0`이고, device에도 SQ/CQ가 없다 |
+| S4 | vector v의 `IrqFree`나 `IrqAffinity`는 v를 iv로 쓰는 live CQ가 없거나, 그 CQ가 drain된 상태에서만 일어난다 |
+| S5 | `DevCreateCQ(c, iv)` 전에 iv에 대한 `IrqAlloc`이 있다. `DevCreateSQ(q, cqid=c)`는 `DevCreateCQ(c)`가 성공한 뒤에만 온다 |
+| S6 | `BitmapSet` / `BitmapClear`는 `Quiesce`~`Unquiesce` 구간 안에서만 일어난다 |
+| S7 | `Unquiesce` 직후 §5.1의 공통 불변식이 모두 성립한다 (invariant 축으로 넘김) |
+| E1 | 절차 중 admin 명령이 실패하면, 복구가 끝난 뒤 INV-Q1~Q5와 INV-I3이 성립한다 (부분 상태와 누수 없음) |
+| E2 | 절차 중 CFS나 컨트롤러 리셋이 발생하면, 리셋 완료 후 driver 상태가 재구성된 장치 상태와 일치한다 |
 
-검사기는 이벤트에 `(ctrl, qid, cid, vector)` 키를 붙여 조인한다. 시각 정렬에는 의존하지 않는다. 게스트 이벤트와 장치 이벤트는 같은 admin 명령의 cid로 묶는다.
+### 5.3 순서 결정 방법 (D3)
+
+| 범위 | 방법 |
+|---|---|
+| 같은 출처 안 | `src_seq` (출처가 단조 증가로 부여) |
+| 게스트 ↔ 장치 | admin 명령의 `(fn_id, cid)`로 인과 관계를 잇는다. `AdminSubmit` → `DevXxx` → `AdminComplete` |
+| trigger 경계 | stub이 `TriggerEnter`/`TriggerExit` 마커를 남긴다. 같은 시퀀스 카운터를 eBPF 쪽에서도 읽어 조인한다 |
+| 정확한 순간 | checkpoint로 VM을 정지시키고 스냅샷을 찍는다 |
+
+순서 규칙 엔진은 이벤트를 위 관계로 이은 **부분 순서(partial order)** 위에서 규칙을 평가한다. 두 이벤트의 순서를 결정할 수 없는데 규칙이 그 순서를 요구하면 INCONCLUSIVE다.
+
+### 5.4 phase window와 판정 결과
+
+- phase window는 이름이 붙은 구간이다. 예: `drain` = `Quiesce` ~ `Unquiesce`, `reset` = `CtrlReset` ~ `CSTS.RDY=1`.
+- window 경계는 이벤트로 정한다. window 안에서는 그 window에 지정된 순서 규칙만 켜고, 공통 불변식은 끈다.
+- 판정 집계: 규칙 하나라도 FAIL이면 FAIL. FAIL이 없고 INCONCLUSIVE가 있으면 INCONCLUSIVE. 모두 PASS일 때만 PASS.
+- **관측 누락은 INCONCLUSIVE로 승격한다**: eBPF ringbuf 손실 카운터가 0이 아니거나, QEMU trace가 잘렸거나, agent 스트림이 끊기면 해당 구간의 순서 규칙 결과를 INCONCLUSIVE로 바꾼다 (NFR-7).
 
 ---
 
-## 5. Trigger 주입 — `nvmeval_stub.ko`
+## 6. Adapter — 드라이버별 매핑 (D1, FR-11)
 
-### 5.1 방식 비교
+### 6.1 원칙
+- OA PC 드라이버의 API와 custom field는 이 서버의 코드와 다르고, 앞으로도 계속 바뀐다. 그래서 **드라이버 고유 정보는 전부 adapter(yaml 데이터)와 feature(Python)에만 둔다.**
+- adapter가 담는 것:
+  - 필드 경로 (drgn C 표현식)
+  - kprobe 위치 (정규 이벤트 생성용)
+  - trigger 심볼과 인자
+  - **UAPI ioctl 번호와 구조체 레이아웃**: ctypes 정의를 코드에 박지 않고 adapter 선언으로 생성한다
+  - checkpoint 위치
+
+### 6.2 예시 (가상의 이름)
+```yaml
+# adapters/qmgmt-oa.yaml — OA PC에서 adapter-scan으로 초안 생성 후 보정
+adapter: qmgmt-oa
+kernel: "7.2.0-*"
+driver_view:
+  dev_from_ctrl: "container_of(ctrl, struct nvme_dev, ctrl)"
+  queues:        "dev->queues[0:dev->nr_allocated_queues]"
+  sq:  {cqid: "nvmeq->cqid", size: "nvmeq->q_depth", tail: "nvmeq->sq_tail"}
+  cq:  {iv: "nvmeq->cq_vector", head: "nvmeq->cq_head"}
+  ext.qmgmt:
+    sq_bitmap: {expr: "dev->qmgmt.sq_bitmap", type: bitmap, nbits: "dev->qmgmt.max_qid"}
+    cq_bitmap: {expr: "dev->qmgmt.cq_bitmap", type: bitmap, nbits: "dev->qmgmt.max_qid"}
+events:                       # 드라이버 고유 정규 이벤트의 kprobe 위치
+  BitmapSet:   {kprobe: "nvme_qmgmt_bitmap_set",   args: {qid: arg1, kind: arg2}}
+  BitmapClear: {kprobe: "nvme_qmgmt_bitmap_clear", args: {qid: arg1, kind: arg2}}
+triggers:
+  compact:  {kind: call,  symbol: nvme_qmgmt_compact, args: [obj:dev]}
+  create:   {kind: ioctl, dev: "/dev/nvme{n}", nr: "_IOWR('N', 0x80, struct nvme_qmgmt_create)",
+             struct: nvme_qmgmt_create}      # 레이아웃은 DWARF에서 읽고 sizeof를 검증
+checkpoints:
+  compact_enter: nvme_qmgmt_compact
+  after_pair_delete: "nvme_qmgmt_del_pair%return"
+```
+
+### 6.3 검증과 생성
+- **세션 시작 시 검증** (`adapter/loader.py`): 하나라도 실패하면 테스트를 시작하지 않는다.
+  - 모든 필드 경로를 drgn으로 평가해 존재 여부와 타입을 확인한다.
+  - trigger, kprobe, checkpoint 심볼이 kallsyms에 있는지, inline으로 사라지지 않았는지 확인한다.
+  - ioctl 구조체의 `sizeof`와 필드 오프셋을 DWARF와 대조한다.
+- **초안 생성** (`nvmeval adapter-scan`): drgn으로 `struct nvme_dev`, `struct nvme_queue`, 이름 패턴(`*qmgmt*` 등)에 맞는 심볼과 구조체를 덤프해 adapter 초안을 만든다. 손으로 옮겨 적다가 생기는 오류를 줄이기 위한 것이다.
+
+---
+
+## 7. Trigger 주입 (D9)
+
+### 7.1 방식 비교
 
 | 방식 | 장점 | 문제 | 판정 |
 |---|---|---|---|
-| sysfs/debugfs 노드를 드라이버에 추가 | 단순하다 | 기능마다 드라이버를 수정해야 하고, "동적인 feature 형태"가 아니다 | 기각 (사용자 결정) |
-| gdbstub으로 함수 호출 주입(PC/레지스터 조작) | 모듈이 필요 없다 | 모든 vCPU가 멈춘 상태에서 호출하므로 sleep이 불가능하다. quiesce/drain은 sleep해야 한다 | 기각 |
-| eBPF | 안전하다 | 임의의 커널 함수를 호출할 수 없다(kfunc만 가능) | 기각 |
-| **범용 trigger stub 모듈** | sleep 가능한 context, 드라이버 무수정, 심볼 이름만으로 동작한다 | 테스트 전용 모듈을 빌드해야 한다 | **채택** |
+| sysfs/debugfs 노드를 드라이버에 추가 | 단순하다 | 기능마다 드라이버를 수정해야 한다. 동적인 feature 형태가 아니다 | 기각 (사용자 결정) |
+| gdbstub으로 함수 호출 주입(PC/레지스터 조작) | 모듈이 필요 없다 | 모든 vCPU가 멈춘 상태에서 호출하므로 sleep할 수 없다. quiesce/drain은 sleep해야 한다 | 기각 |
+| eBPF | 안전하다 | 임의의 커널 함수를 호출할 수 없다 (kfunc만 가능) | 기각 |
+| **드라이버 UAPI ioctl** | 실제 사용 경로를 그대로 검증한다 | 노출된 단위로만 호출할 수 있다 | **채택 (kind=ioctl)** |
+| **범용 trigger stub 모듈** | sleep 가능한 context, 드라이버 무수정, 심볼만으로 내부 단계를 호출한다 | 테스트 전용 모듈을 빌드해야 한다 | **채택 (kind=call)** |
 
-> 참고: [[nvme-queue-mgmt-design]]에 따르면 custom 드라이버에는 이미 `NVME_IOCTL_QMGMT_CREATE/DELETE/INFO` ioctl이 있다. 그래서 trigger 채널은 두 가지를 함께 쓴다.
-> **(a) 드라이버 UAPI ioctl**: 사용자가 실제로 쓰는 경로를 검증할 때. **(b) stub 직접 호출**: ioctl로 노출되지 않은 내부 단계(compaction, IRQ 재배치)를 따로 떼어 호출할 때.
-> plugin의 `Trigger`는 `kind="ioctl" | "call"`로 둘 중 하나를 고른다. N:1 SQ-CQ 매핑이 있으므로 S2는 "CQ를 공유하는 모든 SQ가 삭제된 뒤"로 해석한다.
-
-### 5.2 구조
+### 7.2 stub 구조
 
 ```
-host: Feature plugin ──(Trigger 정의: 심볼명 + 인자 스펙)──▶ agent RPC
-guest agent ──ioctl(NVMEVAL_IOC_CALL)──▶ /dev/nvmeval  (nvmeval_stub.ko)
-   nvmeval_stub: kallsyms 해석(kprobe 기법) → 함수 포인터 → 호출
-               └ sync: ioctl을 부른 스레드(process context, sleep 가능)에서 직접 호출
-               └ async: 전용 kthread에서 실행, 완료는 eventfd/poll로 알림
-                        → "I/O 부하 + trigger 동시 실행" 경쟁 시나리오용
+host: Feature plugin ──(Trigger: kind, 심볼/ioctl, 인자 스펙)──▶ agent RPC
+guest agent ─┬─ kind=ioctl: 드라이버 장치 노드에 직접 ioctl (구조체는 adapter 선언으로 생성)
+             └─ kind=call : ioctl(NVMEVAL_IOC_CALL) ──▶ /dev/nvmeval (nvmeval_stub.ko)
+                  nvmeval_stub: 심볼 해석(kprobe 등록으로 주소 획득) → 함수 포인터 → 호출
+                    ├ sync : ioctl을 부른 스레드(process context, sleep 가능)에서 호출
+                    └ async: 전용 kthread에서 실행. 완료는 poll/eventfd로 알림
+                             → "I/O 부하 + trigger 동시 실행" 경쟁 시나리오용
 ```
 
-- **인자 모델**: `u64` 값, 또는 객체 selector(`ctrl:nvme0`, `nvmeq:nvme0:3`, `hctx:nvme0n1:2`). selector는 stub 안에서 해석한다. 예를 들어 `nvme0`은 `class_find_device`로 `nvme_ctrl`을 찾고, 거기서 `to_nvme_dev`로 내려간다. 호스트 drgn이 읽은 주소를 raw 포인터로 넘기는 방식도 허용하되, 커널 주소 범위인지 검사한다.
-- **반환**: 함수의 반환값(int/long)과 실행 시간, 그리고 stub이 기록한 전후 시퀀스 번호를 돌려준다. 시퀀스 번호는 eBPF 이벤트와 조인할 때 쓴다.
-- **드라이버 쪽 요구사항**: trigger 진입 함수는 `noinline`이어야 하고 kallsyms에 보여야 한다. static이어도 kallsyms에 있으면 된다(`CONFIG_KALLSYMS_ALL`). OA PC 구현에서 확인할 것.
-- **안전장치**: 시그니처 화이트리스트(plugin이 선언한 심볼만 호출 가능), 재진입 직렬화 옵션, 테스트 전용 빌드(`MODULE_LICENSE("GPL")`, 배포 금지).
-
-Plugin 선언 예:
-```python
-TRIGGERS = {
-    "compact":   Trigger("nvme_qmgmt_compact",   args=[Obj("dev")]),            # 이름은 OA PC adapter에서 확정
-    "del_pair":  Trigger("nvme_qmgmt_del_pair",  args=[Obj("dev"), U16("qid")]),
-    "irq_remap": Trigger("nvme_qmgmt_irq_remap", args=[Obj("dev"), U16("qid"), CpuMask("mask")]),
-}
-```
+- **인자 모델**: `u64` 값, 또는 객체 selector(`ctrl:nvme0`, `nvmeq:nvme0:3`, `hctx:nvme0n1:2`). selector는 stub 안에서 해석한다. `nvme_ctrl`→`nvme_dev` 변환처럼 드라이버 구조에 의존하는 부분은 adapter가 정의한 오프셋을 stub에 넘겨서 처리한다. 호스트 drgn이 읽은 raw 포인터도 허용하되, 커널 주소 범위인지 검사한다.
+- **반환**: 함수 반환값, 실행 시간, stub 시퀀스 번호(`TriggerEnter`/`TriggerExit`).
+- **드라이버 쪽 요구사항**: `kind=call` 대상 함수는 kallsyms에 보여야 하고 inline되지 않아야 한다. kallsyms는 OA PC에서 확인할 수 있다고 사용자가 확인했다. inline 여부는 adapter 검증 단계에서 잡는다.
+- **안전장치**: adapter가 선언한 심볼만 호출할 수 있다(화이트리스트). 재진입 직렬화 옵션을 둔다. 테스트 전용 빌드이며 배포하지 않는다.
+- **호출 계약**: 호출되는 함수가 기대하는 락이나 상태 전제(예: 호출자가 ctrl mutex를 잡고 있어야 함)는 stub이 알 수 없다. 그래서 `kind=call` 대상은 **"외부에서 호출해도 되는 진입점"으로 설계된 함수에 한정**한다 (§13 R3).
 
 ---
 
-## 6. 장치 오류 주입 — QEMU 규칙 엔진
+## 8. 장치 오류 주입 — QEMU 규칙 엔진 (D10)
 
-QEMU `hw/nvme`에 규칙 테이블을 두고, admin/IO 명령을 처리하는 지점(`nvme_admin_cmd`, `nvme_io_cmd`, completion 게시, IRQ assert)에 hook을 건다.
+QEMU `hw/nvme`에 규칙 테이블을 두고, 명령 처리 지점(admin/IO 명령 디스패치, completion 게시, IRQ assert)에 hook을 건다.
 
-**QMP 명령 (신규, QAPI):**
-- `nvme-fault-add {id, trigger, action, count}`
+**신규 QMP 명령 (QAPI):**
+- `nvme-fault-add {id, ctrl, trigger, action, count}`
 - `nvme-fault-del {id}`
-- `nvme-fault-list`
-- `query-nvme-queues {id}`
+- `nvme-fault-list` (발동 횟수 포함)
+- `query-nvme-queues {ctrl}`: device view 원본
 
 | 트리거 필드 | 의미 |
 |---|---|
 | `queue` | `admin` / `io` / `sqid:N` |
-| `opcode` | 예: 0x00 Delete SQ, 0x01 Create SQ, 0x04 Delete CQ, 0x05 Create CQ, 0x1C Virt Mgmt |
+| `opcode` | 예: 0x00 Delete I/O SQ, 0x01 Create I/O SQ, 0x04 Delete I/O CQ, 0x05 Create I/O CQ, 0x1C Virtualization Mgmt |
 | `match` | CDW10/11 필드 매칭 (qid, qsize, iv, cqid) |
 | `nth` / `count` | 몇 번째부터 몇 번 적용할지 |
-| `phase` | `before`(처리 전 가로채기) / `after_ok`(정상 처리 후) / `after_err` |
+| `phase` | `before`(처리 전에 가로챔) / `after_ok`(정상 처리 후) / `after_err` |
 | `after_rule` | 다른 규칙이 발동한 뒤에만 활성화 (연쇄) |
 
 | 동작 | 효과 | 검증 대상 |
 |---|---|---|
-| `status{sct,sc,dnr}` | 처리 대신, 또는 처리 후 지정 status를 반환 | 롤백 경로 (E1) |
+| `status{sct,sc,dnr}` | 처리 대신(before) 또는 처리 후(after) 지정 status를 반환 | 롤백 경로 (E1) |
 | `set_cfs` | CSTS.CFS = 1 | 리셋 복구 (E2) |
 | `drop` | completion을 게시하지 않음 | admin 타임아웃 경로 |
 | `delay{ms}` | completion을 지연 | 절차 중간에 다른 이벤트 끼워 넣기 |
 | `aer{type,info}` | Async Event 발생 | AEN 처리 |
 | `irq_suppress` / `irq_vector{v}` | 인터럽트 누락 / 다른 vector로 발생 | IRQ 재배치 검증 |
-| `nssr` | NVM Subsystem Reset (기존 Q5 패치 재사용) | 전체 복구 |
+| `nssr` | NVM Subsystem Reset (기존 NSSR 패치 재사용) | 전체 복구 |
 
-예: "두 번째 Delete SQ는 Invalid Queue Deletion으로 실패하고, 그 직후 Create CQ가 성공하면 CFS를 설정한다."
+`phase=after_*`의 `status` 동작은 **장치 상태는 바뀌었는데 드라이버는 실패로 아는** 상황을 만든다. 예를 들어 SQ는 실제로 삭제됐는데 드라이버에는 오류가 돌아간다. 이것은 롤백 로직이 장치 상태를 다시 확인하는지 검증하는 핵심 케이스다.
+
+예: "두 번째 Delete SQ는 Invalid Queue Deletion으로 실패하고, 그 뒤 Create CQ가 성공하면 CFS를 설정한다."
 ```python
-qmp.fault_add("r1", trigger=dict(queue="admin", opcode=0x00, nth=2, phase="before"),
-              action=dict(type="status", sct=1, sc=0x0C, dnr=True), count=1)
-qmp.fault_add("r2", trigger=dict(queue="admin", opcode=0x05, phase="after_ok", after_rule="r1"),
-              action=dict(type="set_cfs"), count=1)
+faults.add("r1", trigger=dict(queue="admin", opcode=0x00, nth=2, phase="before"),
+           action=dict(type="status", sct=1, sc=0x0C, dnr=True), count=1)
+faults.add("r2", trigger=dict(queue="admin", opcode=0x05, phase="after_ok", after_rule="r1"),
+           action=dict(type="set_cfs"), count=1)
 ```
 
-보조 수단:
+보조 수단 (같은 `FaultPlan` 인터페이스로 다룬다):
 - 게스트 `drivers/nvme/host/fault_inject.c`(debugfs): 드라이버가 받은 completion status를 변조한다.
-- checkpoint(gdb breakpoint): 정확한 코드 지점에서 VM 전체를 멈추고, 그 상태에서 QMP 규칙을 활성화한 뒤 재개한다. "compaction 3단계 진입 직후 CFS" 같은 정밀 경쟁을 만들 때 쓴다.
+- checkpoint(gdb breakpoint): 정확한 코드 지점에서 VM을 멈추고, QMP 규칙을 활성화한 뒤 재개한다. "compaction 특정 단계 진입 직후 CFS" 같은 정밀 경쟁을 만든다.
 
 ---
 
-## 7. 소프트웨어 구조
+## 9. 시나리오 예
+
+```python
+@pytest.mark.feature("qmgmt")
+def test_compact_rollback_on_delete_sq_fail(vm, faults, trigger, agent, oracle):
+    agent.fio_start(profile="randrw-verify", jobs=8)
+    faults.add("r1", trigger=dict(queue="admin", opcode=0x00, nth=1),
+               action=dict(type="status", sct=1, sc=0x0C, dnr=True))
+    r = trigger("compact", fn="nvme0")
+    assert r.ret != 0                                  # 실패를 상위로 보고해야 한다
+    oracle.sequence.expect(["S1", "S6", "E1"])         # 순서 제약 + 롤백
+    oracle.invariant.expect(["INV-Q1", "INV-Q2", "INV-Q3", "INV-I3"])
+    assert agent.fio_stop().verify_errors == 0
+    # 종료 시 fixture가 fault 해제, 최종 스냅샷, verdict.json 기록
+```
+
+---
+
+## 10. 디렉토리 구조 [제안]
+
+위치: `company/nvmeval/`, 독립 git 저장소. 설계 문서는 `deep/`에 둔다.
 
 ```
 nvmeval/
-├── core/
-│   ├── machine.py      QEMU cmdline 빌더(프로파일: single / sriov / multi-pf), 기동·종료·watchdog
-│   ├── artifacts.py    테스트별 산출물 디렉터리
-│   ├── events.py       이벤트 버스, (ctrl,qid,cid,vector) 조인
-│   ├── invariant.py    불변식 엔진(스냅샷 기반) + 순서 제약 검사기(이벤트 기반)
-│   └── checkpoint.py   gdb bp → pause → snapshot → 평가 → cont
-├── backends/
-│   ├── qmp.py          qemu.qmp(asyncio). 이벤트 구독, fault_*, query_nvme_queues
-│   ├── gdbrsp.py       순수 Python GDB RSP 클라이언트 (bp, mem r/w, cont)
-│   ├── drgnview.py     drgn --qemu 연결, 타입/심볼 기반 읽기
-│   ├── agent.py        게스트 agent JSON-RPC (virtio-serial)
-│   └── device/         DeviceBackend 인터페이스: vssd(QMP) 구현 / vfio-user sim(향후)
-├── views/              DriverView · DeviceView · IrqView (dataclass + 정규화)
-├── guest/
-│   ├── agent.py        게스트 쪽 (9p hostroot chroot의 python3): ioctl passthru, trigger, eBPF, fio
-│   └── stub/           nvmeval_stub.ko 소스 (out-of-tree, 대상 커널에 맞춰 빌드)
+├── pyproject.toml              # Python ≥3.9. 의존성: qemu.qmp, drgn, pytest, pyyaml
+├── README.md                   # 사용법만. 설계는 deep/ 문서에 링크
+│
+├── nvmeval/                    # ── 호스트 패키지 (드라이버 비의존 코어) ──
+│   ├── schema/                 # D1: 정규 상태 스키마
+│   │   ├── core.py             #   Snapshot, Function, SQ, CQ, Vector, Hctx, Unknown
+│   │   ├── ext.py              #   feature 확장 등록
+│   │   └── events.py           #   정규 이벤트 타입
+│   ├── backends/               # 통신만 담당 (판정 없음)
+│   │   ├── qmp.py              #   qemu.qmp(asyncio), 이벤트 구독
+│   │   ├── gdbrsp.py           #   순수 Python GDB RSP (bp, mem r/w, cont)
+│   │   ├── drgnconn.py         #   drgn --qemu 연결 (전용 스레드)
+│   │   ├── agent.py            #   게스트 agent RPC 클라이언트 (virtio-serial)
+│   │   └── tracefile.py        #   QEMU trace 파일 스트리밍
+│   ├── views/                  # 원본 → 정규 스키마
+│   │   ├── driver.py           #   adapter 해석 + drgn
+│   │   ├── device.py           #   DeviceBackend: vssd(QMP) / vfio-user sim(향후)
+│   │   └── irq.py
+│   ├── events/                 # 원본 → 정규 이벤트 (출처별 normalizer)
+│   ├── adapter/
+│   │   ├── loader.py           #   로드 + 세션 시작 시 검증
+│   │   └── scan.py             #   adapter-scan
+│   ├── oracle/
+│   │   ├── invariant.py
+│   │   ├── sequence.py         #   부분 순서 위의 규칙 엔진
+│   │   └── phase.py
+│   ├── control/
+│   │   ├── trigger.py          #   kind=ioctl | call
+│   │   ├── passthru.py
+│   │   ├── fault.py            #   FaultPlan (QEMU / fault_inject / gdb)
+│   │   └── checkpoint.py
+│   ├── machine/
+│   │   ├── cmdline.py          #   profile → QEMU 인자
+│   │   ├── vm.py               #   기동, 종료, watchdog, panic 감지
+│   │   └── artifacts.py
+│   ├── plugin.py               # Feature 인터페이스 + 로더 (외부 경로 지원)
+│   ├── pytest_plugin.py        # fixture: vm, faults, trigger, agent, views, oracle
+│   └── cli.py                  # nvmeval doctor | adapter-scan | run | report
+│
+├── features/                   # ── 기능 플러그인 ──
+│   ├── common/                 #   INV-Q*, INV-I*, INV-IO (모든 드라이버 공통)
+│   └── upstream_selftest/      #   upstream 드라이버로 플랫폼 자체 검증 (리셋 절차 S2/S5 등)
+│   # qmgmt/, irq_remap/, sriov/ 는 회사 정보 포함 → 외부 경로 가능 (미결 Q2)
+│
 ├── adapters/
-│   ├── upstream.yaml   upstream nvme-pci의 필드 경로 (이 서버의 자체 검증용)
-│   └── qmgmt.yaml      OA PC qmgmt의 심볼/필드 경로 (bitmap 이름, trigger 심볼). OA PC에서 작성
-├── features/
-│   ├── common/         INV-Q1~Q3, INV-I*, INV-IO (모든 드라이버에 공통)
-│   ├── qmgmt/          triggers, 순서 제약 S1~S7/E1~E2, 시나리오
-│   ├── irq_remap/
-│   └── sriov/          VF enable, 0x1C 재분배, VF 단위로 qmgmt 재사용
-└── tests/              pytest (fixture: vm, qmp, gdb, drgn, agent, faults)
+│   └── upstream-v7.2.yaml      #   개발 서버 자체 검증용
+│
+├── profiles/
+│   ├── dev-server.yaml         #   TCG, qemu-debug 경로, 이 서버 커널
+│   └── oa-pc.example.yaml      #   OA PC용 예시
+│
+├── guest/                      # ── 게스트 배포물 (이 디렉토리만 복사) ──
+│   ├── agent/                  #   Python 3.9, stdlib만 사용
+│   │   ├── nvmeval_agent.py
+│   │   └── nvmeval-agent.service
+│   ├── stub/                   #   nvmeval_stub.ko (C, out-of-tree, KDIR 지정 빌드)
+│   │   ├── nvmeval_stub.c
+│   │   ├── nvmeval_stub_uapi.h
+│   │   └── Makefile
+│   ├── bpf/                    #   bpftrace 스크립트 (정규 이벤트 원본 형식으로 출력)
+│   └── kconfig/nvmeval.config  #   필요한 config 조각 (CentOS config에 merge)
+│
+├── qemu/
+│   ├── patches/                #   qemu-dev 브랜치에서 git format-patch로 export + series
+│   └── README.md               #   적용 대상(11.1.0 / 11.1.2), 적용 방법
+│
+├── images/
+│   ├── build-rootfs.sh         #   CentOS Stream 9 qcow2 + cloud-init seed
+│   └── cloud-init/
+│
+├── tests/                      # ── 플랫폼 단위 테스트 (VM 없이) ──
+│   ├── test_schema.py
+│   ├── test_invariant_engine.py
+│   ├── test_sequence_engine.py #   합성 이벤트로 부분 순서 / INCONCLUSIVE 검증
+│   └── test_adapter_loader.py
+│
+└── artifacts/                  # 실행 결과 (.gitignore)
 ```
 
-**adapter 예** (드라이버 고유 정보는 전부 여기에만 둔다):
-```yaml
-# adapters/qmgmt.yaml (OA PC에서 채움)
-driver_view:
-  dev_from_ctrl: "container_of(ctrl, struct nvme_dev, ctrl)"
-  sq_bitmap: "dev->qmgmt.sq_bitmap"      # 실제 이름으로 교체
-  cq_bitmap: "dev->qmgmt.cq_bitmap"
-  queues:    "dev->queues[0:dev->nr_allocated_queues]"
-  cq_vector: "nvmeq->cq_vector"
-triggers:
-  compact:   {symbol: nvme_qmgmt_compact, args: [obj:dev]}
-checkpoints:
-  compact_enter: nvme_qmgmt_compact
-  after_pair_delete: nvme_qmgmt_del_pair+ret
-```
-
-시나리오 예:
-```python
-@pytest.mark.feature("qmgmt")
-def test_compact_rollback_on_delete_sq_fail(vm, qmp, agent, views, seq):
-    agent.fio_start(profile="randrw-verify", jobs=8)
-    qmp.fault_add("r1", trigger=dict(queue="admin", opcode=0x00, nth=1),
-                  action=dict(type="status", sct=1, sc=0x0C, dnr=True))
-    r = agent.trigger("compact", dev="nvme0")
-    assert r.ret != 0                         # 실패를 상위로 보고해야 한다
-    seq.assert_ok(["S1", "S6", "E1"])         # 순서 제약 + 롤백
-    views.assert_invariants(["INV-Q1", "INV-Q2", "INV-Q3", "INV-I3"])
-    assert agent.fio_stop().verify_errors == 0
-```
+| 원칙 | 구조에 반영된 곳 |
+|---|---|
+| 드라이버 API가 계속 바뀐다 | 드라이버 지식은 `adapters/*.yaml`(데이터)과 `features/*`(로직)에만 있다. `nvmeval/`에는 없다 |
+| 통신, 변환, 판정 분리 | `backends` → `views`/`events` → `oracle`. 판정은 VM 없이 단위 테스트한다(`tests/`) |
+| 게스트 배포물 격리 | `guest/`만 게스트에 복사한다. Python 3.9 제약은 이 디렉토리에만 적용된다 |
+| QEMU 트리 미포함 | 개발은 `qemu-debug/qemu-11.1.2`의 qemu-dev 브랜치에서 하고, 결과만 patch series로 둔다 |
+| 환경 차이 | `profiles/`만 바꾼다 |
 
 ---
 
-## 7.1 실사용 환경이 주는 제약 (CentOS Stream 9)
+## 11. 실행 환경 제약
+
+### 11.1 실사용 환경 (CentOS Stream 9 + v7.2)
 
 | 항목 | 영향 | 결정 |
 |---|---|---|
-| CentOS 9 기본 Python은 **3.9** | 게스트 agent는 게스트의 python3로 실행된다. 개발 서버는 3.12다 | **게스트 agent는 Python 3.9 호환, stdlib만 사용**(fcntl, ctypes, json, select, socket). 호스트 패키지도 3.9 이상을 목표로 한다(`match` 문, PEP 695 사용 금지) |
-| 게스트가 실제 rootfs를 가진다 | 9p hostroot + chroot 트릭이 필요 없다 | agent, bpftrace, fio, nvme-cli를 게스트에 설치해 쓴다. 9p는 **쓰기 가능한 산출물 공유 하나만** 둔다 |
-| 커널 config는 CentOS config 기반으로 v7.2를 빌드 | RHEL 계열 config는 BPF/BTF/KPROBES/KALLSYMS_ALL이 켜져 있는 것이 일반적이다. `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`은 확인이 필요하다 | M1에서 `nvmeval doctor`가 게스트 `/proc/config.gz` 또는 `/boot/config-*`를 읽어 필요한 항목을 자동 점검한다 |
-| debug symbol 존재 | drgn이 vmlinux와 모듈 DWARF를 바로 쓸 수 있다. 타입 기반 읽기가 가능하다 | adapter의 필드 경로는 C 표현식 문자열로 두고 drgn이 해석한다 |
-| QEMU 11.1 (개발은 11.1.2) | 같은 minor 버전이라 hw/nvme 패치가 거의 그대로 적용될 것으로 예상한다 | 패치는 `v11.1.0` 기준으로도 rebase를 확인한다 |
-| 개발 서버 게스트와 일치 | 지금 개발 서버 게스트는 initramfs + busybox라 실환경과 다르다 | **개발 서버에도 CentOS Stream 9 게스트 이미지(qcow2)를 만들어** 같은 v7.2 kernel을 `-kernel`로 부팅한다. rootfs는 virtio-blk에 두어 NVMe 장치와 분리한다 |
+| CentOS 9 기본 Python 3.9 | 게스트 agent가 게스트 python3로 실행된다 | agent는 3.9 호환, stdlib만(fcntl, ctypes, json, select, socket). 호스트도 3.9 이상(`match` 문, PEP 695 금지) |
+| 게스트가 실제 rootfs를 가진다 | 9p hostroot + chroot 트릭이 필요 없다 | agent, bpftrace, fio, nvme-cli를 게스트에 설치한다. 9p는 쓰기 가능한 산출물 공유 하나만 둔다 |
+| CentOS config 기반 v7.2 빌드 | BPF/BTF/KPROBES/KALLSYMS_ALL은 켜져 있을 가능성이 높다. `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`은 확인이 필요하다 | `nvmeval doctor`가 게스트 config를 자동 점검한다 |
+| debug symbol 있음 | drgn이 DWARF로 타입 기반 읽기를 할 수 있다 | adapter 필드 경로를 C 표현식으로 둔다 |
+| QEMU 11.1 (개발은 11.1.2) | 같은 minor 버전이다 | 패치를 v11.1.0에도 rebase해 확인한다 |
 
-## 8. 수정이 필요한 곳
+### 11.2 개발 서버
 
-| 위치 | 작업 | 비고 |
+| 항목 | 현재 상태 | 조치 |
 |---|---|---|
-| `qemu-debug/qemu-11.1.2` (qemu-dev) | Q6: `query-nvme-queues`, Q7': `nvme-fault-*` 규칙 엔진, trace event 보강 | patch series로 OA PC에 이식 |
-| 게스트 커널 config | `BPF_SYSCALL`, `BPF_EVENTS`, `DEBUG_INFO_BTF`, `KPROBES`, `KALLSYMS_ALL`, `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`, `VIRTIO_CONSOLE`, `9P_FS` | CentOS config 기반에서 누락된 항목만 추가 (§7.1) |
-| `nvmeval/guest/stub` | `nvmeval_stub.ko` | 드라이버는 수정하지 않음 |
-| 호스트 | `nvmeval` 패키지 | `qemu.qmp`, `drgn`, `pytest` |
+| 게스트 | initramfs + busybox. 실환경과 다르다 | CentOS Stream 9 qcow2를 virtio-blk rootfs로 두고, v7.2를 `-kernel`로 부팅 |
+| 게스트 커널 config (`qemu-debug/linux-7.2/.config`) | `XFS_FS` 없음(CentOS rootfs가 xfs), `PVPANIC` 없음, `DEBUG_INFO_BTF`·`FAULT_INJECTION_DEBUG_FS` 없음. VIRTIO_BLK/CONSOLE, 9P, FW_CFG_SYSFS, BPF_SYSCALL, KPROBES, KALLSYMS_ALL은 있음 | config 보강 후 재빌드 (2026-11-02 확인) |
+| QEMU trace backend | `log` backend로 빌드됨 (`build/config-host.h`의 `CONFIG_TRACE_LOG`) | `-trace` 출력 파일을 스트리밍 파싱 |
+| Python 도구 | drgn은 `company/drgn-study` 소스 빌드만 있고 모듈 설치는 안 됨. `qemu.qmp` 없음 | 프로젝트 venv에 설치 |
 
 ---
 
-## 9. 단계별 계획
+## 12. 수정이 필요한 곳과 단계별 계획
+
+| 위치 | 작업 |
+|---|---|
+| `qemu-debug/qemu-11.1.2` (qemu-dev) | `query-nvme-queues`, `nvme-fault-*` 규칙 엔진, trace event 보강 → patch series로 export |
+| 게스트 커널 config | §11의 누락 항목 보강 |
+| `nvmeval/guest/stub` | `nvmeval_stub.ko` (드라이버는 수정하지 않음) |
+| `nvmeval/` | 호스트 패키지 |
 
 | 단계 | 내용 | 완료 기준 (이 서버) |
 |---|---|---|
-| M1 | machine + QMP + agent 골격, 산출물 | upstream 드라이버 게스트가 smp 8로 기동하고, agent ping과 passthrough Identify가 성공 |
-| M2 | QEMU `query-nvme-queues` + DeviceView + DriverView(upstream adapter) | upstream 드라이버에서 INV-Q1/Q2가 통과 |
+| M0 | schema, oracle 엔진, adapter loader + 단위 테스트 | VM 없이 합성 스냅샷/이벤트로 PASS/FAIL/INCONCLUSIVE 판정 테스트 통과 |
+| M1 | machine + QMP + agent + CentOS 9 게스트 이미지 | smp 8 기동, agent ping, passthrough Identify 성공 |
+| M2 | QEMU `query-nvme-queues` + DeviceView + DriverView(upstream adapter) | upstream 드라이버에서 INV-Q1/Q2/Q5 통과 (stopped 스냅샷) |
 | M3 | IrqView + INV-I1~I3 | MSI destination ↔ affinity 대조 통과 |
-| M4 | QEMU fault 규칙 엔진 | passthrough로 보낸 Delete SQ가 지정 status로 실패. CFS 설정 후 드라이버 리셋을 관측 |
-| M5 | nvmeval_stub.ko + trigger | upstream의 noinline 함수 하나(예: `nvme_reset_ctrl`)를 trigger로 호출하는 데 성공 |
-| M6 | eBPF 이벤트 + 순서 제약 검사기 + checkpoint | upstream 리셋 절차에서 Delete/Create 순서 제약(S2/S5) 검사 통과 |
-| M7 | features/qmgmt + sriov 프로파일 | **OA PC**에서 qmgmt adapter로 S1~S7/E1~E2 실행 |
+| M4 | QEMU fault 규칙 엔진 | passthrough Delete SQ가 지정 status로 실패. CFS 설정 후 드라이버 리셋 관측 |
+| M5 | `nvmeval_stub.ko` + trigger | upstream의 외부 호출 가능한 함수 하나를 kind=call로 호출 성공 |
+| M6 | eBPF normalizer + sequence 엔진 + checkpoint | upstream 리셋 절차에서 S2/S5 통과, 이벤트 손실 시 INCONCLUSIVE 확인 |
+| M7 | features/qmgmt + sriov profile | **OA PC**에서 qmgmt adapter로 S1~S7/E1~E2 실행 |
 
 ---
 
-## 10. 미결 사항
+## 13. 알려진 위험과 검토 포인트 (리뷰어 중점 검토 요청)
 
-1. ~~OA PC 환경~~ → 해결: v7.2 + CentOS Stream 9 + QEMU 11.1, debug symbol 있음. **남은 것: OA PC에서 KVM 사용 여부** (TCG로도 동작하게 설계하므로 필수는 아니다).
-2. ~~kallsyms 노출~~ → 해결: 확인 가능. 남은 것: inline으로 사라진 내부 단계가 있는지(trigger나 checkpoint 대상이면 `noinline` 필요).
-3. bitmap 단위: qid당 1비트인지, VF별로 bitmap이 따로 있는지. adapter와 INV-V1 정의에 필요하다.
-4. drain 판정 기준: `blk_mq_quiesce_tagset` + tag iterator인지, qmgmt 자체 카운터인지. S1 검사에 쓸 이벤트 소스가 정해진다.
-5. ~~게스트 rootfs~~ → 결정: CentOS Stream 9 qcow2를 virtio-blk에 둔다 (§7.1).
+| ID | 위험 | 현재 대응 | 검토 요청 |
+|---|---|---|---|
+| R1 | running 상태에서 drgn으로 읽으면 torn read가 생긴다 | 판정은 stopped 스냅샷만 쓴다 (§4.4) | TCG에서 정지·재개를 자주 하면 비용이 얼마나 될지, 판정 빈도를 정하는 기준이 적절한지 |
+| R2 | stop 시 `bdrv_drain_all()` 때문에 device view가 driver view보다 앞설 수 있다 | 진행 정도 필드는 "같거나 앞섬" 관계로 비교한다 (§4.4) | 구성 필드도 영향을 받는 경우가 있는지. 예: 정지 직전 처리된 Delete SQ의 CQE를 드라이버가 아직 처리하지 않은 경우 → INV-Q1이 거짓 FAIL을 낼 수 있다. 처리 대기 admin 명령을 고려한 비교 규칙이 필요한지 |
+| R3 | stub이 임의 커널 함수를 호출하면 락이나 상태 전제를 어길 수 있다 | 화이트리스트, 외부 호출 가능한 진입점으로 한정 (§7.2) | 진입점 계약을 adapter에 명시하는 방식(필요한 락, 컨텍스트)이 필요한지 |
+| R4 | `kallsyms_lookup_name`이 export되지 않는다 (5.7 이후) | kprobe 등록으로 주소를 얻는 기법을 쓴다 | v7.2에서 이 기법이 유효한지, 대안이 있는지 |
+| R5 | eBPF 이벤트 손실로 순서 규칙이 거짓 PASS를 낼 수 있다 | 손실 카운터 → INCONCLUSIVE (§5.4) | bpftrace에서 손실 카운터를 확실히 얻을 수 있는지. libbpf 직접 사용이 필요한지 |
+| R6 | 정규 스키마가 미래 기능을 수용하지 못할 수 있다 | core 최소화 + ext 네임스페이스 | function / queue / vector / hctx 외의 core 단위가 필요한지 (예: namespace, multipath path) |
+| R7 | phase window 경계 이벤트가 누락되면 공통 불변식이 잘못 켜지거나 꺼진다 | 경계 이벤트 누락 시 해당 구간 INCONCLUSIVE | 경계를 이벤트 대신 driver view 상태(quiesced 플래그)로 확인하는 이중화가 필요한지 |
+| R8 | `phase=after_ok` + status 변조는 장치와 드라이버의 인식을 의도적으로 어긋나게 한다 | 롤백 검증용으로만 쓰고, 해당 테스트에서는 E1 기준 자체를 "장치 상태 기준 재동기화"로 정의 | 이 시나리오에서 불변식 정의가 일관적인지 |
+| R9 | TCG에서 게스트 시간 흐름이 불규칙해 드라이버 타임아웃이 거짓으로 발생할 수 있다 | 게스트 `nvme_core.io_timeout`/`admin_timeout`을 넉넉하게 설정 | 타임아웃 경로 자체를 검증할 때(`drop` 동작)와 충돌하지 않는지 |
+| R10 | vssd(QEMU)와 실제 SSD/FW의 동작 차이 | NFR-3 백엔드 추상화, 향후 vfio-user sim | – |
+
+---
+
+## 14. 미결 사항
+
+| ID | 내용 | 영향 |
+|---|---|---|
+| Q1 | OA PC에서 KVM 사용 여부 | TCG에서도 동작하게 설계하므로 필수는 아니다. R9 완화에 영향 |
+| Q2 | 회사 정보가 들어가는 `features/qmgmt`, `adapters/qmgmt-oa.yaml`을 같은 저장소에 둘지, 별도 저장소로 분리해 profile의 경로로 불러올지 | NFR-8, 저장소 구성 |
+| Q3 | qmgmt bitmap 단위: qid당 1비트인지, VF별로 따로 있는지 | ext.qmgmt 스키마, INV-V1 |
+| Q4 | drain 판정 기준: blk-mq tag iterator인지, qmgmt 자체 카운터인지 | S1의 이벤트 소스 |
+| Q5 | trigger나 checkpoint 대상 중 inline으로 사라진 함수가 있는지 | `noinline` 필요 여부 (adapter 검증으로 확인 가능) |
+| Q6 | qmgmt 외에 개발 중인 기능 목록과 성격 | 스키마 core 범위(R6), feature 설계 |
+| Q7 | QEMU 패치 관리: qemu-dev 브랜치 개발 + patch export(제안) vs submodule | §10 `qemu/` 구성 |
+| Q8 | 저장소 이름 `nvmeval` 확정 여부 | – |
