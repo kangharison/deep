@@ -1,6 +1,6 @@
 # NVMe 커스텀 드라이버 검증 플랫폼(nvmeval) — 요구사항 및 아키텍처 설계
 
-> 상태: **설계 v0.4 (2026-11-02), 리뷰 요청용**. 구현 전 단계라 아직 실측한 것은 없다. 단, 코드 근거는 표시해 두었다.
+> 상태: **설계 v0.5 (2026-11-02), 1차 외부 리뷰 반영**. 구현 전 단계라 아직 실측한 것은 없다. 단, 코드 근거는 표시해 두었다. 리뷰 반영 내역은 §15에 있다.
 > 기준 소스: QEMU `v11.1.2`(qemu-dev 브랜치), Linux `v7.2`. 근거 위치는 `qemu-debug/<트리>/<경로>:<라인>` 형식으로 적는다.
 > 관련: [[vssd-vs-vfio-user-sim]] · [[nvme-sriov-dynamic-resource-design]] · [[nvme-sriov-multipf-lifecycle]] · [[nvme-sriov-qemu-vs-kernel]] · [[nvme-queue-mgmt-design]] · [[nvme-more-queues-than-cpus-and-nto1-sqcq]] · [[20_msix_interrupt_e2e_qemu_trace]]
 
@@ -45,7 +45,7 @@
 | FR-5 | **상태 스냅샷**: driver view와 IRQ view는 drgn, device view는 QMP로 읽고, 모두 **정규 스키마**(§4)로 변환한다 |
 | FR-6 | **Checkpoint**: 지정한 커널 심볼에서 VM을 정지시키고, 세 view 스냅샷과 판정을 마친 뒤 재개한다 (gdbstub) |
 | FR-7 | **장치 오류 주입**: "트리거 조건 → 동작" 규칙을 QMP로 등록·해제한다 (§8) |
-| FR-8 | **판정**: 스냅샷 기반 불변식(invariant)과 이벤트 기반 순서 제약(sequence)의 두 축으로 판정한다 (§5) |
+| FR-8 | **판정**: 세 축으로 판정한다. 스냅샷 기반 불변식(invariant), 이벤트 기반 순서 제약(sequence), 기한 기반 진행 보장(liveness) (§5) |
 | FR-9 | **장애 감지**: panic(QMP `GUEST_PANICKED`), hang(watchdog), 타임아웃을 감지하면 시리얼 로그와 drgn 덤프를 남긴다 |
 | FR-10 | **시나리오**: pytest로 작성한다. 기능은 플러그인(`features/<name>/`)으로 추가한다 |
 | FR-11 | **adapter 검증과 생성**: 세션 시작 시 adapter의 필드 경로, 타입, 심볼, 구조체 크기를 DWARF와 대조해 맞지 않으면 즉시 실패한다. DWARF에서 adapter 초안을 만드는 도구를 제공한다 (§6) |
@@ -135,7 +135,7 @@
 | ID | 결정 | 상태 | 근거 / 대안 |
 |---|---|---|---|
 | D1 | **정규 상태 스키마를 플랫폼의 중심 계약으로 둔다.** 흐름은 `드라이버 → adapter → 정규 스키마 → 판정`이다. 구조는 core 스키마 + feature 확장 네임스페이스(`ext`) | 제안 | 드라이버 API가 계속 바뀐다. 판정이 드라이버 필드를 직접 읽으면 드라이버가 바뀔 때마다 판정 코드도 고쳐야 한다. 대안 "feature마다 독자 스키마"는 공통 불변식(INV-Q*)을 재사용할 수 없어 기각 (§4) |
-| D2 | **판정은 두 축으로 한다.** Invariant(상태)와 Sequence(순서)를 phase window로 잇는다 | 제안 | drain 구간 안에서는 상태가 일시적으로 불일치하는 것이 정상이다. 그래서 구간 안은 순서로, 구간 밖은 상태로 판정한다 (§5) |
+| D2 | **판정은 세 축으로 한다.** Invariant(상태), Sequence(순서), Liveness(진행). 앞의 두 축은 phase window로 잇는다. 정상적인 과도·축퇴 상태는 선언된 예외(allowed state)로 처리한다 | 제안 (v0.5에서 liveness와 예외 추가) | drain 구간 안에서는 상태가 일시적으로 불일치하는 것이 정상이다. 그래서 구간 안은 순서로, 구간 밖은 상태로 판정한다. 그런데 safety 규칙만 있으면 "아무 일도 일어나지 않는" hang이 PASS가 된다. 그래서 liveness 축을 추가한다 (§5) |
 | D3 | **전역 시계에 의존하지 않는다.** 출처 내부 순서, cid 인과 조인, stub 마커, checkpoint 정지로 순서를 정한다 | 제안 | 게스트 ktime과 QEMU 시각을 맞출 수 없다. TCG에서는 시간 비율도 일정하지 않다 (§5.3) |
 | D4 | **게스트 agent는 얇게 둔다.** 실행과 스트림 전달만 하고, 판정 로직은 모두 호스트에 둔다 | 제안 | 게스트는 Python 3.9이고 OA PC에 배포해야 한다. 바뀌는 부분(판정, adapter)을 호스트에 모은다 |
 | D5 | **호스트는 단일 asyncio 루프로 실행한다.** drgn(동기 API)은 전용 스레드에서 돌린다 | 제안 | 경쟁 시나리오("fio 부하 + 비동기 trigger + N번째 Delete SQ fault")를 한 곳에서 조율해야 한다. 대안인 멀티프로세스는 조율 비용이 커서 기각 |
@@ -159,8 +159,10 @@ Snapshot                                   ← 한 시점, 한 view의 전체 �
       ├─ ctrl:    ControllerState           (enabled, csts{rdy,cfs,shst}, cc, is_vf, parent_fn, nr_vfs)
       ├─ sqs:     {qid → SQ}                (cqid, size, state, prio, head, tail)
       ├─ cqs:     {qid → CQ}                (iv, size, ien, state, head, tail)
-      ├─ vectors: {v   → Vector}            (irq, affinity, effective, dest_apic, masked, managed)
-      ├─ hctx:    {hctx_idx → Hctx}         (qids[], cpus[], quiesced, inflight)
+      ├─ vectors: {v   → Vector}            (irq, affinity, effective, dest_apic, masked, managed,
+      │                                      move_pending, pending_mask, cqids[])   ← cqids: 역참조 (N:1)
+      ├─ hctx:    {hctx_idx → Hctx}         (qids[], cpus[], quiesced, inflight, busy_tags)
+      ├─ blkmq:   BlkmqState                (nr_hw_queues, map_mode(normal|fallback|single), q_usage)
       └─ ext:     {"qmgmt": QmgmtExt, "sriov": SriovExt, ...}   ← feature 확장 네임스페이스
 ```
 
@@ -168,6 +170,11 @@ Snapshot                                   ← 한 시점, 한 view의 전체 �
 - **core에 넣는 기준**: NVMe 스펙이나 커널 공통 개념(SQ, CQ, vector, hctx)이고, **두 개 이상의 view에서 관측할 수 있는** 필드만 core에 둔다. 교차 검증의 대상이 core다.
 - **ext에 넣는 기준**: 한 view에서만 보이는 드라이버 고유 상태다(예: qmgmt 관리 bitmap). ext는 feature가 dataclass로 선언하고 `schema.ext.register("qmgmt", QmgmtExt)`로 등록한다. 다른 feature의 ext는 읽기만 할 수 있다.
 - **qid 0(admin queue)도 sqs/cqs에 포함한다.** 판정 규칙에서 IO queue만 볼 때는 필터로 거른다.
+- **관계의 다중도를 스키마에서 허용한다** (v0.5):
+  - SQ → CQ는 N:1이다 (`sqs[q].cqid`).
+  - CQ → vector도 N:1이다. VI < VQ, 즉 VF에 vector가 queue pair보다 적게 배정된 경우다. 그래서 `vectors[v].cqids[]`로 역참조를 둔다. driver view와 device view 각각에서 `cqs[*].iv`로 계산한다.
+  - vector 개수 정책(예: `min(VI, 쌍 수 + 1)`, +1은 admin vector)은 **드라이버 정책**이므로 core 불변식이 아니다. feature 불변식(qmgmt/sriov)으로 둔다.
+- **IRQ 이동 대기 상태를 스키마에 넣는다** (v0.5): `move_pending`, `pending_mask`. 의미는 §5.6에서 설명한다.
 
 ### 4.2 view별 채우는 필드
 
@@ -179,7 +186,11 @@ Snapshot                                   ← 한 시점, 한 view의 전체 �
 | `cqs[qid].iv` | ✅ | ✅ | – |
 | `vectors[v].irq/affinity/effective/managed` | △ (드라이버가 기록한 irq 번호) | – | ✅ |
 | `vectors[v].dest_apic/masked` | – | ✅ MSI-X 테이블 | ✅ MSI 메시지 |
-| `hctx[*]` | ✅ | – | – |
+| `vectors[v].move_pending/pending_mask` | – | – | ✅ `IRQD_SETAFFINITY_PENDING`, `desc->pending_mask` |
+| `vectors[v].cqids` | ✅ (driver의 cq_vector로 계산) | ✅ (device의 CQ.iv로 계산) | – |
+| `hctx[*]` (busy_tags 포함) | ✅ | – | – |
+| `blkmq.*` | ✅ | – | – |
+| `sqs[qid]` 미처리 명령 수 | – | ✅ SQ head≠tail, 장치 내부 outstanding 요청 | – |
 | `ext.qmgmt.*` (bitmap 등) | ✅ | – | – |
 | `ext.sriov.*` (VQ/VI 할당) | ✅ | ✅ | – |
 
@@ -238,11 +249,13 @@ def sq_bitmap_matches_device(drv: Function, dev: Function) -> Verdict:
 | INV-Q3 | 모든 hctx가 live qid 하나 이상에 매핑되고, 삭제된 qid로 가는 매핑은 없다 | driver ↔ device |
 | INV-Q4 | 드라이버 내부 표현끼리 모순이 없다 (qmgmt bitmap ↔ nvmeq->flags 등. 구체 규칙은 feature가 정의) | driver |
 | INV-Q5 | 구성 필드(cqid, size, iv)가 driver와 device에서 같다 | driver ↔ device |
-| INV-I1 | CQ.iv의 MSI destination이 해당 IRQ의 effective_affinity에 속한다 ([[20_msix_interrupt_e2e_qemu_trace]] 방식) | device ↔ irq |
-| INV-I2 | 재배치 이후 IRQ 카운트는 새 cpumask에 속한 CPU에서만 증가한다 (두 스냅샷의 차분) | irq |
+| INV-I1 | vector v의 MSI destination이 v의 effective_affinity에 속한다 ([[20_msix_interrupt_e2e_qemu_trace]] 방식). **`move_pending`인 vector는 확정 상태가 아니므로 판정을 미룬다** (§5.6 AS-3) | device ↔ irq |
+| INV-I2 | 재배치 이후 IRQ 카운트는 새 cpumask에 속한 CPU에서만 증가한다 (두 스냅샷의 차분). 재배치 직후 첫 인터럽트 1건은 이전 CPU에서 올 수 있으므로 제외한다 (AS-3) | irq |
 | INV-I3 | 해제된 vector에 매달린 IRQ handler가 없다 (IRQ 누수 없음) | driver ↔ irq |
+| INV-I4 | (v0.5) vector를 공유하는 CQ들(`vectors[v].cqids`)이 서비스하는 hctx CPU의 합집합이 v의 affinity에 포함된다. 공유 vector에서는 affinity를 CQ 하나가 아니라 **합집합과 비교**해야 한다. 포함(⊆)인지 일치(=)인지는 feature 정책으로 정한다 | driver ↔ irq |
+| INV-I5 | (v0.5) driver의 `cqs[*].iv`로 계산한 `cqids`와 device의 CQ.iv로 계산한 `cqids`가 같다 (N:1 매핑 일치) | driver ↔ device |
 | INV-IO | 제출 수 = 완료 수, fio verify 실패 0건, 오류 주입 시나리오가 아닌데 생긴 I/O error 0건 | agent |
-| INV-V1 | PF와 VF의 VQ/VI 합계 ≤ flexible 자원 상한. 0x1C 결과와 device view가 일치한다 | driver ↔ device |
+| INV-V1 | PF와 VF의 VQ/VI 합계 ≤ flexible 자원 상한. 0x1C 결과와 device view가 일치한다. VF의 IO queue pair 수 ≤ VQ − 1 (VQ에 admin 포함, §8.5 SR-1) | driver ↔ device |
 
 ### 5.2 Sequence 축: 이벤트 기반
 
@@ -257,7 +270,7 @@ qmgmt 순서 제약:
 
 | ID | 제약 |
 |---|---|
-| S1 | `DevDeleteSQ(q)` 시점에 q에 매핑된 hctx가 모두 quiesce 상태이고 `inflight(q) = 0`이다 |
+| S1 | `DevDeleteSQ(q)` 시점에 q에 매핑된 hctx가 모두 quiesce 상태이고 `inflight(q) = 0`이다. **inflight는 feature 자체 카운터가 아니라 blk-mq 상태와 장치 상태로 판정한다** (§5.7) |
 | S2 | `DevDeleteCQ(c)`는 c를 cqid로 가진 모든 SQ의 `DevDeleteSQ`가 성공한 뒤에만 온다 (N:1 매핑 고려) |
 | S3 | compaction 진입(`TriggerEnter` 또는 adapter가 정한 kprobe) 시 대상 q는 `sq_bit = 0 ∧ cq_bit = 0`이고, device에도 SQ/CQ가 없다 |
 | S4 | vector v의 `IrqFree`나 `IrqAffinity`는 v를 iv로 쓰는 live CQ가 없거나, 그 CQ가 drain된 상태에서만 일어난다 |
@@ -284,6 +297,52 @@ qmgmt 순서 제약:
 - window 경계는 이벤트로 정한다. window 안에서는 그 window에 지정된 순서 규칙만 켜고, 공통 불변식은 끈다.
 - 판정 집계: 규칙 하나라도 FAIL이면 FAIL. FAIL이 없고 INCONCLUSIVE가 있으면 INCONCLUSIVE. 모두 PASS일 때만 PASS.
 - **관측 누락은 INCONCLUSIVE로 승격한다**: eBPF ringbuf 손실 카운터가 0이 아니거나, QEMU trace가 잘렸거나, agent 스트림이 끊기면 해당 구간의 순서 규칙 결과를 INCONCLUSIVE로 바꾼다 (NFR-7).
+- 판정 결과에 **DEGRADED** 표시를 추가한다 (v0.5). 선언된 예외 상태(§5.6) 덕분에 통과한 경우 PASS(DEGRADED)로 표시한다. 예: blk-mq fallback 매핑. 오류 주입 시나리오에서는 정상 결과일 수 있지만, 오류 주입이 없는 시나리오라면 기능 결함 신호다. 시나리오가 `allow_degraded=False`로 엄격하게 만들 수 있다.
+
+### 5.5 Liveness 축: 기한 기반 진행 보장 (v0.5 추가)
+
+safety 규칙(invariant, sequence)만으로는 "drain이 끝나지 않는다", "리셋이 영원히 RESETTING에 머문다" 같은 hang을 잡지 못한다. 아무 일도 일어나지 않으면 위반 이벤트도 생기지 않아 PASS가 되기 때문이다. 그래서 "결국 일어나야 하는 일"을 기한과 함께 검사한다.
+
+| ID | 진행 보장 | 종결 조건 |
+|---|---|---|
+| L1 | 제출된 모든 요청은 결국 완료되거나 실패한다 | 요청마다 `AdminComplete`/`block_rq_complete` 또는 오류 반환. 테스트 종료 시 driver view의 busy tag가 0 |
+| L2 | fio(부하 생성기)는 결국 종료된다 | agent가 fio 종료 코드와 요약을 수신 |
+| L3 | 리셋이나 fault 이후 컨트롤러는 결국 **종결 상태(LIVE 또는 DEAD)**에 도달한다 | `nvme_ctrl.state`가 LIVE 또는 DEAD. RESETTING/CONNECTING에 머물면 위반. 어느 쪽이 기대값인지는 시나리오가 정한다 |
+| L4 | 모든 `Quiesce`는 결국 `Unquiesce`로 닫힌다 (drain window 종결) | 짝이 되는 `Unquiesce` 이벤트, 그리고 driver view의 quiesced=false |
+| L5 | trigger 호출은 결국 반환된다 | `TriggerExit` 마커 |
+| L6 | `move_pending`인 IRQ 이동은 I/O가 발생하면 결국 반영된다 | 다음 인터럽트 이후 `move_pending=false`, effective가 새 mask에 속함 (§5.6 AS-3) |
+
+**기한을 정하는 방식** (TCG 환경 고려):
+- 벽시계 시간만으로는 정할 수 없다. TCG에서는 게스트가 호스트 부하에 따라 느려지기 때문이다.
+- 기한은 **게스트 진행량**으로 정한다. drgn으로 읽은 `jiffies` 증가량, 또는 게스트 sched clock을 쓴다. 예: "게스트 시간으로 30초 안에 L3 도달".
+- 별도로 벽시계 상한(예: 10분)을 두어 플랫폼 자체가 멈추지 않게 한다.
+- 위반 판정 시: 게스트 시간이 흘렀는데 종결되지 않았으면 **FAIL(hang)**이다. 게스트 시간이 흐르지 않았으면(VM 자체가 멈춤) **INCONCLUSIVE + 플랫폼 오류**다.
+- hang FAIL이 나면 자동으로 다음을 덤프한다: drgn으로 hung task 스택, blk-mq 상태(hctx 상태, busy tag, dispatch list), 컨트롤러 상태.
+
+### 5.6 선언된 예외 상태 (allowed states, v0.5 추가)
+
+정상이지만 일반 불변식에 어긋나 보이는 과도·축퇴 상태가 있다. 이런 상태를 불변식마다 if 문으로 흩어 두지 않고, **이름을 붙인 예외 상태로 선언**한다. 불변식은 "어떤 예외 상태에서 면제되는지"를 명시한다.
+
+| ID | 상태 | 판정 조건 | 면제 / 변형되는 규칙 | 근거 |
+|---|---|---|---|---|
+| AS-1 | **빈 풀**: IO queue pair가 0개 (admin queue만 존재) | driver와 device 모두 IO SQ/CQ가 0개 | INV-Q3(모든 hctx가 live qid에 매핑)를 면제한다. 대신 "IO 제출이 막히거나 오류를 반환한다"를 검사한다. 시나리오가 이 상태를 허용할 때만 적용 | qmgmt가 모든 pair를 삭제한 중간 또는 최종 상태 |
+| AS-2 | **blk-mq fallback 매핑** | `blkmq.nr_hw_queues` ≠ 장치 IO queue 수, 또는 모든 CPU가 hctx 0에 매핑됨 | INV-Q3을 "모든 CPU가 live hctx에 매핑되고, 그 hctx가 live qid를 가진다"로 완화한다. 결과는 DEGRADED | `blk_mq_update_nr_hw_queues` 실패 시 이전 개수로 fallback (`qemu-debug/linux-7.2/block/blk-mq.c:5162~5176`). 재매핑 전 `blk_mq_clear_mq_map`이 모든 CPU를 0으로 초기화 (`block/blk-mq.c:4777~4780`). `blk_mq_map_hw_queues`의 실패 fallback (`block/blk-mq-cpumap.c:129~130`) |
+| AS-3 | **IRQ 이동 대기**: affinity를 바꿨지만 아직 반영되지 않음 | `vectors[v].move_pending = true` | INV-I1/I2는 v에 대해 판정을 미룬다(INCONCLUSIVE가 아니라 "대기"). 판정 전에 해당 queue로 I/O를 보내 인터럽트를 유발한 뒤 다시 스냅샷을 찍는다. L6로 결국 반영되는지 검사한다 | x86에서 interrupt remapping이 없으면 PCI MSI chip에 `IRQCHIP_MOVE_DEFERRED`가 설정된다 (`qemu-debug/linux-7.2/arch/x86/kernel/apic/msi.c:216~217`). 그러면 `irq_set_affinity`는 즉시 바꾸지 않고 pending으로 기록한다 (`kernel/irq/manage.c:304~312`). 실제 이동은 다음 인터럽트 처리 때 일어난다. 개발 서버 커널은 `CONFIG_IRQ_REMAP` 없음, `GENERIC_PENDING_IRQ=y` |
+| AS-4 | drain window 내부 | phase = drain | 공통 불변식 전체 면제. 순서 규칙만 적용 | §5.4 |
+| AS-5 | 리셋 진행 중 | ctrl.state ∈ {RESETTING, CONNECTING} | 공통 불변식 면제. L3로 종결을 검사 | §5.5 |
+
+AS-3 관련 profile 옵션: q35에 `-device intel-iommu,intremap=on`을 붙인 **IR 모드 profile**을 별도로 두어, 즉시 이동(IR)과 지연 이동(non-IR) 양쪽에서 같은 시나리오를 돌린다. OA PC 실장비 환경이 어느 쪽인지에 따라 어느 결과를 기준으로 삼을지 정한다.
+
+### 5.7 drain 판정 기준 (v0.5, 미결 Q4 해결)
+
+S1의 "inflight = 0"은 **검증 대상 기능의 자체 카운터로 판정하지 않는다.** 검증 대상이 자기 상태를 스스로 보고하는 셈이 되어, 카운터 버그를 잡을 수 없기 때문이다. 독립된 두 출처로 판정하고, feature 카운터는 대조용으로만 쓴다.
+
+| 출처 | 판정 방법 | 주의 |
+|---|---|---|
+| **blk-mq tag 상태** (주 판정) | q에 매핑된 각 hctx에 대해, driver tag 비트맵(sbitmap)에서 할당된 tag의 request 상태가 `MQ_RQ_IN_FLIGHT`인 것이 0개. 커널이 CPU offline drain에 쓰는 `blk_mq_hctx_has_requests()`(`qemu-debug/linux-7.2/block/blk-mq.c:3677`)와 같은 방식의 순회를 drgn으로 한다 | tag는 할당됐지만 아직 발행되지 않은 request(dispatch list, requeue)는 SQ에 들어가지 않았으므로 inflight가 아니다. 상태(IN_FLIGHT)로 구분해야 한다 |
+| **`q_usage_counter`** (보조) | `percpu_ref`가 0인지 확인 | **freeze를 쓸 때만 의미가 있다.** quiesce는 dispatch만 멈추므로, quiesce 중에도 sw queue나 스케줄러에 대기 중인 request가 참조를 잡고 있어 0이 아닐 수 있다. 이것은 정상이다. percpu 모드에서는 CPU별 합산이 필요하고, freeze 후 atomic 모드일 때 정확하다(`block/blk-mq.c:171~221`) |
+| **장치 상태** (교차 확인) | device view에서 해당 SQ의 head = tail이고, 장치 내부에 outstanding 요청이 없으며, 해당 CQ에 미처리 CQE가 없다 | 드라이버가 inflight 0이라고 믿어도, 장치에 명령이 남아 있으면 S1 위반이다 |
+| feature 카운터 (대조) | adapter가 지정한 qmgmt 자체 카운터 | 위 출처들과 다르면 그 자체로 FAIL (카운터 버그) |
 
 ---
 
@@ -392,6 +451,7 @@ QEMU `hw/nvme`에 규칙 테이블을 두고, 명령 처리 지점(admin/IO 명�
 | `aer{type,info}` | Async Event 발생 | AEN 처리 |
 | `irq_suppress` / `irq_vector{v}` | 인터럽트 누락 / 다른 vector로 발생 | IRQ 재배치 검증 |
 | `nssr` | NVM Subsystem Reset (기존 NSSR 패치 재사용) | 전체 복구 |
+| `pause` | (v0.5) 명령 처리 직전에 VM 정지를 요청한다(BH로 `vm_stop` 지연 요청 → QMP `STOP` 이벤트). 플랫폼이 stopped 스냅샷을 찍은 뒤 `cont`로 재개 | S1처럼 "장치가 명령을 받는 순간"의 상태 판정 (R12) |
 
 `phase=after_*`의 `status` 동작은 **장치 상태는 바뀌었는데 드라이버는 실패로 아는** 상황을 만든다. 예를 들어 SQ는 실제로 삭제됐는데 드라이버에는 오류가 돌아간다. 이것은 롤백 로직이 장치 상태를 다시 확인하는지 검증하는 핵심 케이스다.
 
@@ -403,9 +463,40 @@ faults.add("r2", trigger=dict(queue="admin", opcode=0x05, phase="after_ok", afte
            action=dict(type="set_cfs"), count=1)
 ```
 
-보조 수단 (같은 `FaultPlan` 인터페이스로 다룬다):
-- 게스트 `drivers/nvme/host/fault_inject.c`(debugfs): 드라이버가 받은 completion status를 변조한다.
-- checkpoint(gdb breakpoint): 정확한 코드 지점에서 VM을 멈추고, QMP 규칙을 활성화한 뒤 재개한다. "compaction 특정 단계 진입 직후 CFS" 같은 정밀 경쟁을 만든다.
+### 8.1 커널 쪽 오류 주입 — 같은 `FaultPlan`에 포함 (v0.5 확장)
+
+장치 오류만으로는 **드라이버 내부 실패 경로**(메모리 할당 실패, IRQ 할당 실패, 커널 API 오류 반환)를 만들 수 없다. 그런데 qmgmt 롤백(E1)에서 가장 버그가 많을 곳이 바로 여기다. 그래서 커널 오류 주입을 장치 오류와 같은 `FaultPlan`의 1급 백엔드로 둔다.
+
+| 백엔드 | 수단 | 대표 용도 | 필요 config |
+|---|---|---|---|
+| `kernel.nvme_status` | `drivers/nvme/host/fault_inject.c` (debugfs `fault_inject/`) | 드라이버가 받은 completion status 변조 | `FAULT_INJECTION_DEBUG_FS` + `FAULT_INJECTION` |
+| `kernel.function` | fail_function (debugfs `fail_function/inject`) | `ALLOW_ERROR_INJECTION`으로 표시된 함수의 반환값 강제 | `FUNCTION_ERROR_INJECTION`, `FAIL_FUNCTION` |
+| `kernel.bpf_override` | kprobe + `bpf_override_return` | 위와 같은 대상에 조건부 주입 (특정 qid, N번째 호출 등) | `BPF_KPROBE_OVERRIDE` |
+| `kernel.alloc` | failslab / fail_page_alloc (task 필터 지원) | queue 생성 경로의 메모리 할당 실패 | `FAILSLAB`, `FAIL_PAGE_ALLOC` |
+| `kernel.io_timeout` | fail_io_timeout (블록 장치별 `io-timeout-fail`) | 요청 타임아웃 경로 | `FAIL_IO_TIMEOUT` |
+| `kernel.make_request` | fail_make_request | 블록 계층 제출 실패 | `FAIL_MAKE_REQUEST` |
+| `gdb.checkpoint` | gdb breakpoint로 정지 → 다른 규칙 활성화 → 재개 | "compaction 특정 단계 진입 직후 CFS" 같은 정밀 경쟁 | (gdbstub) |
+
+- 드라이버 고유 함수(예: qmgmt 내부 단계)에 `kernel.function`/`bpf_override`를 쓰려면 그 함수에 `ALLOW_ERROR_INJECTION`이 있어야 한다. 이건 드라이버 쪽 결정이다. 허용 목록은 adapter에 적고, 세션 시작 시 `/sys/kernel/debug/fail_function/injectable`과 대조해 검증한다.
+- 범위 제한: failslab/fail_page_alloc은 시스템 전체에 영향을 주므로 반드시 `task-filter`를 쓴다. 대상은 trigger를 실행하는 스레드(stub의 sync 호출 스레드나 async kthread)로 한정한다. 아니면 게스트 전체가 불안정해져 판정을 신뢰할 수 없다.
+- 모든 백엔드는 D7을 따른다: 테스트 범위 수명, 종료 시 자동 해제, 발동 이력(`FaultFired` 이벤트) 기록.
+
+---
+
+## 8.5 SR-IOV 규칙 (v0.5 추가)
+
+sriov feature가 따라야 할 스펙과 구현의 사실이다. 시나리오를 생성하거나 판정할 때 이 규칙을 전제로 한다.
+
+| ID | 규칙 | 근거 | 플랫폼에 미치는 영향 |
+|---|---|---|---|
+| SR-1 | **VQ 자원에는 admin queue가 포함된다.** VF에 VQ를 N개 배정하면 IO queue pair는 N−1개다. VI도 admin vector를 포함한다 | QEMU: secondary 컨트롤러의 `conf_ioqpairs = nvq - 1` (`qemu-debug/qemu-11.1.2/hw/nvme/ctrl.c:8028`). VF마다 최소 2개 VQ가 필요하다: `sriov_vq_flexible >= 2 * sriov_max_vfs` (`ctrl.c:8914`) | INV-V1과 vector 개수 정책(`min(VI, 쌍 수 + 1)`)은 이 규칙으로 계산한다. 시나리오 생성기는 VQ < 2를 유효하지 않은 배정(오류 기대)으로 분류한다 |
+| SR-2 | **자원 배정(Secondary Assign)은 VF 컨트롤러가 Offline일 때만 허용된다** | QEMU: secondary가 online(`sctrl->scs`)이면 `NVME_INVALID_SEC_CTRL_STATE`를 반환한다 (`ctrl.c:7298~` `nvme_assign_virt_res_to_sec`). [[nvme-sriov-dynamic-resource-design]] §2.1 | VF 자원 변경 시나리오는 항상 `offline → assign → online` 순서다. 이 순서 자체를 순서 규칙(SR-S1)으로 검사한다. online 상태에서 assign하는 것은 오류 기대 시나리오로 둔다 |
+| SR-3 | **VF의 Vendor ID/Device ID는 config 공간에서 0xFFFF로 읽힌다** (SR-IOV 스펙). 그래서 VF 준비 완료 여부를 vendor ID로 확인할 수 없다 | QEMU: VF config에 vendor/device id 0xffff 설정 (`qemu-debug/qemu-11.1.2/hw/pci/pcie_sriov.c:186~187, 340`). 커널: `pci_dev_wait()`는 VF면 `PCI_VENDOR_ID` 대신 `PCI_COMMAND`를 읽는다 (`qemu-debug/linux-7.2/drivers/pci/pci.c:1237~1241`) | 플랫폼이 VF 준비를 확인할 때(agent나 QMP로 config 읽기) **Command 레지스터**를 쓴다. 0xFFFF 읽기를 "장치 없음"으로 해석하는 공통 헬퍼를 VF에 적용하지 않는다. VF 식별은 PF의 SR-IOV capability(VF offset/stride)와 sysfs `physfn` 링크로 한다 |
+| SR-4 | PF 리셋 시 모든 VF가 Offline이 된다 | [[nvme-sriov-dynamic-resource-design]] §0 | E2 판정 시 VF 상태 기대값은 Offline이다 |
+
+SR-IOV 순서 규칙:
+- **SR-S1:** `VirtMgmt(assign, cntlid=c)` 시점에 c는 Offline이다.
+- **SR-S2:** VF c에서 `VirtMgmt(online)` 이후 VF 드라이버가 재초기화를 마치면 INV-Q*와 INV-V1이 성립한다(L3으로 종결을 검사).
 
 ---
 
@@ -530,7 +621,7 @@ nvmeval/
 |---|---|---|
 | CentOS 9 기본 Python 3.9 | 게스트 agent가 게스트 python3로 실행된다 | agent는 3.9 호환, stdlib만(fcntl, ctypes, json, select, socket). 호스트도 3.9 이상(`match` 문, PEP 695 금지) |
 | 게스트가 실제 rootfs를 가진다 | 9p hostroot + chroot 트릭이 필요 없다 | agent, bpftrace, fio, nvme-cli를 게스트에 설치한다. 9p는 쓰기 가능한 산출물 공유 하나만 둔다 |
-| CentOS config 기반 v7.2 빌드 | BPF/BTF/KPROBES/KALLSYMS_ALL은 켜져 있을 가능성이 높다. `FAULT_INJECTION_DEBUG_FS`, `FW_CFG_SYSFS`, `PVPANIC`은 확인이 필요하다 | `nvmeval doctor`가 게스트 config를 자동 점검한다 |
+| CentOS config 기반 v7.2 빌드 | BPF/BTF/KPROBES/KALLSYMS_ALL은 켜져 있을 가능성이 높다. fault injection 계열, `FW_CFG_SYSFS`, `PVPANIC`은 확인이 필요하다 | `nvmeval doctor`가 게스트 config를 자동 점검한다 (§11.3 목록) |
 | debug symbol 있음 | drgn이 DWARF로 타입 기반 읽기를 할 수 있다 | adapter 필드 경로를 C 표현식으로 둔다 |
 | QEMU 11.1 (개발은 11.1.2) | 같은 minor 버전이다 | 패치를 v11.1.0에도 rebase해 확인한다 |
 
@@ -539,11 +630,23 @@ nvmeval/
 | 항목 | 현재 상태 | 조치 |
 |---|---|---|
 | 게스트 | initramfs + busybox. 실환경과 다르다 | CentOS Stream 9 qcow2를 virtio-blk rootfs로 두고, v7.2를 `-kernel`로 부팅 |
-| 게스트 커널 config (`qemu-debug/linux-7.2/.config`) | `XFS_FS` 없음(CentOS rootfs가 xfs), `PVPANIC` 없음, `DEBUG_INFO_BTF`·`FAULT_INJECTION_DEBUG_FS` 없음. VIRTIO_BLK/CONSOLE, 9P, FW_CFG_SYSFS, BPF_SYSCALL, KPROBES, KALLSYMS_ALL은 있음 | config 보강 후 재빌드 (2026-11-02 확인) |
+| 게스트 커널 config (`qemu-debug/linux-7.2/.config`) | `XFS_FS` 없음(CentOS rootfs가 xfs), `PVPANIC` 없음, `DEBUG_INFO_BTF` 없음, **fault injection 계열 전부 없음**(`FAULT_INJECTION`부터 `FAIL_*`, `BPF_KPROBE_OVERRIDE`까지). `INTEL_IOMMU=y`, `IRQ_REMAP` 없음(AS-3의 non-IR 모드). VIRTIO_BLK/CONSOLE, 9P, FW_CFG_SYSFS, BPF_SYSCALL, KPROBES, KALLSYMS_ALL은 있음 | config 보강 후 재빌드 (2026-11-02 확인) |
 | QEMU trace backend | `log` backend로 빌드됨 (`build/config-host.h`의 `CONFIG_TRACE_LOG`) | `-trace` 출력 파일을 스트리밍 파싱 |
 | Python 도구 | drgn은 `company/drgn-study` 소스 빌드만 있고 모듈 설치는 안 됨. `qemu.qmp` 없음 | 프로젝트 venv에 설치 |
 
 ---
+
+### 11.3 `nvmeval doctor` 점검 항목 (v0.5)
+
+| 분류 | config | 없으면 |
+|---|---|---|
+| 필수: 관측 | `KALLSYMS_ALL`, `KPROBES`, `BPF_SYSCALL`, `BPF_EVENTS`, `DEBUG_INFO_BTF`, `FW_CFG_SYSFS`(drgn `--qemu`의 vmcoreinfo) | 실행 거부 |
+| 필수: 통신 | `VIRTIO_CONSOLE`, `9P_FS`, `NET_9P_VIRTIO` | 실행 거부 |
+| 필수: 장애 감지 | `PVPANIC`, `PVPANIC_PCI` | 실행 거부 |
+| **fault injection** | `FAULT_INJECTION`, `FAULT_INJECTION_DEBUG_FS`, `FUNCTION_ERROR_INJECTION`, `FAIL_FUNCTION`, `BPF_KPROBE_OVERRIDE`, `FAILSLAB`, `FAIL_PAGE_ALLOC`, `FAIL_IO_TIMEOUT`, `FAIL_MAKE_REQUEST` | 해당 `kernel.*` 백엔드를 쓰는 테스트만 SKIP (사유 기록) |
+| 모드 식별 | `IRQ_REMAP`, `INTEL_IOMMU`, `GENERIC_PENDING_IRQ` | 실패가 아니라 AS-3 모드(IR / non-IR)를 결정하는 입력 |
+
+config 조각은 `guest/kconfig/nvmeval.config`로 제공하고, CentOS config에 `scripts/kconfig/merge_config.sh`로 합친다.
 
 ## 12. 수정이 필요한 곳과 단계별 계획
 
@@ -559,10 +662,11 @@ nvmeval/
 | M0 | schema, oracle 엔진, adapter loader + 단위 테스트 | VM 없이 합성 스냅샷/이벤트로 PASS/FAIL/INCONCLUSIVE 판정 테스트 통과 |
 | M1 | machine + QMP + agent + CentOS 9 게스트 이미지 | smp 8 기동, agent ping, passthrough Identify 성공 |
 | M2 | QEMU `query-nvme-queues` + DeviceView + DriverView(upstream adapter) | upstream 드라이버에서 INV-Q1/Q2/Q5 통과 (stopped 스냅샷) |
-| M3 | IrqView + INV-I1~I3 | MSI destination ↔ affinity 대조 통과 |
+| M3 | IrqView + INV-I1~I5 + AS-3 | MSI destination ↔ affinity 대조 통과. non-IR 모드에서 affinity 변경 후 `move_pending` 관측 → I/O 유발 → 반영 확인(L6). IR profile에서는 즉시 반영 확인 |
 | M4 | QEMU fault 규칙 엔진 | passthrough Delete SQ가 지정 status로 실패. CFS 설정 후 드라이버 리셋 관측 |
 | M5 | `nvmeval_stub.ko` + trigger | upstream의 외부 호출 가능한 함수 하나를 kind=call로 호출 성공 |
-| M6 | eBPF normalizer + sequence 엔진 + checkpoint | upstream 리셋 절차에서 S2/S5 통과, 이벤트 손실 시 INCONCLUSIVE 확인 |
+| M6 | eBPF normalizer + sequence 엔진 + liveness 엔진 + checkpoint | upstream 리셋 절차에서 S2/S5/L3 통과. 이벤트 손실 시 INCONCLUSIVE, `drop` fault로 만든 hang이 L1 FAIL로 잡힘 |
+| M6.5 | 커널 fault 백엔드 (`kernel.*`) | fail_function/failslab(task-filter)로 upstream 리셋 경로의 할당 실패를 주입하고 L3 종결(DEAD 또는 LIVE) 확인 |
 | M7 | features/qmgmt + sriov profile | **OA PC**에서 qmgmt adapter로 S1~S7/E1~E2 실행 |
 
 ---
@@ -581,6 +685,9 @@ nvmeval/
 | R8 | `phase=after_ok` + status 변조는 장치와 드라이버의 인식을 의도적으로 어긋나게 한다 | 롤백 검증용으로만 쓰고, 해당 테스트에서는 E1 기준 자체를 "장치 상태 기준 재동기화"로 정의 | 이 시나리오에서 불변식 정의가 일관적인지 |
 | R9 | TCG에서 게스트 시간 흐름이 불규칙해 드라이버 타임아웃이 거짓으로 발생할 수 있다 | 게스트 `nvme_core.io_timeout`/`admin_timeout`을 넉넉하게 설정 | 타임아웃 경로 자체를 검증할 때(`drop` 동작)와 충돌하지 않는지 |
 | R10 | vssd(QEMU)와 실제 SSD/FW의 동작 차이 | NFR-3 백엔드 추상화, 향후 vfio-user sim | – |
+| R11 | (v0.5) liveness 기한을 게스트 jiffies로 정하는데, 게스트가 hang 상태여도 타이머 인터럽트는 돌아 jiffies가 증가한다 | 의도한 동작이다. 게스트 시간이 흘렀는데 종결되지 않았으면 hang FAIL로 판정한다. 게스트 시간 자체가 멈춘 경우만 플랫폼 오류로 본다 | 기한 기본값(게스트 시간 30초 등)이 적절한지. TCG에서 smp 8 기준 |
+| R12 | (v0.5) blk-mq tag 순회를 drgn으로 할 때, running 상태에서는 tag 비트맵과 request 상태를 읽는 사이에 값이 바뀐다 | S1 판정은 `DevDeleteSQ` 시점의 checkpoint(stopped)에서 한다. 그러려면 장치 쪽 Delete SQ 처리 직전에 VM을 정지시키는 hook이 필요하다 → fault 규칙 엔진에 `action=pause`(QMP stop 요청 이벤트) 추가 | QEMU 디바이스 코드 안에서 vm_stop을 요청하는 것이 안전한지(BH로 지연 요청) |
+| R13 | (v0.5) 예외 상태(AS-*)가 많아지면 불변식이 사실상 무력화될 수 있다 | 예외는 이름으로 선언하고, PASS(DEGRADED)로 노출한다. 시나리오별로 허용할 예외를 명시한다 | 예외 판정 조건 자체가 잘못될 위험(예: fallback이 아닌데 fallback으로 오인)을 어떻게 막을지 |
 
 ---
 
@@ -591,8 +698,27 @@ nvmeval/
 | Q1 | OA PC에서 KVM 사용 여부 | TCG에서도 동작하게 설계하므로 필수는 아니다. R9 완화에 영향 |
 | Q2 | 회사 정보가 들어가는 `features/qmgmt`, `adapters/qmgmt-oa.yaml`을 같은 저장소에 둘지, 별도 저장소로 분리해 profile의 경로로 불러올지 | NFR-8, 저장소 구성 |
 | Q3 | qmgmt bitmap 단위: qid당 1비트인지, VF별로 따로 있는지 | ext.qmgmt 스키마, INV-V1 |
-| Q4 | drain 판정 기준: blk-mq tag iterator인지, qmgmt 자체 카운터인지 | S1의 이벤트 소스 |
+| ~~Q4~~ | ~~drain 판정 기준~~ → 해결 (v0.5): blk-mq tag 상태 + 장치 상태가 주 판정, feature 카운터는 대조용 (§5.7) | – |
 | Q5 | trigger나 checkpoint 대상 중 inline으로 사라진 함수가 있는지 | `noinline` 필요 여부 (adapter 검증으로 확인 가능) |
 | Q6 | qmgmt 외에 개발 중인 기능 목록과 성격 | 스키마 core 범위(R6), feature 설계 |
 | Q7 | QEMU 패치 관리: qemu-dev 브랜치 개발 + patch export(제안) vs submodule | §10 `qemu/` 구성 |
 | Q8 | 저장소 이름 `nvmeval` 확정 여부 | – |
+| Q9 | (v0.5) OA PC 실장비 환경에 interrupt remapping(IOMMU IR)이 있는지 | AS-3에서 어느 모드를 기준으로 삼을지 |
+| Q10 | (v0.5) 드라이버의 vector 개수 정책이 `min(VI, 쌍 수 + 1)`인지, admin vector를 IO와 공유하는지 | qmgmt/sriov feature 불변식 |
+| Q11 | (v0.5) qmgmt 내부 단계 중 오류 주입 대상 함수에 `ALLOW_ERROR_INJECTION`을 붙일 수 있는지 | `kernel.function`/`bpf_override` 사용 가능 범위 |
+
+---
+
+## 15. 리뷰 반영 이력
+
+### 1차 외부 리뷰 (2026-11-02) → v0.5
+
+| # | 피드백 | 검토 결과 | 반영 위치 |
+|---|---|---|---|
+| 1 | 판정 축에 liveness 추가 (요청 완료/실패, fio 종료, 컨트롤러 LIVE/DEAD 도달) | **수용.** safety 규칙만으로는 hang이 PASS로 나온다는 지적이 정확하다. TCG를 고려해 기한은 게스트 진행량(jiffies)으로 정하고, 벽시계 상한은 따로 둔다. drain 종결(L4), trigger 반환(L5), IRQ 이동 반영(L6)도 추가했다 | §5.5, D2 |
+| 2 | 정상 과도 상태 예외 (빈 풀, IRQ 이동 지연, blk-mq fallback) | **수용, 코드로 확인함.** (a) IRQ 이동 지연: non-IR x86 MSI는 `IRQCHIP_MOVE_DEFERRED`라서 다음 인터럽트에서 반영된다(`arch/x86/kernel/apic/msi.c:216~217`, `kernel/irq/manage.c:304~312`). 개발 서버 커널도 `IRQ_REMAP`이 없어 이 모드다. (b) fallback: `blk_mq_update_nr_hw_queues` 실패 fallback(`block/blk-mq.c:5162~5176`), 재매핑 전 전체 CPU→0 초기화(`block/blk-mq.c:4777~4780`). 예외를 불변식에 흩지 않고 이름 붙인 상태(AS-1~5)로 선언하고, DEGRADED로 드러나게 했다. IR/non-IR profile을 둘 다 둔다 | §5.6, §5.4 |
+| 3 | CQ→vector N:1 (VQ > VI) 스키마/불변식, 벡터 수 `min(VI, 쌍 수+1)`, INV-I1은 공유 vector의 affinity 합집합과 비교 | **수용하되 일부 재구성.** 스키마에 `vectors[v].cqids` 역참조를 추가하고 N:1 일치 불변식(INV-I5)을 만들었다. 다만 INV-I1(MSI destination ∈ effective affinity)은 vector 단위라서 공유 여부와 관계없이 그대로 맞다. 합집합 비교는 별도 불변식 INV-I4(공유 CQ들의 hctx CPU 합집합 ⊆ vector affinity)로 분리했다. 벡터 수 공식은 드라이버 정책이므로 core가 아니라 feature 불변식으로 두고 확인을 요청했다(Q10) | §4.1, §4.2, §5.1 |
+| 4 | drain 판정은 기능 카운터가 아니라 blk-mq 상태(`q_usage_counter`, tag busy 비트맵)로 | **수용, 보정 포함.** 검증 대상의 자체 카운터로 판정하면 안 된다는 원칙에 동의한다. 다만 `q_usage_counter`는 **freeze를 쓸 때만** drain 지표가 된다. quiesce만 하면 sw queue에 대기 중인 request가 참조를 잡고 있어 0이 아닌 것이 정상이다. 그래서 주 판정은 tag 비트맵 + request 상태 `MQ_RQ_IN_FLIGHT`(커널의 `blk_mq_hctx_has_requests`와 같은 방식)로 하고, `q_usage_counter`는 보조로 둔다. 장치 쪽 SQ head=tail 교차 확인과, feature 카운터와의 대조(불일치 시 FAIL)를 추가했다. stopped 상태에서 판정해야 하므로 R12(`action=pause`)를 새로 만들었다 | §5.7, S1, R12, Q4 해결 |
+| 5 | 커널 쪽 장애 주입도 FaultPlan에 포함, config 점검에 fault injection 추가 | **수용.** v0.4에서는 nvme fault_inject만 보조 수단으로 있었다. 이를 fail_function, bpf_override_return, failslab/fail_page_alloc(task-filter 필수), fail_io_timeout, fail_make_request까지 1급 백엔드로 넓혔다. 개발 서버 커널에는 이 계열 config가 **하나도 없음**을 확인했다. `nvmeval doctor` 점검 목록에 추가했다 | §8.1, §11.2, §11.3, M6.5 |
+| 6 | SR-IOV: VQ는 admin queue 포함, 자원 배정은 VF offline에서만, VF vendor ID는 0xFFFF라 준비 확인은 Command 레지스터로 | **수용, 세 가지 모두 코드로 확인함.** VQ admin 포함: `conf_ioqpairs = nvq - 1`(`hw/nvme/ctrl.c:8028`), VF당 최소 2 VQ(`ctrl.c:8914`). offline 전용: online이면 `INVALID_SEC_CTRL_STATE`(`ctrl.c:7298~`). VF ID 0xFFFF: QEMU `hw/pci/pcie_sriov.c:186~187`, 커널 `pci_dev_wait`가 VF면 `PCI_COMMAND`를 읽음(`drivers/pci/pci.c:1237~1241`). (리뷰 원문의 "0xfffff"는 16비트 0xFFFF의 오타로 보인다) | §8.5, INV-V1 |
+
